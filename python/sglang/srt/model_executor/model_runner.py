@@ -852,26 +852,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.maybe_init_ngram_embedding()
 
         if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+            from sglang.srt.configs.model_config import is_minimax_sparse
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            hisparse_cfg = parse_hisparse_config(self.server_args)
-            hisparse_top_k = getattr(
-                self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-            )
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            )
+            is_m3 = is_minimax_sparse(self.model_config.hf_config)
+            if is_m3:
+                from sglang.srt.managers.minimax_hisparse_coordinator import (
+                    MiniMaxHiSparseCoordinator,
+                )
+
+                self.hisparse_coordinator = MiniMaxHiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    device=self.device,
+                )
+            else:
+                from sglang.srt.managers.hisparse_coordinator import (
+                    HiSparseCoordinator,
+                )
+
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                hisparse_top_k = getattr(
+                    self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+                )
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=(
+                        self.attention_tp_group.cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_group.cpu_group
+                    ),
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                )
 
         self.init_routed_experts_capturer()
         self.init_indexer_capturer()

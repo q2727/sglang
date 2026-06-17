@@ -93,6 +93,7 @@ class MiniMaxSparseMainHostPool:
         self.layer_num = layer_num
         self.device = "cpu"
         self.pin_memory = pin_memory
+        self._free_head = 0
         self.k_buffer = [self._alloc_buffer() for _ in range(layer_num)]
         self.v_buffer = [self._alloc_buffer() for _ in range(layer_num)]
 
@@ -160,6 +161,40 @@ class MiniMaxSparseMainHostPool:
             self.k_buffer[local_layer_id][host_locs_cpu],
             self.v_buffer[local_layer_id][host_locs_cpu],
         )
+
+    def alloc(self, num: int) -> torch.Tensor:
+        """Allocate contiguous host pool slots.
+
+        Returns a 1-D Long tensor of allocated slot indices.
+        Raises RuntimeError if insufficient free slots remain.
+        """
+        if num <= 0:
+            return torch.empty((0,), dtype=torch.int64)
+        if self._free_head + num > self.alloc_size:
+            raise RuntimeError(
+                f"MiniMaxSparseMainHostPool exhausted: "
+                f"need {num} slots, only {self.alloc_size - self._free_head} remain "
+                f"(capacity={self.alloc_size})."
+            )
+        start = self._free_head
+        self._free_head += num
+        return torch.arange(start, start + num, dtype=torch.int64)
+
+    def free(self, indices: torch.Tensor) -> None:
+        """Return host pool slots to the free list.
+
+        Currently a no-op: the pool uses a simple bump allocator. Freed slots
+        are not reused until the pool is reset. This is acceptable for the
+        first-phase implementation where the pool is sized with a generous
+        host_to_device_ratio.
+        """
+        # Bump allocator: freed slots are not immediately reusable.
+        # The pool will be reset when all requests finish.
+        del indices
+
+    @property
+    def free_slots(self) -> int:
+        return self.alloc_size - self._free_head
 
     def get_kv_size_bytes(self) -> Tuple[int, int]:
         return (

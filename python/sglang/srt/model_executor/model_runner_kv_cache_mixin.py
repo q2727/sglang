@@ -829,28 +829,36 @@ class ModelRunnerKVCacheMixin:
                 else:
                     if self.enable_hisparse:
                         if isinstance(self.token_to_kv_pool, MiniMaxHiSparseKVPool):
-                            raise NotImplementedError(
-                                "MiniMax-M3 HiSparse KV pool is available, but "
-                                "allocator/coordinator lifecycle integration is not "
-                                "implemented yet. Do not route MiniMax-M3 through "
-                                "the generic DSA HiSparse allocator."
+                            # MiniMax-M3 HiSparse uses a standard paged allocator.
+                            # The host pool manages its own free list; no dual-
+                            # allocator indirection is needed.
+                            self.token_to_kv_pool_allocator = (
+                                PagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                )
                             )
-                        from sglang.srt.mem_cache.sparsity import (
-                            parse_hisparse_config,
-                        )
+                        else:
+                            from sglang.srt.mem_cache.sparsity import (
+                                parse_hisparse_config,
+                            )
 
-                        hisparse_cfg = parse_hisparse_config(self.server_args)
-                        self.token_to_kv_pool_allocator = (
-                            HiSparseTokenToKVPoolAllocator(
-                                self.max_total_num_tokens,
-                                page_size=self.page_size,
-                                dtype=self.kv_cache_dtype,
-                                device=self.device,
-                                kvcache=self.token_to_kv_pool,
-                                need_sort=need_sort,
-                                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            hisparse_cfg = parse_hisparse_config(self.server_args)
+                            self.token_to_kv_pool_allocator = (
+                                HiSparseTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                )
                             )
-                        )
                     elif self.page_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
