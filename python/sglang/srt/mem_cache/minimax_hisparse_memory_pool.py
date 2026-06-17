@@ -17,6 +17,28 @@ from sglang.srt.mem_cache.memory_pool import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# JIT kernel availability check (cached per process).
+# ---------------------------------------------------------------------------
+_use_jit_swap_in_cache: Optional[bool] = None
+
+
+def _check_jit_swap_in_available() -> bool:
+    """Return True if the JIT swap-in kernel can be loaded on this device."""
+    global _use_jit_swap_in_cache
+    if _use_jit_swap_in_cache is not None:
+        return _use_jit_swap_in_cache
+    try:
+        from sglang.jit_kernel.minimax_hisparse_swap_in import (
+            minimax_hisparse_swap_in_available,
+        )
+
+        _use_jit_swap_in_cache = minimax_hisparse_swap_in_available()
+    except Exception:
+        logger.debug("MiniMax HiSparse JIT swap-in kernel not available.", exc_info=True)
+        _use_jit_swap_in_cache = False
+    return _use_jit_swap_in_cache
+
 
 @dataclass
 class MiniMaxHiSparseLoadResult:
@@ -298,7 +320,31 @@ class MiniMaxHiSparseKVPool(KVCache):
             + self.sparse_main_hot_pool.mem_usage
         )
         self._hot_page_table_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._hot_r2t_by_layer: dict[int, torch.Tensor] = {}
         self.full_to_hisparse_device_index_mapping: Optional[torch.Tensor] = None
+
+        # JIT kernel path: when available, use GPU-side block dedup + async H2D copy.
+        self._use_jit_swap_in = _check_jit_swap_in_available()
+        if self._use_jit_swap_in:
+            logger.info(
+                "MiniMaxHiSparse: JIT block swap-in kernel enabled."
+            )
+        else:
+            logger.info(
+                "MiniMaxHiSparse: JIT block swap-in kernel NOT available; "
+                "using Python reference path."
+            )
+
+        # Per-layer persistent state for CUDA-graph-safe swap-in.
+        # next_hot_page is a scalar atomic counter reset before each layer.
+        self._next_hot_page: Optional[torch.Tensor] = None
+        self._overflow_flag: Optional[torch.Tensor] = None
+        # Dedicated stream for async host→device copies.
+        self._copy_stream: Optional[torch.cuda.Stream] = None
+        if self._use_jit_swap_in and device:
+            self._copy_stream = torch.cuda.Stream(device=device)
+        # Pre-allocated output tensor caches keyed by (batch, Hkv, K, max_pages, total_pages).
+        self._jit_output_cache: dict[tuple, dict[str, torch.Tensor]] = {}
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
@@ -548,6 +594,178 @@ class MiniMaxHiSparseKVPool(KVCache):
             hot_locs=hot_locs_device,
         )
 
+    def _get_or_create_jit_outputs(
+        self,
+        batch: int,
+        Hkv: int,
+        K: int,
+        max_pages: int,
+    ) -> dict[str, torch.Tensor]:
+        """Allocate (or retrieve cached) output tensors for the JIT swap-in kernel.
+
+        Tensors are cached by shape key so that repeated calls with identical
+        batch dimensions (e.g. under CUDA graph) reuse the same buffers.
+
+        Returns a dict with keys:
+            hot_page_table, hot_kv_indices, hot_kv_indices_offset,
+            host_locs, hot_locs, next_hot_page, overflow_flag.
+        """
+        total_pages = batch * K  # worst case: every selected block is unique
+        total_tokens = total_pages * self.page_size
+        key = (batch, Hkv, K, max_pages, total_pages)
+        cached = self._jit_output_cache.get(key)
+        if cached is not None:
+            # Reset the atomic counters and overflow flag.
+            cached["next_hot_page"].zero_()
+            cached["token_counter"].zero_()
+            cached["overflow_flag"].zero_()
+            # Fill hot_page_table with -1 (invalid sentinel).
+            cached["hot_page_table"].fill_(-1)
+            return cached
+
+        device = self.device
+        tensors = {
+            "hot_page_table": torch.full(
+                (batch, max_pages), -1, dtype=torch.int32, device=device
+            ),
+            "hot_kv_indices": torch.empty(
+                (total_pages,), dtype=torch.int32, device=device
+            ),
+            "hot_kv_indices_offset": torch.empty(
+                (batch,), dtype=torch.int32, device=device
+            ),
+            "host_locs": torch.empty(
+                (total_tokens,), dtype=torch.int64, device=device
+            ),
+            "hot_locs": torch.empty(
+                (total_tokens,), dtype=torch.int64, device=device
+            ),
+            "next_hot_page": torch.zeros(
+                (1,), dtype=torch.int32, device=device
+            ),
+            "token_counter": torch.zeros(
+                (1,), dtype=torch.int32, device=device
+            ),
+            "overflow_flag": torch.zeros(
+                (1,), dtype=torch.int32, device=device
+            ),
+        }
+        self._jit_output_cache[key] = tensors
+        return tensors
+
+    def _load_sparse_main_blocks_to_hot_jit(
+        self,
+        layer_id: int,
+        req_to_host: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        topk_idx: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_real_reqs: int,
+    ) -> MiniMaxHiSparseLoadResult:
+        """JIT-kernel-accelerated block swap-in.
+
+        Replaces the CPU block-mode path with a GPU kernel that:
+        1. Deduplicates topk block ids per request across KV heads.
+        2. Atomically allocates hot pages from the device counter.
+        3. Builds hot_page_table, hot_kv_indices, host_locs, hot_locs.
+        Then the existing H2D copy helper transfers the data.
+        """
+        from sglang.jit_kernel.minimax_hisparse_swap_in import minimax_hisparse_swap_in
+
+        Hkv, B, K = topk_idx.shape
+        if topk_idx.shape[1] != B:
+            # Handle [Hkv, B, K] vs [B, Hkv, K] — the kernel expects [Hkv, B, K].
+            # The backend always produces [Hkv, B, K] after index-head reduction
+            # (see minimax_sparse_decode), but be defensive.
+            if topk_idx.shape[0] == B:
+                topk_idx = topk_idx.permute(1, 0, 2).contiguous()
+                Hkv, B, K = topk_idx.shape
+            else:
+                raise ValueError(
+                    f"topk_idx must be [Hkv, B, K] or [B, Hkv, K]; "
+                    f"got shape={tuple(topk_idx.shape)}"
+                )
+
+        max_pages = int(
+            (int(seq_lens.max().item()) + self.page_size - 1) // self.page_size
+        )
+
+        outputs = self._get_or_create_jit_outputs(B, Hkv, K, max_pages)
+
+        # Ensure contiguity for the JIT kernel.
+        if not topk_idx.is_contiguous():
+            topk_idx = topk_idx.contiguous()
+        if not seq_lens.is_contiguous():
+            seq_lens = seq_lens.contiguous()
+        if not req_to_host.is_contiguous():
+            req_to_host = req_to_host.contiguous()
+        if not req_pool_indices.is_contiguous():
+            req_pool_indices = req_pool_indices.contiguous()
+
+        # Launch the GPU kernel.
+        minimax_hisparse_swap_in(
+            topk_idx=topk_idx,
+            seq_lens=seq_lens,
+            req_to_host=req_to_host,
+            req_pool_indices=req_pool_indices,
+            hot_page_table=outputs["hot_page_table"],
+            hot_kv_indices=outputs["hot_kv_indices"],
+            hot_kv_indices_offset=outputs["hot_kv_indices_offset"],
+            host_locs=outputs["host_locs"],
+            hot_locs=outputs["hot_locs"],
+            next_hot_page=outputs["next_hot_page"],
+            token_counter=outputs["token_counter"],
+            overflow_flag=outputs["overflow_flag"],
+            hot_page_offset=self.hot_page_offset,
+            hot_page_capacity=self.hot_page_capacity,
+            num_real_reqs=num_real_reqs,
+        )
+
+        # Check for hot buffer overflow.
+        if int(outputs["overflow_flag"].item()) != 0:
+            raise RuntimeError(
+                "MiniMaxHiSparse hot buffer exhausted: JIT kernel detected "
+                f"overflow (capacity={self.hot_page_capacity} pages)."
+            )
+
+        # --- H2D copy: use the existing host→hot copy helper ---
+        # The kernel atomically reserves token ranges; ``token_counter`` holds
+        # the total number of token entries written.
+        total_tokens = int(outputs["token_counter"].item())
+        if total_tokens > 0:
+            host_locs_flat = outputs["host_locs"][:total_tokens]
+            hot_locs_flat = outputs["hot_locs"][:total_tokens]
+            self._load_sparse_main_locs_to_hot(
+                layer_id,
+                host_locs_flat,
+                hot_locs_flat,
+            )
+
+        # --- Build compact hot_kv_indices ---
+        # hot_kv_indices_offset stores per-request page counts.
+        # Compute prefix sum over real requests, then compact the flattened indices.
+        offsets_real = offsets[:num_real_reqs]
+        offsets_cpu = offsets_real.cpu()
+        prefix = torch.cat(
+            [torch.zeros(1, dtype=torch.int32), torch.cumsum(offsets_cpu, 0)]
+        ).to(torch.int32)
+        total_pages = int(prefix[-1].item())
+        compact_kv_indices = outputs["hot_kv_indices"][:total_pages].contiguous()
+
+        # --- Store page table for later retrieval ---
+        page_table_device = outputs["hot_page_table"]
+        self._hot_page_table_by_layer[layer_id] = (
+            compact_kv_indices,
+            page_table_device,
+        )
+
+        return MiniMaxHiSparseLoadResult(
+            host_locs=outputs["host_locs"][:total_tokens].cpu(),
+            hot_locs=outputs["hot_locs"][:total_tokens],
+            hot_page_table=page_table_device,
+            hot_kv_indices=compact_kv_indices,
+        )
+
     def load_sparse_main_blocks_to_hot(
         self,
         layer_id: int,
@@ -592,11 +810,25 @@ class MiniMaxHiSparseKVPool(KVCache):
         if topk_idx.ndim != 3:
             raise ValueError(f"topk_idx must be rank-3, got shape={topk_idx.shape}.")
 
+        batch = int(req_pool_indices.numel())
+
+        # --- JIT kernel path (when available) ---
+        if self._use_jit_swap_in and topk_idx.is_cuda:
+            return self._load_sparse_main_blocks_to_hot_jit(
+                layer_id,
+                req_to_host,
+                req_pool_indices,
+                topk_idx,
+                seq_lens,
+                num_real_reqs=batch,  # caller can override via a future kwarg
+            )
+
+        # --- Python reference path (CPU fallback) ---
+
         topk_cpu = topk_idx.detach().to(device="cpu", dtype=torch.int64)
         req_to_host_cpu = req_to_host.detach().to(device="cpu", dtype=torch.long)
         req_pool_cpu = req_pool_indices.detach().to(device="cpu", dtype=torch.long)
         seq_lens_cpu = seq_lens.detach().to(device="cpu", dtype=torch.long)
-        batch = int(req_pool_cpu.numel())
         if topk_cpu.shape[1] == batch:
             topk_by_batch = [topk_cpu[:, b, :] for b in range(batch)]
         elif topk_cpu.shape[0] == batch:
@@ -710,6 +942,68 @@ class MiniMaxHiSparseKVPool(KVCache):
             )
         hot_kv_indices, hot_page_table = entry
         return hot_kv_indices if flattened else hot_page_table
+
+    # ------------------------------------------------------------------
+    # Hot req_to_token for Triton fallback path
+    # ------------------------------------------------------------------
+
+    def build_hot_req_to_token(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_reqs: int,
+        max_ctx: int,
+        num_real_reqs: int,
+    ) -> torch.Tensor:
+        """Build a layer-scoped hot ``req_to_token`` for the Triton fallback path.
+
+        For each selected logical block recorded in ``hot_page_table``, this writes
+        the corresponding hot buffer slot ids into a ``[max_reqs, max_ctx]`` int32
+        tensor.  Unmapped positions remain ``-1``.
+
+        The Triton sparse kernel (``flash_decode_with_gqa_share_sparse``) resolves
+        tokens through ``req_to_token[slot_ids[b], logical_pos]``.  By shadowing
+        the baseline ``req_to_token`` with this hot mapping only for sparse main
+        attention, the kernel loads the correct hot K/V values without modification.
+
+        Returns a ``[max_reqs, max_ctx]`` int32 tensor on the same device as
+        ``req_pool_indices``.
+        """
+        entry = self._hot_page_table_by_layer.get(layer_id)
+        if entry is None:
+            raise RuntimeError(
+                f"No hot page table has been built for sparse layer {layer_id}. "
+                "Call load_sparse_main_blocks_to_hot first."
+            )
+        _hot_kv_indices, hot_page_table = entry  # [total_pages], [B, max_pages]
+
+        B, max_pages = hot_page_table.shape
+        device = hot_page_table.device
+
+        hot_r2t = torch.full(
+            (max_reqs, max_ctx), -1, dtype=torch.int32, device=device
+        )
+
+        for b in range(int(num_real_reqs)):
+            req_row = int(req_pool_indices[b].item())
+            sl = int(seq_lens[b].item())
+            num_pages = (sl + self.page_size - 1) // self.page_size
+            for page_idx in range(min(num_pages, max_pages)):
+                hot_page_id = int(hot_page_table[b, page_idx].item())
+                if hot_page_id < 0:
+                    continue
+                # For each token in this logical page, write the hot slot id.
+                for t in range(self.page_size):
+                    logical_pos = page_idx * self.page_size + t
+                    if logical_pos >= sl:
+                        break
+                    hot_slot = hot_page_id * self.page_size + t
+                    hot_r2t[req_row, logical_pos] = hot_slot
+
+        # Cache for later retrieval keyed by layer_id.
+        self._hot_r2t_by_layer[layer_id] = hot_r2t
+        return hot_r2t
 
     def get_kv_size_bytes(self):
         sub_pools = [
