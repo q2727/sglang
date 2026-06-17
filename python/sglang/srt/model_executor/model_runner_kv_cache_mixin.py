@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.minimax_hisparse_memory_pool import MiniMaxHiSparseKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -658,7 +659,21 @@ class ModelRunnerKVCacheMixin:
                 disable_value_sparse_layer_ids = (
                     get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
                 )
-                self.token_to_kv_pool = MiniMaxSparseKVPool(
+                pool_cls = (
+                    MiniMaxHiSparseKVPool
+                    if self.enable_hisparse
+                    else MiniMaxSparseKVPool
+                )
+                pool_kwargs = {}
+                if self.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    hisparse_cfg = parse_hisparse_config(self.server_args)
+                    pool_kwargs = {
+                        "hot_size": hisparse_cfg.device_buffer_size,
+                        "host_to_device_ratio": hisparse_cfg.host_to_device_ratio,
+                    }
+                self.token_to_kv_pool = pool_cls(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -675,6 +690,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    **pool_kwargs,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}
@@ -812,6 +828,13 @@ class ModelRunnerKVCacheMixin:
                     )
                 else:
                     if self.enable_hisparse:
+                        if isinstance(self.token_to_kv_pool, MiniMaxHiSparseKVPool):
+                            raise NotImplementedError(
+                                "MiniMax-M3 HiSparse KV pool is available, but "
+                                "allocator/coordinator lifecycle integration is not "
+                                "implemented yet. Do not route MiniMax-M3 through "
+                                "the generic DSA HiSparse allocator."
+                            )
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )

@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
 )
+from sglang.srt.mem_cache.minimax_hisparse_memory_pool import MiniMaxHiSparseKVPool
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -27,7 +28,9 @@ logger = logging.getLogger(__name__)
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
-        assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
+        assert isinstance(
+            runner.token_to_kv_pool, (MiniMaxSparseKVPool, MiniMaxHiSparseKVPool)
+        )
         self.kv_pool = runner.token_to_kv_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token
         self.max_context_len = int(runner.model_config.context_len)
