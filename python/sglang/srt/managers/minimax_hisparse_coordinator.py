@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.managers.hisparse_coordinator import HiSparseTokenStats
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
@@ -242,8 +243,34 @@ class MiniMaxHiSparseCoordinator:
         pass
 
     # ------------------------------------------------------------------
-    # Token stats (for observability)
+    # Token stats (for observability, pool_stats_observer)
     # ------------------------------------------------------------------
+
+    def get_token_stats(self) -> HiSparseTokenStats:
+        """Return HiSparse token usage stats compatible with DSA interface.
+
+        M3 has no per-request device buffer, so ``device_tokens`` reflects
+        the standard GPU pool usage (dense_main + sparse_index_k).  Host
+        tokens are tracked by the bump allocator in the host pool.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        device_capacity = allocator.size
+        device_tokens = device_capacity - allocator.available_size()
+
+        host_pool = self.token_to_kv_pool.sparse_main_host_pool
+        host_capacity = host_pool.alloc_size
+        host_tokens = host_capacity - host_pool.free_slots
+
+        return HiSparseTokenStats(
+            device_tokens=device_tokens,
+            device_token_usage=(
+                device_tokens / device_capacity if device_capacity > 0 else 0.0
+            ),
+            host_tokens=host_tokens,
+            host_token_usage=(
+                host_tokens / host_capacity if host_capacity > 0 else 0.0
+            ),
+        )
 
     def get_host_usage(self) -> tuple[int, int]:
         """Return (used_host_slots, total_host_slots)."""
