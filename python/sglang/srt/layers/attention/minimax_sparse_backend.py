@@ -12,6 +12,9 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.minimax_sparse_ops.decode.flash_with_topk_idx import (
+    flash_decode_with_topk_idx,
+)
 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
@@ -169,10 +172,50 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # fused decode top-k kernel each layer, so the backend keeps no metadata.
         self.dense_backend: Optional[AttentionBackend] = None
 
+        # ── Two-pool HiSparse gate ──────────────────────────────────────────
+        # When HiSparse is enabled, TWO pools coexist:
+        #   standard_kv_pool (MiniMaxSparseKVPool): full GPU K/V for prefill,
+        #     dense layers, and sparse index K.
+        #   kv_pool / hisparse_kv_pool (MiniMaxHiSparseKVPool): host-backed
+        #     sparse main K/V + hot GPU buffer for sparse decode.
+        self.standard_kv_pool: Optional["MiniMaxSparseKVPool"] = getattr(
+            runner, "standard_kv_pool", None
+        )
+        self._is_m3_hisparse = (
+            self.standard_kv_pool is not None
+            and isinstance(self.kv_pool, MiniMaxHiSparseKVPool)
+        )
+
+        # Coordinator reference (plumbed from ModelRunner.hisparse_coordinator).
+        self._m3_hisparse_coordinator: Optional[
+            "MiniMaxHiSparseCoordinator"
+        ] = None
+        if self._is_m3_hisparse:
+            self._m3_hisparse_coordinator = getattr(
+                runner, "hisparse_coordinator", None
+            )
+            if self._m3_hisparse_coordinator is None:
+                raise RuntimeError(
+                    "MiniMaxHiSparseKVPool + standard_kv_pool in use but "
+                    "hisparse_coordinator was not set on ModelRunner."
+                )
+
+        # ── CUDA graph policy for HiSparse ──
+        # First-phase M3 HiSparse decode does not support CUDA graph capture.
+        if self._is_m3_hisparse and _decode_cuda_graph:
+            raise RuntimeError(
+                "MiniMax-M3 HiSparse does not support CUDA graph decode. "
+                "Use --disable-cuda-graph to force eager execution for all layers."
+            )
+
+        # GPU mirror of coordinator.req_to_host for JIT swap-in kernel.
+        self._hisparse_req_to_host_gpu: Optional[torch.Tensor] = None
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"hisparse={self._is_m3_hisparse}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
 
@@ -299,12 +342,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
     ):
+        # ── Prefill: always use the standard pool ──
+        # When HiSparse is enabled, prefill writes ALL K/V (dense main,
+        # sparse main, sparse index) to the standard GPU pool.  The HiSparse
+        # host/hot pool is only consulted during decode.
+        p = self.standard_kv_pool if self._is_m3_hisparse else self.kv_pool
         disable_value = layer.layer_id in self.disable_value_layer_ids
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
         )
         if not kv_cached_by_fusion:
-            self.kv_pool.set_fused_kv_index_buffer(
+            p.set_fused_kv_index_buffer(
                 layer,
                 forward_batch.out_cache_loc,
                 k,
@@ -312,12 +360,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k,
                 None if disable_value else idx_v,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = p.get_kv_buffer(layer.layer_id)
         if disable_value:
-            idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
+            idx_k_cache = p.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
         else:
-            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
+            idx_k_cache, idx_v_cache = p.get_index_kv_buffer(layer.layer_id)
 
         cu_seqlens = torch.cat(
             [
@@ -434,6 +482,318 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             "dense sparse decode currently supports trtllm_mha only (fa3 is TODO)"
         )
 
+    # ── HiSparse helpers ───────────────────────────────────────────────────
+
+    def _get_req_to_host_gpu(self) -> torch.Tensor:
+        """Return a GPU mirror of coordinator.req_to_host.
+
+        The coordinator owns ``req_to_host`` on CPU.  The JIT swap-in kernel
+        requires a GPU copy; this method creates and maintains a lazy GPU
+        mirror.  For large contexts this full-tensor copy is a known first-phase
+        bottleneck — a future optimization is for the coordinator to maintain
+        the GPU mirror incrementally.
+        """
+        coord = self._m3_hisparse_coordinator
+        cpu_tensor = coord.req_to_host  # [max_reqs, max_ctx] int64 CPU
+        if cpu_tensor.device.type in ("cuda", "hip"):
+            return cpu_tensor
+
+        device = torch.device(self.kv_pool.device)
+        if (
+            self._hisparse_req_to_host_gpu is None
+            or self._hisparse_req_to_host_gpu.shape != cpu_tensor.shape
+        ):
+            self._hisparse_req_to_host_gpu = cpu_tensor.to(
+                device=device, dtype=torch.int64, non_blocking=False
+            )
+        else:
+            self._hisparse_req_to_host_gpu.copy_(cpu_tensor, non_blocking=False)
+        return self._hisparse_req_to_host_gpu
+
+    def _get_host_locs_for_decode(
+        self, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Return host pool slot indices for the current decode token per request.
+
+        Reads from ``coordinator.req_to_host[req_pool_idx, seq_len - 1]``.
+        Returns a 1-D int64 CPU tensor of length batch_size.
+        """
+        coord = self._m3_hisparse_coordinator
+        batch_size = forward_batch.batch_size
+        host_locs = torch.empty(batch_size, dtype=torch.int64)
+        # Use CPU-side copies when available to avoid GPU sync;
+        # fall back to GPU tensors with .item() for each slot.
+        req_pool_cpu = getattr(
+            forward_batch, "req_pool_indices_cpu", None
+        )
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if req_pool_cpu is None:
+            req_pool_cpu = forward_batch.req_pool_indices.cpu()
+        if seq_lens_cpu is None:
+            seq_lens_cpu = forward_batch.seq_lens.cpu()
+
+        for b in range(batch_size):
+            req_idx = int(req_pool_cpu[b].item())
+            sl = int(seq_lens_cpu[b].item())
+            host_locs[b] = int(coord.req_to_host[req_idx, sl - 1].item())
+        return host_locs
+
+    @staticmethod
+    def _run_index_branch_decode(
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_ids: torch.Tensor,
+        max_seqlen: int,
+        block_size_k: int,
+        topk_blocks: int,
+        init_blocks: int,
+        local_blocks: int,
+        score_type: str,
+        page_size: int,
+    ) -> torch.Tensor:
+        """Run the MiniMax index branch and return ``topk_idx`` [Hidx, B, K].
+
+        This is the first half of ``minimax_sparse_decode`` — the indexer —
+        extracted so the HiSparse path can intercept between index selection
+        and main sparse attention.
+        """
+        _idx_o, topk_idx, _real_seq_lens = flash_decode_with_topk_idx(
+            q=idx_q,
+            sink=None,
+            k_cache=idx_k_cache,
+            v_cache=None,  # K-only index; disable_index_value=True
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            slot_ids=slot_ids,
+            block_size=block_size_k,
+            topk=topk_blocks,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            score_type=score_type,
+            disable_index_value=True,
+            use_dense_main_attn=False,
+            page_size=page_size,
+        )
+        return topk_idx  # [Hidx, B, K]
+
+    @staticmethod
+    def _reduce_topk_idx(
+        topk_idx: torch.Tensor,  # [Hidx, B, K]
+        num_idx_heads: int,
+        num_kv_heads: int,
+    ) -> torch.Tensor:
+        """Reduce index-head topk to KV-head topk when Hidx > Hkv."""
+        idx_group_size = num_idx_heads // num_kv_heads
+        if idx_group_size > 1:
+            from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+                topk_index_reduce,
+            )
+
+            return topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk_idx.shape[-1]),
+                dim=1,
+            )
+        return topk_idx  # shape unchanged when Hidx == Hkv
+
+    def _swap_sparse_main_blocks_to_hot(
+        self,
+        layer_id: int,
+        topk_idx: torch.Tensor,  # [Hkv, B, K] int32
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Swap selected sparse main K/V blocks into the hot GPU buffer."""
+        req_to_host_gpu = self._get_req_to_host_gpu()
+        self.kv_pool.load_sparse_main_blocks_to_hot(
+            layer_id,
+            req_to_host=req_to_host_gpu,
+            req_pool_indices=forward_batch.req_pool_indices,
+            topk_idx=topk_idx,
+            seq_lens=forward_batch.seq_lens,
+            block_size=self.block_size_k,
+        )
+
+    def _build_hot_msa_meta_for_layer(
+        self,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+    ):
+        """Build per-layer MSA decode metadata pointing to the hot buffer."""
+        from fmha_sm100 import fmha_sm100_plan
+
+        hot_kv_indices = self.kv_pool.get_hot_page_table(
+            layer_id, flattened=True
+        )
+        P = self.block_size_k
+        B = forward_batch.seq_lens.shape[0]
+        seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
+        plan = fmha_sm100_plan(
+            torch.ones(B, dtype=torch.int32),
+            seq_lens_i32,
+            self.num_q_heads,
+            num_kv_heads=self.num_kv_heads,
+            page_size=P,
+            kv_block_num=self.topk_blocks,
+            causal=False,
+            qo_offset=(seq_lens_i32 - 1).clamp_min(0),
+            device=forward_batch.seq_lens.device,
+        )
+        return hot_kv_indices, plan
+
+    def _build_hot_req_to_token_for_layer(
+        self,
+        layer_id: int,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Build a layer-scoped hot ``req_to_token`` for the Triton fallback."""
+        return self.kv_pool.build_hot_req_to_token(
+            layer_id=layer_id,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            max_reqs=self.req_to_token.shape[0],
+            max_ctx=self.req_to_token.shape[1],
+            num_real_reqs=int(forward_batch.batch_size),
+        )
+
+    def _run_main_sparse_attention_hisparse(
+        self,
+        q: torch.Tensor,
+        topk_idx: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run main sparse attention from the *hot* GPU K/V buffer."""
+        layer_id = layer.layer_id
+        hot_k, hot_v = self.kv_pool.get_hot_kv_buffer(layer_id)
+        sm_scale = getattr(layer, "scaling", None)
+
+        if self._use_msa_decode:
+            hot_kv_indices, hot_plan = self._build_hot_msa_meta_for_layer(
+                layer_id, forward_batch
+            )
+            from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+                msa_sparse_decode_main,
+            )
+
+            o = msa_sparse_decode_main(
+                q=q,
+                k_cache=hot_k,
+                v_cache=hot_v,
+                topk_idx=topk_idx,
+                req_to_token=self.req_to_token,
+                slot_ids=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                block_size_k=self.block_size_k,
+                sm_scale=sm_scale,
+                kv_indices=hot_kv_indices,
+                plan=hot_plan,
+            )
+        else:
+            hot_req_to_token = self._build_hot_req_to_token_for_layer(
+                layer_id, forward_batch
+            )
+            from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+                flash_decode_with_gqa_share_sparse,
+            )
+
+            o = flash_decode_with_gqa_share_sparse(
+                q=q,
+                sink=None,
+                k_cache=hot_k,
+                v_cache=hot_v,
+                req_to_token=hot_req_to_token,
+                seq_lens=forward_batch.seq_lens,
+                slot_ids=forward_batch.req_pool_indices,
+                block_size=self.block_size_k,
+                topk_idx=topk_idx,
+                sm_scale=sm_scale,
+            )
+        return o
+
+    def _forward_decode_hisparse_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+        disable_value: bool,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+    ):
+        """HiSparse decode path for one sparse MiniMax-M3 layer.
+
+        Two-pool design:
+        1. Store main K/V → HiSparse host pool.
+        2. Store index K → standard pool (GPU, so the indexer sees full context).
+        3. Read index K from standard pool → run indexer → topk_idx.
+        4. Swap selected main K/V blocks from host → HiSparse hot GPU buffer.
+        5. Run main sparse attention from hot K/V (MSA or Triton fallback).
+        """
+        hisparse = self.kv_pool  # MiniMaxHiSparseKVPool
+        standard = self.standard_kv_pool  # MiniMaxSparseKVPool
+        layer_id = layer.layer_id
+
+        # Step 1: Store main K/V → HiSparse host pool.
+        # Host locs come from the coordinator's req_to_host mapping
+        # (NOT from out_cache_loc, which are GPU slots in the standard pool).
+        host_locs = self._get_host_locs_for_decode(forward_batch)
+        hisparse.backup_sparse_main_to_host(
+            layer_id,
+            host_locs,
+            cache_k=k,
+            cache_v=v,
+        )
+
+        # Step 2: Store index K → standard pool (GPU).
+        # The standard pool must contain the full index K history so the
+        # indexer sees the latest token for local_blocks selection.
+        standard.set_index_k_buffer(layer, forward_batch.out_cache_loc, idx_k)
+
+        # Step 3: Read index K from standard pool and run the indexer.
+        idx_k_cache = standard.get_index_k_buffer(layer_id)
+        topk_idx = self._run_index_branch_decode(
+            idx_q=idx_q,
+            idx_k_cache=idx_k_cache,
+            req_to_token=self.req_to_token,
+            seq_lens=forward_batch.seq_lens,
+            slot_ids=forward_batch.req_pool_indices,
+            max_seqlen=self._max_seqlen_k,
+            block_size_k=self.block_size_k,
+            topk_blocks=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            score_type=self.score_type,
+            page_size=self.page_size,
+        )
+        num_idx_heads = idx_q.shape[1]
+        topk_idx = self._reduce_topk_idx(
+            topk_idx,
+            num_idx_heads,
+            standard.main_pool.head_num,
+        )
+
+        # Step 4: Swap selected sparse main K/V blocks into hot GPU buffer.
+        self._swap_sparse_main_blocks_to_hot(
+            layer_id, topk_idx, forward_batch
+        )
+
+        # Step 5: Run main sparse attention from hot K/V.
+        o = self._run_main_sparse_attention_hisparse(
+            q, topk_idx, layer, forward_batch
+        )
+
+        # idx_o is always None for M3 K-only sparse layers.
+        return (
+            None,
+            o.reshape(q.shape[0], -1).contiguous(),
+        )
+
+    # ── forward_decode ────────────────────────────────────────────────────
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -450,6 +810,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
+
+        # ── HiSparse sparse decode path ──
+        if (
+            self._is_m3_hisparse
+            and layer.layer_id in self.sparse_layer_ids
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            return self._forward_decode_hisparse_sparse(
+                q, k, v, layer, forward_batch, disable_value,
+                idx_q, idx_k, idx_v,
+            )
+
+        # ── Standard / non-HiSparse path (also HiSparse dense layers) ──
         self.kv_pool.set_fused_kv_index_buffer(
             layer,
             forward_batch.out_cache_loc,
@@ -479,16 +852,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch,
                 )
 
-        # The MSA decode page table + plan are built once per forward in
-        # init_forward_metadata_out_graph (eager, outside graph capture) and shared
-        # across all sparse layers; here we just consume the cached metadata.
         msa_kv_indices = msa_plan = None
         if self._use_msa_decode and attn_fn is None:
             if self._msa_dec_meta is not None:
                 msa_kv_indices, msa_plan = self._msa_dec_meta
             elif q.shape[0] > 0:
-                # Rebuilding the plan inline would run host-side code inside
-                # CUDA-graph capture; fail loudly instead.
                 raise RuntimeError(
                     "MSA decode metadata missing: init_forward_metadata_out_graph "
                     "did not prepare the plan for this forward (gate mismatch)."
