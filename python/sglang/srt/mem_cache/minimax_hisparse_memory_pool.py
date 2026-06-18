@@ -593,6 +593,30 @@ class MiniMaxHiSparseKVPool(KVCache):
         )
         return _as_cpu_long(host_locs)
 
+    def backup_sparse_main_from_standard_pool(
+        self,
+        layer_id: int,
+        host_locs: torch.Tensor,
+        standard_k_cache: torch.Tensor,
+        standard_v_cache: torch.Tensor,
+        standard_indices: torch.Tensor,
+    ) -> None:
+        """Backup sparse main K/V from a standard (external) GPU pool to host memory.
+
+        Reads K/V at ``standard_indices`` from the standard pool and writes them
+        to ``host_locs`` in the host backing store for the given sparse layer.
+
+        This is a thin bridge for Plan B: when dense_main_pool and
+        sparse_index_k_pool are unused, a standard MiniMaxSparseKVPool holds
+        the authoritative full K/V, and this method copies selected sparse main
+        K/V pages into the HiSparse host pool.
+        """
+        cache_k = standard_k_cache[standard_indices]
+        cache_v = standard_v_cache[standard_indices]
+        self.backup_sparse_main_to_host(
+            layer_id, host_locs, cache_k=cache_k, cache_v=cache_v
+        )
+
     def _load_sparse_main_locs_to_hot(
         self,
         layer_id: int,
