@@ -88,11 +88,34 @@ def _make_kv_pool(host_pool=None):
         host_pool = _make_host_pool()
     pool = SimpleNamespace()
     pool.sparse_main_host_pool = host_pool
+    pool.local_sparse_layer_ids = list(range(3, 60))  # layers 3-59
+    pool.backup_sparse_main_from_standard_pool = (
+        lambda layer_id, host_locs,
+        standard_k_cache, standard_v_cache,
+        standard_indices: None
+    )
+    return pool
+
+
+def _make_standard_kv_pool():
+    """Mock MiniMaxSparseKVPool — returns a dummy (k, v) per layer."""
+    pool = SimpleNamespace()
+
+    def _get_kv_buffer(layer_id):
+        k = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+        v = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+        return k, v
+
+    pool.get_kv_buffer = _get_kv_buffer
     return pool
 
 
 def _make_allocator():
-    return SimpleNamespace()
+    alloc = SimpleNamespace()
+    alloc.free = lambda indices: None
+    alloc.size = 100000
+    alloc.available_size = lambda: 99999
+    return alloc
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +135,15 @@ _COORDINATOR_PATH = (
 _mock_utils = SimpleNamespace()
 _mock_utils.get_device_module = lambda: SimpleNamespace(Stream=lambda: None)
 sys.modules["sglang.srt.utils"] = _mock_utils
+
+# Mock HiSparseTokenStats for the coordinator import
+from collections import namedtuple
+_mock_hisparse_coord = SimpleNamespace()
+_mock_hisparse_coord.HiSparseTokenStats = namedtuple(
+    "HiSparseTokenStats",
+    ["device_tokens", "device_token_usage", "host_tokens", "host_token_usage"],
+)
+sys.modules["sglang.srt.managers.hisparse_coordinator"] = _mock_hisparse_coord
 
 # Load coordinator module from source
 spec = importlib.util.spec_from_file_location(
@@ -143,12 +175,14 @@ class TestMiniMaxHiSparseCoordinator(unittest.TestCase):
             size=self.host_size, page_size=self.page_size
         )
         self.kv_pool = _make_kv_pool(host_pool=self.host_pool)
+        self.standard_pool = _make_standard_kv_pool()
         self.allocator = _make_allocator()
 
         self.coordinator = MiniMaxHiSparseCoordinator(
             req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.kv_pool,
             token_to_kv_pool_allocator=self.allocator,
+            standard_kv_pool=self.standard_pool,
+            hisparse_kv_pool=self.kv_pool,
             device="cpu",
         )
 
@@ -367,8 +401,9 @@ class TestMiniMaxHiSparseCoordinator(unittest.TestCase):
 
         coord = MiniMaxHiSparseCoordinator(
             req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=small_kv,
             token_to_kv_pool_allocator=self.allocator,
+            standard_kv_pool=self.standard_pool,
+            hisparse_kv_pool=small_kv,
             device="cpu",
         )
 

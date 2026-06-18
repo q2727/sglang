@@ -673,6 +673,28 @@ class ModelRunnerKVCacheMixin:
                         "hot_size": hisparse_cfg.device_buffer_size,
                         "host_to_device_ratio": hisparse_cfg.host_to_device_ratio,
                     }
+                    # Also create a standard MiniMaxSparseKVPool for prefill.
+                    # Prefill writes all K/V (dense + sparse main + index) to
+                    # the standard pool on GPU; after prefill the coordinator
+                    # backs up sparse main K/V to the HiSparse host pool.
+                    self.standard_kv_pool = MiniMaxSparseKVPool(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        index_dtype=self.dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        idx_head_dim=sparse_cfg["sparse_index_dim"],
+                        dense_layer_ids=dense_layer_ids,
+                        sparse_layer_ids=sparse_layer_ids,
+                        disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
                 self.token_to_kv_pool = pool_cls(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,

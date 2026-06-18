@@ -863,8 +863,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 self.hisparse_coordinator = MiniMaxHiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool=self.token_to_kv_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    standard_kv_pool=self.standard_kv_pool,
+                    hisparse_kv_pool=self.token_to_kv_pool,
                     device=self.device,
                 )
             else:
