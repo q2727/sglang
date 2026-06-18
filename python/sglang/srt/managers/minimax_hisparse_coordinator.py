@@ -15,6 +15,24 @@ Data flow::
       → decode (standard pool: dense/index K; hisparse: hot sparse main K/V)
 
 No staging queue, no async DMA, no per-request device buffer, no compress_ratio.
+
+
+GPU-resident tensors for Agent D JIT kernel
+--------------------------------------------
+
+``req_to_host`` lives on GPU so Agent D's block-swap kernel can read it
+directly without a D2H copy.  Pre-allocated fixed-shape buffers mirror
+DSA's ``top_k_device_locs_buffer`` / ``raw_indices_buffer`` pattern and
+are graph-safe:
+
+- ``hot_page_table_buffer``: [max_reqs, max_pages_per_req] int32
+- ``hot_kv_indices_buffer``: [max_reqs * max_pages_per_req] int32
+- ``host_locs_buffer``: [max_reqs * max_pages_per_req * block_size] int64
+- ``hot_locs_buffer``:  same shape as host_locs_buffer
+
+These buffers are *not* layer-scoped (unlike DSA's per-layer tensors)
+because M3 has a per-layer global hot buffer; the kernel writes into
+them and the attention backend reads them for that layer.
 """
 
 from __future__ import annotations
@@ -64,17 +82,53 @@ class MiniMaxHiSparseCoordinator:
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
+        block_size = hisparse_kv_pool.page_size
+        max_pages_per_req = (max_context_len + block_size - 1) // block_size
 
+        # Primary mapping: (req_pool_idx, logical_token_pos) → host pool slot.
+        # GPU-resident so Agent D's JIT block-swap kernel can read it directly.
         self.req_to_host = torch.full(
             (max_num_reqs, max_context_len),
             -1,
             dtype=torch.int64,
-            device="cpu",
+            device=device,
         )
         self.req_to_host_allocated_len = torch.zeros(
             max_num_reqs, dtype=torch.int64, device="cpu"
         )
 
+        # ------------------------------------------------------------------
+        # Graph-safe pre-allocated buffers (M3 equivalents of DSA's
+        # top_k_device_locs_buffer / raw_indices_buffer).
+        # Agent D's block-swap JIT kernel writes into these each decode step.
+        # ------------------------------------------------------------------
+        max_selected_tokens = max_num_reqs * max_pages_per_req * block_size
+        self.hot_page_table_buffer = torch.full(
+            (max_num_reqs, max_pages_per_req),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.hot_kv_indices_buffer = torch.full(
+            (max_num_reqs * max_pages_per_req,),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.host_locs_buffer = torch.full(
+            (max_selected_tokens,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.hot_locs_buffer = torch.full(
+            (max_selected_tokens,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+
+        # Scalar: number of real (non-padded) requests, updated before graph replay.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
         self._decode_producer_stream: Optional[device_module.Stream] = None
 
@@ -115,8 +169,9 @@ class MiniMaxHiSparseCoordinator:
         if prefill_len <= 0:
             return
 
-        # 1. Allocate host slots
-        host_locs = self._alloc_host_slots(prefill_len)
+        # 1. Allocate host slots (CPU), write to GPU req_to_host
+        host_locs_cpu = self._alloc_host_slots(prefill_len)
+        host_locs = host_locs_cpu.to(device=self.device, dtype=torch.int64)
         self.req_to_host[req.req_pool_idx, :prefill_len] = host_locs
         self.req_to_host_allocated_len[req.req_pool_idx] = prefill_len
 
@@ -126,11 +181,12 @@ class MiniMaxHiSparseCoordinator:
         ]
 
         # 3. Backup sparse main K/V from standard pool → hisparse host
+        #    Pass CPU host_locs to the bridge (it writes to CPU host pool).
         for layer_id in self._sparse_layer_ids:
             k_cache, v_cache = self.standard_kv_pool.get_kv_buffer(layer_id)
             self.hisparse_kv_pool.backup_sparse_main_from_standard_pool(
                 layer_id=layer_id,
-                host_locs=host_locs,
+                host_locs=host_locs_cpu,
                 standard_k_cache=k_cache,
                 standard_v_cache=v_cache,
                 standard_indices=gpu_indices,
@@ -169,7 +225,8 @@ class MiniMaxHiSparseCoordinator:
             return
 
         num_new = seq_len - current_allocated
-        host_locs = self._alloc_host_slots(num_new)
+        host_locs_cpu = self._alloc_host_slots(num_new)
+        host_locs = host_locs_cpu.to(device=self.device, dtype=torch.int64)
         self.req_to_host[
             req.req_pool_idx, current_allocated:seq_len
         ] = host_locs
@@ -189,11 +246,11 @@ class MiniMaxHiSparseCoordinator:
             if gpu_slots.numel() > 0:
                 self.token_to_kv_pool_allocator.free(gpu_slots)
 
-        # 2. Free hisparse host pool slots
+        # 2. Free hisparse host pool slots (GPU → CPU for host pool free)
         if allocated_len > 0:
             host_locs = self.req_to_host[
                 req.req_pool_idx, :allocated_len
-            ].clone()
+            ].to(device="cpu", copy=True)
             self._free_host_slots(host_locs)
 
         # 3. Clear bookkeeping
@@ -244,6 +301,19 @@ class MiniMaxHiSparseCoordinator:
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
         pass
+
+    # ------------------------------------------------------------------
+    # Graph replay hook (called by model_runner before CUDA graph replay)
+    # ------------------------------------------------------------------
+
+    def prepare_for_graph_replay(self, forward_batch) -> None:
+        """Update per-batch GPU state before CUDA graph replay.
+
+        Called unconditionally before every decode forward pass (both graph
+        and eager paths).  Sets ``num_real_reqs`` so graph-captured kernels
+        skip padded batch entries.
+        """
+        self.num_real_reqs.fill_(forward_batch.batch_size)
 
     # ------------------------------------------------------------------
     # Token stats

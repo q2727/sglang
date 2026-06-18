@@ -89,6 +89,7 @@ def _make_kv_pool(host_pool=None):
     pool = SimpleNamespace()
     pool.sparse_main_host_pool = host_pool
     pool.local_sparse_layer_ids = list(range(3, 60))  # layers 3-59
+    pool.page_size = 128  # sparse_block_size for M3
     pool.backup_sparse_main_from_standard_pool = (
         lambda layer_id, host_locs,
         standard_k_cache, standard_v_cache,
@@ -471,6 +472,56 @@ class TestMiniMaxHiSparseCoordinator(unittest.TestCase):
         """num_real_reqs can be updated."""
         self.coordinator.num_real_reqs.fill_(5)
         self.assertEqual(int(self.coordinator.num_real_reqs.item()), 5)
+
+    # ------------------------------------------------------------------
+    # GPU req_to_host
+    # ------------------------------------------------------------------
+
+    def test_req_to_host_on_device(self):
+        """req_to_host lives on the coordinator's device (GPU), not CPU."""
+        self.assertEqual(
+            str(self.coordinator.req_to_host.device),
+            str(self.coordinator.device),
+        )
+
+    # ------------------------------------------------------------------
+    # Pre-allocated graph-safe buffers
+    # ------------------------------------------------------------------
+
+    def test_graph_buffers_pre_allocated(self):
+        """Graph-safe buffers exist with expected shapes and dtypes."""
+        max_pages = (
+            self.max_context_len + self.page_size - 1
+        ) // self.page_size
+        self.assertEqual(
+            self.coordinator.hot_page_table_buffer.shape,
+            (self.max_reqs, max_pages),
+        )
+        self.assertEqual(self.coordinator.hot_page_table_buffer.dtype, torch.int32)
+        self.assertEqual(
+            self.coordinator.hot_kv_indices_buffer.shape,
+            (self.max_reqs * max_pages,),
+        )
+        self.assertTrue(
+            torch.all(self.coordinator.host_locs_buffer == -1),
+        )
+        self.assertTrue(
+            torch.all(self.coordinator.hot_locs_buffer == -1),
+        )
+
+    # ------------------------------------------------------------------
+    # prepare_for_graph_replay
+    # ------------------------------------------------------------------
+
+    def test_prepare_for_graph_replay_updates_num_real_reqs(self):
+        """prepare_for_graph_replay sets num_real_reqs from batch size."""
+        mock_batch = SimpleNamespace(batch_size=3)
+        self.coordinator.prepare_for_graph_replay(mock_batch)
+        self.assertEqual(int(self.coordinator.num_real_reqs.item()), 3)
+
+        mock_batch.batch_size = 7
+        self.coordinator.prepare_for_graph_replay(mock_batch)
+        self.assertEqual(int(self.coordinator.num_real_reqs.item()), 7)
 
 
 class TestMiniMaxHiSparseModelDetection(unittest.TestCase):
