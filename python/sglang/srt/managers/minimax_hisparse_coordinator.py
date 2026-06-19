@@ -130,6 +130,11 @@ class MiniMaxHiSparseCoordinator:
 
         # Scalar: number of real (non-padded) requests, updated before graph replay.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+
+        # Async backup stream + sync event (mirrors DSA's decode_backup_stream pattern)
+        self.decode_backup_stream = device_module.Stream()
+        self._backup_done_event = device_module.Event()
+        self._has_pending_backup = False
         self._decode_producer_stream: Optional[device_module.Stream] = None
 
     # ------------------------------------------------------------------
@@ -279,17 +284,20 @@ class MiniMaxHiSparseCoordinator:
         return []
 
     # ------------------------------------------------------------------
-    # Stream management
+    # Stream management (mirrors DSA's async backup pattern)
     # ------------------------------------------------------------------
 
     def set_decode_producer_stream(self, stream) -> None:
         self._decode_producer_stream = stream
 
     def wait_for_pending_backup(self) -> None:
-        pass
+        if not self._has_pending_backup:
+            return
+        self._backup_done_event.wait(device_module.current_stream())
+        self._has_pending_backup = False
 
     # ------------------------------------------------------------------
-    # Per-step scheduler hooks
+    # Per-step decode backup (called before each decode forward pass)
     # ------------------------------------------------------------------
 
     def map_last_loc_to_buffer(
@@ -300,7 +308,79 @@ class MiniMaxHiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        pass
+        """Back up the previous decode token's sparse main K/V to host.
+
+        Called from ``ScheduleBatch.prepare_for_decode`` BEFORE each decode
+        forward pass (outside CUDA graph).  At this point ``seq_lens`` has
+        already been incremented, so the token that was stored in the
+        PREVIOUS step is at logical position ``seq_len - 2``.
+
+        Runs on ``self.decode_backup_stream`` so the backup overlaps with
+        the current step's forward pass on the main stream.
+        """
+        # Build list of batch positions that need a backup.
+        # Skip the first decode step after prefill (all prefill tokens were
+        # already backed up by admit_prefill).
+        # For every subsequent decode step, back up position seq_len - 2.
+        backup_indices = []
+        for i in range(len(seq_lens_cpu)):
+            seq_len = int(seq_lens_cpu[i])
+            prev_pos = seq_len - 2
+            if prev_pos < 0:
+                continue
+            req_idx = int(req_pool_indices_cpu[i])
+            # Only backup if a host slot was allocated for this position
+            # (positions before prefill already have data; positions after
+            #  prefill need explicit backup each step).
+            if int(self.req_to_host_allocated_len[req_idx]) > prev_pos:
+                backup_indices.append(i)
+
+        if not backup_indices:
+            return
+
+        backup_indices_gpu = torch.tensor(
+            backup_indices, dtype=torch.int64, device=self.device
+        )
+        backup_req_indices = req_pool_indices[backup_indices_gpu]
+
+        # GPU slot for the previous token in the standard pool
+        prev_positions = seq_lens[backup_indices_gpu] - 2
+        gpu_slots = self.req_to_token_pool.req_to_token[
+            backup_req_indices, prev_positions
+        ]
+
+        # Host slot for the previous token
+        host_locs = self.req_to_host[backup_req_indices, prev_positions]
+
+        # Wait for any in-flight backup, then submit async backup
+        self.wait_for_pending_backup()
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self._decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(
+                    self._decode_producer_stream
+                )
+            for layer_id in self._sparse_layer_ids:
+                k_cache, v_cache = self.standard_kv_pool.get_kv_buffer(
+                    layer_id
+                )
+                self.hisparse_kv_pool.backup_sparse_main_from_standard_pool(
+                    layer_id=layer_id,
+                    host_locs=host_locs,
+                    standard_k_cache=k_cache,
+                    standard_v_cache=v_cache,
+                    standard_indices=gpu_slots,
+                )
+            self._backup_done_event.record()
+            # Protect tensors that may go out of scope before stream completes
+            if gpu_slots.is_cuda:
+                gpu_slots.record_stream(self.decode_backup_stream)
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if backup_req_indices.is_cuda:
+                backup_req_indices.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
 
     # ------------------------------------------------------------------
     # Graph replay hook (called by model_runner before CUDA graph replay)
@@ -309,10 +389,11 @@ class MiniMaxHiSparseCoordinator:
     def prepare_for_graph_replay(self, forward_batch) -> None:
         """Update per-batch GPU state before CUDA graph replay.
 
-        Called unconditionally before every decode forward pass (both graph
-        and eager paths).  Sets ``num_real_reqs`` so graph-captured kernels
-        skip padded batch entries.
+        Called before every decode forward pass.  Blocks until the async
+        backup from ``map_last_loc_to_buffer`` completes, then sets
+        ``num_real_reqs`` so graph-captured kernels skip padded entries.
         """
+        self.wait_for_pending_backup()
         self.num_real_reqs.fill_(forward_batch.batch_size)
 
     # ------------------------------------------------------------------
