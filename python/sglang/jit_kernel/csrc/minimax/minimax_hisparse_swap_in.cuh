@@ -92,14 +92,17 @@ __global__ void minimax_hisparse_swap_in_kernel(
   __shared__ int32_t s_token_offsets[kMaxEntries + 1], s_warp_sums[kWarps];
   __shared__ int64_t s_req_row, s_seq_len;
   __shared__ int32_t s_num_pages, s_count, s_start_page, s_total_tokens;
+  __shared__ int32_t s_has_local, s_local_idx;    // local-block skip
 
   if (tx == 0) {
     s_req_row=req_pool_indices[batch_id]; s_seq_len=seq_lens[batch_id];
     s_num_pages=(s_seq_len+PAGE_SIZE-1)/PAGE_SIZE; s_count=0; s_total_tokens=0;
+    s_has_local=0; s_local_idx=-1;
   }
   __syncthreads();
   const int64_t seq_len=s_seq_len, req_row=s_req_row;
   const int num_pages=s_num_pages;
+  const int32_t local_block_id = num_pages - 1;  // last logical block = local
 
   // P1 load
   if (tx < total_entries) {
@@ -132,7 +135,18 @@ __global__ void minimax_hisparse_swap_in_kernel(
   __syncthreads();
   const int32_t cnt=s_count;
 
-  // P4 token counts
+  // P3.5: identify local block (last logical block), swap to end of s_unique
+  if(tx<cnt && s_unique[tx]==local_block_id){s_has_local=1; s_local_idx=tx;}
+  __syncthreads();
+  if(s_has_local && tx==0){
+    int32_t last=cnt-1, li=s_local_idx;
+    if(li!=last){int32_t tmp=s_unique[li]; s_unique[li]=s_unique[last]; s_unique[last]=tmp;}
+  }
+  __syncthreads();
+  const int32_t has_local = s_has_local;
+  const int32_t nonlocal_cnt = cnt - has_local;  // blocks needing H2D copy
+
+  // P4 token counts (recompute after possible swap)
   if(tx<cnt){int32_t bs=s_unique[tx]*PAGE_SIZE;s_token_counts[tx]=max(0,min(PAGE_SIZE,(int32_t)seq_len-bs));}
   __syncthreads();
 
@@ -140,21 +154,25 @@ __global__ void minimax_hisparse_swap_in_kernel(
   if(tx==0){int32_t a=0;for(int i=0;i<cnt;++i){s_token_offsets[i]=a;a+=s_token_counts[i];}s_token_offsets[cnt]=a;s_total_tokens=a;}
   __syncthreads();
 
-  // P6 atomic alloc
-  if(tx==0&&cnt>0)s_start_page=atomicAdd(next_hot_page,cnt);
+  // P6 atomic alloc — only allocate for non-local blocks
+  if(tx==0&&nonlocal_cnt>0)s_start_page=atomicAdd(next_hot_page,nonlocal_cnt);
   __syncthreads();
-  if(tx==0&&cnt>0&&(s_start_page+cnt>hot_page_capacity))atomicExch(overflow_flag,1);
+  if(tx==0&&nonlocal_cnt>0&&(s_start_page+nonlocal_cnt>hot_page_capacity))atomicExch(overflow_flag,1);
   __syncthreads();
   const int32_t sp=s_start_page;
 
-  // P7 page table
-  if(tx<cnt)hot_page_table[batch_id*max_pages+s_unique[tx]]=hot_page_offset+sp+tx;
+  // P7 page table: local→0 (reserved page), others→hot_page_offset+sp+pos
+  // s_unique layout after swap: [nonlocal_0, ..., nonlocal_{k-1}, local (at cnt-1)]
+  if(tx<cnt){
+    int32_t hp = (has_local && tx==cnt-1) ? 0 : hot_page_offset+sp+tx;
+    hot_page_table[batch_id*max_pages+s_unique[tx]]=hp;
+  }
   __syncthreads();
 
-  // P8 inline H2D copy
+  // P8 inline H2D copy — skip local block (it lives in page 0, already resident)
   const int k_stride=head_num*head_dim*elem_size_bytes;
   const int64_t req_off=req_row*(int64_t)max_ctx;
-  if(tx<cnt){
+  if(tx<nonlocal_cnt){
     int32_t blk=s_unique[tx],hp=hot_page_offset+sp+tx;
     int32_t bs=blk*PAGE_SIZE,nt=s_token_counts[tx];
     for(int t=0;t<nt;++t){
@@ -165,9 +183,15 @@ __global__ void minimax_hisparse_swap_in_kernel(
     }
   }
 
-  // P9 kv_indices
-  if(tx==0)hot_kv_indices_offset[batch_id]=cnt;
-  if(tx<cnt)hot_kv_indices[batch_id*max_pages+tx]=hot_page_offset+sp+tx;
+  // P9 kv_indices: local→0, others→hot_page_offset+sp+pos
+  if(tx==0) hot_kv_indices_offset[batch_id]=cnt;
+  __syncthreads();
+  if(tx<cnt){
+    int32_t hp;
+    if(has_local && tx==cnt-1) hp=0;
+    else hp=hot_page_offset+sp+tx;
+    hot_kv_indices[batch_id*max_pages+tx]=hp;
+  }
 }
 
 }  // namespace
