@@ -308,51 +308,48 @@ class MiniMaxHiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        """Back up the previous decode token's sparse main K/V to host.
+        """Back up the hot local page (page 0) to hisparse host pool.
 
         Called from ``ScheduleBatch.prepare_for_decode`` BEFORE each decode
         forward pass (outside CUDA graph).  At this point ``seq_lens`` has
-        already been incremented, so the token that was stored in the
-        PREVIOUS step is at logical position ``seq_len - 2``.
+        already been incremented.
 
-        Runs on ``self.decode_backup_stream`` so the backup overlaps with
-        the current step's forward pass on the main stream.
+        Uses ``hisparse_kv_pool.backup_local_to_host`` which copies the
+        entire hot local page (``page_size`` tokens) from the hot GPU buffer
+        to the host pool.  Runs on ``self.decode_backup_stream`` so the
+        backup overlaps with the main-stream forward pass.
         """
-        # Build list of batch positions that need a backup.
-        # Skip the first decode step after prefill (all prefill tokens were
-        # already backed up by admit_prefill).
-        # For every subsequent decode step, back up position seq_len - 2.
-        backup_indices = []
+        page_size = self.hisparse_kv_pool.page_size
+
+        # Collect requests whose local page needs backing up.
+        backup_req_indices_list = []
+        backup_host_locs_list = []
         for i in range(len(seq_lens_cpu)):
             seq_len = int(seq_lens_cpu[i])
-            prev_pos = seq_len - 2
-            if prev_pos < 0:
+            if seq_len <= 0:
                 continue
             req_idx = int(req_pool_indices_cpu[i])
-            # Only backup if a host slot was allocated for this position
-            # (positions before prefill already have data; positions after
-            #  prefill need explicit backup each step).
-            if int(self.req_to_host_allocated_len[req_idx]) > prev_pos:
-                backup_indices.append(i)
+            # Local page: last page_size logical positions
+            local_start = max(0, seq_len - page_size)
+            if int(self.req_to_host_allocated_len[req_idx]) < seq_len:
+                continue
+            host_locs_local = self.req_to_host[
+                req_idx, local_start:seq_len
+            ]
+            backup_req_indices_list.append(req_idx)
+            backup_host_locs_list.append(host_locs_local)
 
-        if not backup_indices:
+        if not backup_req_indices_list:
             return
 
-        backup_indices_gpu = torch.tensor(
-            backup_indices, dtype=torch.int64, device=self.device
+        # Stack into [num_backup_reqs, page_size]
+        host_locs = torch.stack(backup_host_locs_list)
+
+        backup_req_indices = torch.tensor(
+            backup_req_indices_list, dtype=torch.int64, device=self.device
         )
-        backup_req_indices = req_pool_indices[backup_indices_gpu]
 
-        # GPU slot for the previous token in the standard pool
-        prev_positions = seq_lens[backup_indices_gpu] - 2
-        gpu_slots = self.req_to_token_pool.req_to_token[
-            backup_req_indices, prev_positions
-        ]
-
-        # Host slot for the previous token
-        host_locs = self.req_to_host[backup_req_indices, prev_positions]
-
-        # Wait for any in-flight backup, then submit async backup
+        # Wait for in-flight backup, then submit async
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
         with device_module.stream(self.decode_backup_stream):
@@ -362,20 +359,11 @@ class MiniMaxHiSparseCoordinator:
                     self._decode_producer_stream
                 )
             for layer_id in self._sparse_layer_ids:
-                k_cache, v_cache = self.standard_kv_pool.get_kv_buffer(
-                    layer_id
-                )
-                self.hisparse_kv_pool.backup_sparse_main_from_standard_pool(
+                self.hisparse_kv_pool.backup_local_to_host(
                     layer_id=layer_id,
                     host_locs=host_locs,
-                    standard_k_cache=k_cache,
-                    standard_v_cache=v_cache,
-                    standard_indices=gpu_slots,
                 )
             self._backup_done_event.record()
-            # Protect tensors that may go out of scope before stream completes
-            if gpu_slots.is_cuda:
-                gpu_slots.record_stream(self.decode_backup_stream)
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
             if backup_req_indices.is_cuda:
