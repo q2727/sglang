@@ -618,6 +618,43 @@ class MiniMaxHiSparseKVPool(KVCache):
             layer_id, host_locs, cache_k=cache_k, cache_v=cache_v
         )
 
+    # ── local page helpers ──────────────────────────────────────────
+    # Page 0 in the hot buffer is the *local page*, reserved for the
+    # current decode token.  topk-block loads start at hot_page_offset=1.
+
+    def write_cur_kv_to_hot(
+        self,
+        layer_id: int,
+        hot_loc: torch.Tensor,   # scalar or 1D int64, positions inside page 0
+        k: torch.Tensor,         # [N, Hkv, D] or [Hkv, D]
+        v: torch.Tensor,         # [N, Hkv, D] or [Hkv, D]
+    ) -> None:
+        """Write current-token main K/V directly into hot page 0 (GPU only)."""
+        hot_k, hot_v = self.get_hot_kv_buffer(layer_id)
+        hot_loc_device = hot_loc.to(device=hot_k.device, dtype=torch.long)
+        _check_indices("hot_loc", _as_cpu_long(hot_loc), self.page_size)
+        hot_k[hot_loc_device] = k.to(device=hot_k.device, dtype=hot_k.dtype)
+        hot_v[hot_loc_device] = v.to(device=hot_v.device, dtype=hot_v.dtype)
+
+    def backup_local_to_host(
+        self,
+        layer_id: int,
+        host_locs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Copy hot page 0 (the local page) to host pool at *host_locs*.
+
+        Returns the CPU copy of *host_locs* (``torch.long``).
+        """
+        hot_k, hot_v = self.get_hot_kv_buffer(layer_id)
+        local_page_hot_locs = torch.arange(
+            0, self.page_size, dtype=torch.long, device=hot_k.device
+        )
+        return self.backup_sparse_main_to_host(
+            layer_id,
+            host_locs,
+            hot_locs=local_page_hot_locs,
+        )
+
     def _load_sparse_main_locs_to_hot(
         self,
         layer_id: int,
