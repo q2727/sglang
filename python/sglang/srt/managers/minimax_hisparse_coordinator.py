@@ -297,7 +297,7 @@ class MiniMaxHiSparseCoordinator:
         self._has_pending_backup = False
 
     # ------------------------------------------------------------------
-    # Per-step decode backup (called before each decode forward pass)
+    # Per-step decode backup (called outside CUDA graph, before graph replay)
     # ------------------------------------------------------------------
 
     def map_last_loc_to_buffer(
@@ -308,46 +308,68 @@ class MiniMaxHiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
-        """Back up the hot local page (page 0) to hisparse host pool.
+        """No-op: per-step backup is in ``async_backup_previous_token``.
 
-        Called from ``ScheduleBatch.prepare_for_decode`` BEFORE each decode
-        forward pass (outside CUDA graph).  At this point ``seq_lens`` has
-        already been incremented.
-
-        Uses ``hisparse_kv_pool.backup_local_to_host`` which copies the
-        entire hot local page (``page_size`` tokens) from the hot GPU buffer
-        to the host pool.  Runs on ``self.decode_backup_stream`` so the
-        backup overlaps with the main-stream forward pass.
+        Host slots are allocated by ``extend_decode`` and graph-internal
+        backup is handled by Agent E's attention backend.  Async backup
+        from the standard pool to the hisparse host pool is triggered by
+        ``async_backup_previous_token`` before graph replay.
         """
-        page_size = self.hisparse_kv_pool.page_size
+        pass
 
-        # Collect requests whose local page needs backing up.
-        backup_req_indices_list = []
-        backup_host_locs_list = []
+    def async_backup_previous_token(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> None:
+        """Async backup of the previous decode token's sparse main K/V.
+
+        Copies sparse main K/V at logical position ``seq_len - 2`` from
+        the **standard pool** (GPU) to the **hisparse host pool** (CPU) on
+        ``decode_backup_stream``.  The backup overlaps with the main-stream
+        forward pass.
+
+        Called outside the CUDA graph — ``prepare_for_graph_replay``
+        triggers it before each graph replay.
+
+        References DSA ``_eager_backup_previous_token`` for the async
+        stream layering pattern, but is simpler: no compress_ratio, no
+        per-request device buffer, no staged skip logic.
+        """
+        # Identify requests that have a previous token to backup.
+        # seq_lens has already been incremented by prepare_for_decode;
+        # the token at position seq_len - 2 was stored in the last step.
+        backup_indices = []
+        prev_positions_list = []
         for i in range(len(seq_lens_cpu)):
             seq_len = int(seq_lens_cpu[i])
-            if seq_len <= 0:
+            prev_pos = seq_len - 2
+            if prev_pos < 0:
                 continue
             req_idx = int(req_pool_indices_cpu[i])
-            # Local page: last page_size logical positions
-            local_start = max(0, seq_len - page_size)
-            if int(self.req_to_host_allocated_len[req_idx]) < seq_len:
+            if prev_pos >= int(self.req_to_host_allocated_len[req_idx]):
                 continue
-            host_locs_local = self.req_to_host[
-                req_idx, local_start:seq_len
-            ]
-            backup_req_indices_list.append(req_idx)
-            backup_host_locs_list.append(host_locs_local)
+            backup_indices.append(i)
+            prev_positions_list.append(prev_pos)
 
-        if not backup_req_indices_list:
+        if not backup_indices:
             return
 
-        # Stack into [num_backup_reqs, page_size]
-        host_locs = torch.stack(backup_host_locs_list)
-
-        backup_req_indices = torch.tensor(
-            backup_req_indices_list, dtype=torch.int64, device=self.device
+        backup_indices_gpu = torch.tensor(
+            backup_indices, dtype=torch.int64, device=self.device
         )
+        backup_req_indices = req_pool_indices[backup_indices_gpu]
+        prev_positions = torch.tensor(
+            prev_positions_list, dtype=torch.int64, device=self.device
+        )
+
+        # GPU slot in standard pool + host slot for the previous token
+        gpu_slots = self.req_to_token_pool.req_to_token[
+            backup_req_indices, prev_positions
+        ]
+        host_locs = self.req_to_host[backup_req_indices, prev_positions]
 
         # Wait for in-flight backup, then submit async
         self.wait_for_pending_backup()
@@ -359,11 +381,19 @@ class MiniMaxHiSparseCoordinator:
                     self._decode_producer_stream
                 )
             for layer_id in self._sparse_layer_ids:
-                self.hisparse_kv_pool.backup_local_to_host(
+                k_cache, v_cache = self.standard_kv_pool.get_kv_buffer(
+                    layer_id
+                )
+                self.hisparse_kv_pool.backup_sparse_main_from_standard_pool(
                     layer_id=layer_id,
                     host_locs=host_locs,
+                    standard_k_cache=k_cache,
+                    standard_v_cache=v_cache,
+                    standard_indices=gpu_slots,
                 )
             self._backup_done_event.record()
+            if gpu_slots.is_cuda:
+                gpu_slots.record_stream(self.decode_backup_stream)
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
             if backup_req_indices.is_cuda:
@@ -377,10 +407,19 @@ class MiniMaxHiSparseCoordinator:
     def prepare_for_graph_replay(self, forward_batch) -> None:
         """Update per-batch GPU state before CUDA graph replay.
 
-        Called before every decode forward pass.  Blocks until the async
-        backup from ``map_last_loc_to_buffer`` completes, then sets
-        ``num_real_reqs`` so graph-captured kernels skip padded entries.
+        1. Triggers ``async_backup_previous_token`` to back up the
+           previous token from standard pool → hisparse host on the
+           async backup stream (NOT captured in the graph).
+        2. Blocks until the async backup completes.
+        3. Sets ``num_real_reqs`` so graph-captured kernels skip
+           padded batch entries.
         """
+        self.async_backup_previous_token(
+            seq_lens=forward_batch.seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+        )
         self.wait_for_pending_backup()
         self.num_real_reqs.fill_(forward_batch.batch_size)
 
