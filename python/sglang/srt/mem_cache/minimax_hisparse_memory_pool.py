@@ -742,6 +742,8 @@ class MiniMaxHiSparseKVPool(KVCache):
         topk_idx: torch.Tensor,
         seq_lens: torch.Tensor,
         num_real_reqs: torch.Tensor,  # [1] int32 GPU scalar — graph-safe
+        current_k: Optional[torch.Tensor] = None,
+        current_v: Optional[torch.Tensor] = None,
     ) -> MiniMaxHiSparseLoadResult:
         """JIT-kernel-accelerated block swap-in (graph-safe).
 
@@ -783,12 +785,21 @@ class MiniMaxHiSparseKVPool(KVCache):
         head_num = hot_k.shape[1]
         head_dim = hot_k.shape[2]
 
+        use_current_kv = current_k is not None
+        if current_k is None:
+            current_k = torch.empty(
+                (1, head_num, head_dim), dtype=hot_k.dtype, device=hot_k.device
+            )
+            current_v = torch.empty_like(current_k)
+
         # === Launch graph-safe kernel (H2D copy inside) ===
         minimax_hisparse_swap_in(
             topk_idx=topk_idx,
             seq_lens=seq_lens,
             req_to_host=req_to_host,
             req_pool_indices=req_pool_indices,
+            current_k=current_k,
+            current_v=current_v,
             host_k_buffer=host_k,
             host_v_buffer=host_v,
             hot_k_buffer=hot_k,
@@ -804,6 +815,7 @@ class MiniMaxHiSparseKVPool(KVCache):
             head_num=head_num,
             head_dim=head_dim,
             elem_size_bytes=elem_size_bytes,
+            use_current_kv=use_current_kv,
         )
 
         # Overflow check (error path — .item() is acceptable here)
@@ -850,6 +862,8 @@ class MiniMaxHiSparseKVPool(KVCache):
         topk_idx: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
+        current_k: Optional[torch.Tensor] = None,
+        current_v: Optional[torch.Tensor] = None,
     ) -> MiniMaxHiSparseLoadResult:
         """Load sparse main K/V rows or selected logical blocks into hot GPU K/V.
 
@@ -901,6 +915,8 @@ class MiniMaxHiSparseKVPool(KVCache):
                 topk_idx,
                 seq_lens,
                 num_real_reqs=self._num_real_reqs,
+                current_k=current_k,
+                current_v=current_v,
             )
 
         # --- Python reference path (CPU fallback) ---
