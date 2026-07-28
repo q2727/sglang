@@ -119,6 +119,10 @@ class DrafterIpcThread:
         # consumption keeps per-seat generation order on the wire.
         self._evented_queue: queue.SimpleQueue[EventedDraftBlock] = queue.SimpleQueue()
         self._evented_fifo: deque[EventedDraftBlock] = deque()
+        # Head-wedge watchdog state (see _drain_evented): which head we have
+        # been blocked on, and since when.
+        self._head_blocked_id: Optional[int] = None
+        self._head_blocked_since = 0.0
         self._closed = threading.Event()
         # Wakes the idle loop the instant a result is queued (latency-critical send).
         self._wakeup = threading.Event()
@@ -251,7 +255,23 @@ class DrafterIpcThread:
         while self._evented_fifo:
             head = self._evented_fifo[0]
             if head.event is not None and not head.event.query():
-                break
+                now = time.monotonic()
+                if self._head_blocked_id != id(head):
+                    self._head_blocked_id = id(head)
+                    self._head_blocked_since = now
+                if now - self._head_blocked_since <= 1.0:
+                    break
+                # Watchdog: the staging copy was enqueued >1s ago on a stream
+                # that has long since produced later rounds; an event that
+                # still reports not-ready is wedged (boot-time race on some
+                # platforms, root cause open), not pending. The pinned data
+                # is settled -- force the send instead of wedging the FIFO
+                # (and with it the whole speculation plane) forever.
+                logger.warning(
+                    "evented head stuck %.1fs (event never fired); force-sending",
+                    now - self._head_blocked_since,
+                )
+            self._head_blocked_id = None
             self._evented_fifo.popleft()
             batch = head.header
             if head.buffer is not None:
