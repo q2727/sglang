@@ -163,6 +163,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     # role validator and the per-algorithm handler consumed it.
     if server_args.decoupled_spec_role == "drafter":
         server_args.speculative_algorithm = None
+        # Also clear num_draft_tokens: on hybrid (GDN) draft models the mamba
+        # pool allocates target-verify intermediate state buffers whenever the
+        # field is set -- [layers, mamba_slots, num_draft_tokens, heads, dk,
+        # dv] fp32, hundreds of GB at useful cache sizes -- and the drafter
+        # never runs target-verify. The enumeration engine sizes itself from
+        # speculative_num_steps / speculative_fanout, which survive.
+        server_args.speculative_num_draft_tokens = None
 
 
 def _handle_decoupled_spec(server_args: ServerArgs) -> None:
