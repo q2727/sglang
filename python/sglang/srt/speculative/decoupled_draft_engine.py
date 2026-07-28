@@ -25,6 +25,17 @@ A miss round (the commit fell outside the last block) collapses to case 0:
 the verifier's select missed the same block the same way and falls back, so
 the next commit can only be a single bonus -- only the F case-0 chains are
 drafted and the dead cells are poisoned (see ``_case0_round``).
+
+Hybrid (GDN / linear-attention) draft models add one twist: besides KV, every
+row carries per-request recurrent state (conv + ssm) in a ``MambaPool`` slot
+resolved through the pool-row mapping at forward time. The engine owns all of
+its slots outright (``_MambaStateArena``): each seat holds a persistent slot
+with the state after the committed prefix (only the advance ever runs on it),
+carrier rows keep fixed slots for their whole lifetime (so the row->slot
+mapping written once at alloc stays valid), and node states are forked
+between slots with batched ``MambaPool.copy_from`` before each phase -- see
+the per-phase fork comments. Everything is gated on ``self._hybrid``; pure-KV
+models take exactly the old paths.
 """
 
 from __future__ import annotations
@@ -41,12 +52,14 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.decoupled_spec_io import DraftReqKey
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -134,6 +147,16 @@ class _DraftReqState:
         # active bet) + the pre-bet mirror snapshot for rollback.
         self.prerun_len = 0
         self.prerun_snapshot: Optional[tuple] = None
+        # Hybrid models only (None on pure-KV): the seat's persistent mamba
+        # slot, holding the recurrent state AFTER the committed prefix (node 0
+        # post-advance). Only the advance extend ever runs on it; every other
+        # phase works on forked copies. Shape [1], mirroring the framework's
+        # per-request ``req.mamba_pool_idx`` convention.
+        self.mamba_slot: Optional[torch.Tensor] = None
+        # Pre-bet copy of the seat state: a prerun's advance contaminates the
+        # seat slot with bet tokens, so the stash restores it on a miss (and
+        # is simply dropped on a hit).
+        self.prerun_mamba_stash: Optional[torch.Tensor] = None
 
     def pending_delta(self) -> list[int]:
         """Committed tokens whose KV has not been advanced yet."""
@@ -167,6 +190,7 @@ class _FanoutVariant(msgspec.Struct):
     br_j: torch.Tensor  # case-prefix scatter cols (backbone slot j)
     comb_j: torch.Tensor  # glue triangle cols + br_j
     case_of_row: list[int]  # accept case per selected row
+    case_of_row_dev: torch.Tensor  # same, device tensor (hybrid fork gather)
 
 
 class _SeatCarrier:
@@ -197,6 +221,8 @@ class _SeatCarrier:
         glue_reqs: list,
         branch_reqs: list,
         synced_len: int,
+        glue_mamba_slots: Optional[torch.Tensor] = None,  # [K] device
+        branch_mamba_slots: Optional[torch.Tensor] = None,  # [(K+1)*F] device
     ) -> None:
         self.glue_rows = glue_rows
         self.branch_rows = branch_rows
@@ -204,6 +230,15 @@ class _SeatCarrier:
         self.glue_reqs = glue_reqs
         self.branch_reqs = branch_reqs
         self.synced_len = synced_len
+        # Hybrid models only (None on pure-KV): engine-owned mamba slots bound
+        # 1:1 to the carrier rows for the carrier's whole lifetime. The pool's
+        # row->slot mapping is written once (at row alloc) and never again --
+        # the fixed binding is what keeps every later fast-round forward on
+        # these rows reading the right recurrent state; per-round content is
+        # refreshed by state FORKS into the slots, not by re-mapping. Glue row
+        # g's slot holds node-(g+1) state after each glue forward.
+        self.glue_mamba_slots = glue_mamba_slots
+        self.branch_mamba_slots = branch_mamba_slots
         # All carrier rows sharing the committed prefix (delta broadcast).
         self.all_rows = torch.cat([glue_rows, branch_rows])
         # Combined scatter rows per effective fanout (values/cols come from
@@ -218,6 +253,52 @@ class _SeatCarrier:
             rows = torch.cat([self.glue_rows[tri_g], self.branch_rows[br_r_pool]])
             self._comb_rows_cache[f_live] = rows
         return rows
+
+
+class _MambaStateArena:
+    """Engine-owned mamba slot free-list in front of ``MambaSlotAllocator``.
+
+    Slots are pulled from the pool allocator lazily (grown on demand) and
+    then recycled inside the engine forever: persistent takes (seat slots,
+    carrier rows) return at seat close/evict, transient takes (slow-path
+    backbone, prerun stash) at round end -- steady-state rounds never touch
+    the allocator. Ids are virtual (same space as ``req.mamba_pool_idx``);
+    translate before physical pool state ops. take/give_back never sync.
+    """
+
+    def __init__(self, *, allocator: MambaSlotAllocator, sizing_hint: str) -> None:
+        self._allocator = allocator
+        self._sizing_hint = sizing_hint
+        self._free_slots: Optional[torch.Tensor] = None
+
+    def take(self, num_slots: int) -> torch.Tensor:
+        free = self._free_slots
+        num_free = 0 if free is None else free.numel()
+        if num_slots == 0:
+            # Degenerate widths (e.g. K == 0) must not dereference an empty
+            # free list.
+            return torch.empty((0,), dtype=torch.int64, device=self._allocator.device)
+        if num_free < num_slots:
+            grown = self._allocator.alloc(num_slots - num_free)
+            if grown is None:
+                raise RuntimeError(
+                    "drafter mamba state pool exhausted "
+                    f"(want {num_slots - num_free} more slots, "
+                    f"{self._allocator.available_size()} free in the pool "
+                    f"allocator); {self._sizing_hint}"
+                )
+            free = grown if free is None else torch.cat([free, grown])
+        taken = free[:num_slots]
+        self._free_slots = free[num_slots:]
+        return taken
+
+    def give_back(self, slots: torch.Tensor) -> None:
+        if slots.numel() == 0:
+            return
+        slots = slots.reshape(-1)
+        self._free_slots = (
+            slots if self._free_slots is None else torch.cat([self._free_slots, slots])
+        )
 
 
 class EnumDraftEngine:
@@ -242,6 +323,43 @@ class EnumDraftEngine:
         self.effective_fanout = self.fanout
         self.unit_width = self.num_steps + 1
         self.device = model_runner.device
+        # Hybrid (GDN) detection + the engine-owned state-slot arena. Both
+        # guards are launch-config errors on the DRAFTER process, caught here
+        # rather than as silent corruption mid-round: extra-buffer tracking
+        # would allocate radix ping-pong slots per scratch req (leaked -- the
+        # engine frees rows via ReqToTokenPool.free, never free_mamba_cache),
+        # and the linear-ReplaySSM ring breaks the copy_from fork invariant
+        # (sources must be fully flushed checkpoints; the engine forks slots
+        # that just ran decode steps).
+        self._hybrid = isinstance(model_runner.req_to_token_pool, HybridReqToTokenPool)
+        self._mamba_arena: Optional[_MambaStateArena] = None
+        if self._hybrid:
+            hybrid_pool = model_runner.req_to_token_pool
+            if hybrid_pool.enable_mamba_extra_buffer:
+                raise RuntimeError(
+                    "the decoupled drafter engine requires the plain mamba pool; "
+                    "launch the drafter without mamba radix tracking "
+                    "(--enable-mamba-extra-buffer)"
+                )
+            if hybrid_pool.mamba_pool.replayssm_write_pos is not None:
+                raise RuntimeError(
+                    "the decoupled drafter engine forks mamba state with "
+                    "MambaPool.copy_from, which requires fully flushed "
+                    "checkpoints; launch the drafter without "
+                    "--enable-linear-replayssm"
+                )
+            # Per-seat worst case: 1 seat + K glue + (K+1)*F branch rows plus
+            # 2 transients (slow-path backbone, prerun stash).
+            slots_per_seat = 3 + self.num_steps + (self.num_steps + 1) * self.fanout
+            self._mamba_arena = _MambaStateArena(
+                allocator=hybrid_pool.mamba_allocator,
+                sizing_hint=(
+                    f"size --max-mamba-cache-size to at least "
+                    f"seats x {slots_per_seat} (1 seat + K glue + (K+1)*F "
+                    f"branch + 2 transient; K={self.num_steps}, "
+                    f"F={self.fanout})"
+                ),
+            )
         self._tree_cache = _ScratchTreeCache(
             page_size=model_runner.server_args.page_size,
             device=model_runner.device,
@@ -279,6 +397,11 @@ class EnumDraftEngine:
         ]
         self._tri_g = torch.tensor(tri_g, dtype=torch.int64, device=self.device)
         self._tri_j = tri_j
+        # Hybrid glue rows re-scan their nested chain prefix (see
+        # _glue_forward): tri_j doubles as the per-seat gather for row g's
+        # input tokens c_1..c_{g+1} and their (shared) backbone KV slots.
+        self._tri_j_dev = torch.tensor(tri_j, dtype=torch.int64, device=self.device)
+        self._tri_row_lens = [g + 1 for g in range(self.num_steps)]
         self._br_r = torch.tensor(br_r, dtype=torch.int64, device=self.device)
         self._br_j = torch.tensor(br_j, dtype=torch.int64, device=self.device)
         self._comb_j = torch.tensor(tri_j + br_j, dtype=torch.int64, device=self.device)
@@ -297,6 +420,9 @@ class EnumDraftEngine:
                 br_j=self._br_j,
                 comb_j=self._comb_j,
                 case_of_row=self._case_of_row,
+                case_of_row_dev=torch.tensor(
+                    self._case_of_row, dtype=torch.int64, device=self.device
+                ),
             )
         }
         # Dead-guess exclusion (see the env var's comment): fast-path rounds
@@ -332,6 +458,13 @@ class EnumDraftEngine:
         self.close(key)
         state = _DraftReqState(req_pool_idx=req_pool_idx, device=self.device)
         state.committed_tokens = list(prompt_tokens) + list(committed_outputs)
+        if self._hybrid:
+            # The seat slot must start ZEROED: the GDN extend kernel reads the
+            # slot's ssm state as the initial state unconditionally, and an
+            # arena-recycled slot still carries the previous seat's state.
+            state.mamba_slot = self._mamba_arena.take(1)
+            pool = self.model_runner.req_to_token_pool
+            pool.mamba_pool.clear_slots(pool.translate_mamba_indices(state.mamba_slot))
         self._states[key] = state
 
     def apply_commit(self, key: DraftReqKey, committed_tokens: list[int]) -> bool:
@@ -358,6 +491,9 @@ class EnumDraftEngine:
             if delta == bet:
                 state.prerun_len = 0
                 state.prerun_snapshot = None
+                # Bet confirmed: the seat slot's bet-advanced state is now the
+                # real committed state; the pre-bet stash is simply dropped.
+                self._drop_prerun_mamba_stash(state)
                 self.prerun_hit_ct += 1
                 return True
             self._rollback_prerun(state)
@@ -385,6 +521,13 @@ class EnumDraftEngine:
             )
             state.committed_slots = state.committed_slots[:base_len]
         state.committed_tokens = state.committed_tokens[:base_len]
+        if state.prerun_mamba_stash is not None:
+            # The bet's advance ran IN PLACE over the seat slot; restore the
+            # stashed pre-bet state before the real delta re-advances it.
+            self._fork_mamba_states(
+                src_slots=state.prerun_mamba_stash, dst_slots=state.mamba_slot
+            )
+            self._drop_prerun_mamba_stash(state)
         units_dev, units_host_clone, backbone_host, mirror_event = state.prerun_snapshot
         state.last_units_dev = units_dev
         if state.last_units_host is not None and units_host_clone is not None:
@@ -394,6 +537,11 @@ class EnumDraftEngine:
         state.mirror_event = mirror_event
         state.prerun_len = 0
         state.prerun_snapshot = None
+
+    def _drop_prerun_mamba_stash(self, state: _DraftReqState) -> None:
+        if state.prerun_mamba_stash is not None:
+            self._mamba_arena.give_back(state.prerun_mamba_stash)
+            state.prerun_mamba_stash = None
 
     @torch.no_grad()
     def speculative_prerun(self, keys: list[DraftReqKey]) -> Optional[dict]:
@@ -430,6 +578,13 @@ class EnumDraftEngine:
                 state.last_backbone_host,
                 state.mirror_event,
             )
+            if self._hybrid:
+                # Snapshot the seat state alongside the mirrors: the prerun's
+                # advance is about to run the bet tokens over the seat slot.
+                state.prerun_mamba_stash = self._mamba_arena.take(1)
+                self._fork_mamba_states(
+                    src_slots=state.mamba_slot, dst_slots=state.prerun_mamba_stash
+                )
             state.committed_tokens.extend(bet_delta)
             state.prerun_len = len(bet_delta)
         try:
@@ -443,8 +598,16 @@ class EnumDraftEngine:
     def close(self, key: DraftReqKey) -> None:
         self._evict_seat(key)
         state = self._states.pop(key, None)
-        if state is not None and state.committed_slots.numel() > 0:
+        if state is None:
+            return
+        if state.committed_slots.numel() > 0:
             self.model_runner.token_to_kv_pool_allocator.free(state.committed_slots)
+        # Seat + stash slots return to the engine arena (never to the pool
+        # allocator: the arena keeps ownership for reuse across seats).
+        if state.mamba_slot is not None:
+            self._mamba_arena.give_back(state.mamba_slot)
+            state.mamba_slot = None
+        self._drop_prerun_mamba_stash(state)
 
     def has(self, key: DraftReqKey) -> bool:
         return key in self._states
@@ -480,6 +643,10 @@ class EnumDraftEngine:
             return None
         scratch_batches: list[ScheduleBatch] = []
         scratch_slots: list[torch.Tensor] = []
+        # Hybrid only: mamba slots that must go back to the arena at round end
+        # (slow-path transients; carrier-destined slots are appended too and
+        # removed on donation, so an aborted slow round cannot leak them).
+        scratch_mamba_slots: list[torch.Tensor] = []
         self.profiler.start_round()
         try:
             hit_keys: list[DraftReqKey] = []
@@ -531,7 +698,11 @@ class EnumDraftEngine:
             if slow_states:
                 parts.append(
                     self._slow_round(
-                        slow_keys, slow_states, scratch_batches, scratch_slots
+                        slow_keys,
+                        slow_states,
+                        scratch_batches,
+                        scratch_slots,
+                        scratch_mamba_slots,
                     )
                 )
             if len(parts) == 1:
@@ -548,7 +719,7 @@ class EnumDraftEngine:
                 "units_device": torch.cat([part["units_device"] for part in parts]),
             }
         finally:
-            self._free_scratch(scratch_batches, scratch_slots)
+            self._free_scratch(scratch_batches, scratch_slots, scratch_mamba_slots)
             self.profiler.mark("free")
 
     def _match_seat(
@@ -600,6 +771,7 @@ class EnumDraftEngine:
             for _ in range(c)
         ]
         br_j = [j for c in range(num_cases) for _ in range(f_live) for j in range(c)]
+        case_of_row = [c for c in range(num_cases) for _ in range(f_live)]
         variant = _FanoutVariant(
             sel_rows_pool=sel_rows_pool,
             sel_rows_dev=torch.tensor(
@@ -611,7 +783,10 @@ class EnumDraftEngine:
             comb_j=torch.tensor(
                 self._tri_j + br_j, dtype=torch.int64, device=self.device
             ),
-            case_of_row=[c for c in range(num_cases) for _ in range(f_live)],
+            case_of_row=case_of_row,
+            case_of_row_dev=torch.tensor(
+                case_of_row, dtype=torch.int64, device=self.device
+            ),
         )
         self._fanout_variants[f_live] = variant
         return variant
@@ -648,11 +823,14 @@ class EnumDraftEngine:
 
         # -- Advance the committed prefix (node 0 logits), as on the slow
         # path; its freshly written KV slots feed the carrier row updates.
+        # The advance runs IN PLACE on the seat's mamba slot (the only phase
+        # ever allowed to): afterwards it holds exactly node-0 state.
         base_lens = [state.committed_slots.numel() for state in states]
         advance_batch, advance_slots = self._extend_batch(
             token_lists=[state.committed_tokens for state in states],
             prefix_slots=[state.committed_slots for state in states],
             tag="advance",
+            mamba_slots=self._seat_mamba_slots(states),
         )
         scratch_batches.append(advance_batch)
         node0_logits = self._forward(advance_batch, tag="advance")
@@ -691,6 +869,17 @@ class EnumDraftEngine:
 
         # -- Glue extend: all K backbone tokens in one forward = node 1..K
         # logits; their KV lands in this round's backbone slots.
+        if self._hybrid:
+            # Every glue row re-scans its chain prefix from node-0 state (see
+            # _glue_forward), so all K rows fork from the seat slot -- the
+            # advance above left it holding exactly node 0. Row g's slot then
+            # naturally ends the glue forward holding node-(g+1) state.
+            self._fork_mamba_states(
+                src_slots=torch.cat(
+                    [state.mamba_slot.repeat(num_steps) for state in states]
+                ),
+                dst_slots=torch.cat([carrier.glue_mamba_slots for carrier in carriers]),
+            )
         glue_logits = self._glue_forward(
             carriers=carriers,
             states=states,
@@ -709,6 +898,27 @@ class EnumDraftEngine:
         guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
 
         # -- Branch chains: K decode replays on the assembled carrier rows.
+        if self._hybrid:
+            # Branch case a's rows start from node-a state: the seat slot for
+            # a == 0, glue row (a-1)'s slot otherwise (its re-scan ended
+            # exactly at node a). One batched fork for all selected rows; the
+            # chain decode steps then advance the branch slots in place.
+            self._fork_mamba_states(
+                src_slots=torch.cat(
+                    [
+                        torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
+                            variant.case_of_row_dev
+                        ]
+                        for state, carrier in zip(states, carriers)
+                    ]
+                ),
+                dst_slots=torch.cat(
+                    [
+                        carrier.branch_mamba_slots[variant.sel_rows_dev]
+                        for carrier in carriers
+                    ]
+                ),
+            )
         chain_steps = self._branch_decode_chain(
             carriers=carriers,
             states=states,
@@ -738,24 +948,46 @@ class EnumDraftEngine:
         glue = self._glue_template
         # Assemble the subset's rows onto the shared shell (rebind-only).
         glue.reqs = [req for carrier in carriers for req in carrier.glue_reqs]
+        # mrope models (Qwen3.5 family) index multimodal_inputs per row in
+        # ForwardBatch.init_new; the shell's build-time list goes stale as the
+        # row count changes, so rebind it (always text-only rows here).
+        glue.multimodal_inputs = [None] * len(glue.reqs)
         glue.req_pool_indices = (
             torch.cat([carrier.glue_rows for carrier in carriers])
             if bs > 1
             else carriers[0].glue_rows
         )
-        glue.extend_lens = [1] * (bs * num_steps)
         glue.extend_logprob_start_lens = [0] * (bs * num_steps)
-        glue.extend_num_tokens = bs * num_steps
         lens = [state.committed_slots.numel() for state in states]
         seq_host = [lens[i] + g + 1 for i in range(bs) for g in range(num_steps)]
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
-        glue.input_ids = torch.cat(chains) if bs > 1 else chains[0]
-        glue.out_cache_loc = backbone_slots.view(-1)
+        if self._hybrid:
+            # GDN extend scans a row's extend tokens from its OWN slot's state
+            # and cannot see node states produced by sibling rows of the same
+            # forward, so the one-token stagger doesn't work for the linear
+            # layers: row g instead re-scans the whole chain prefix c_1..c_{g+1}
+            # from its forked node-0 copy (K(K+1)/2 redundant token-updates --
+            # the price of keeping glue ONE forward). Full-attn KV is unchanged
+            # semantically: every row writes token c_{j+1}'s K/V to the SAME
+            # backbone slot j, and the values are identical across rows (same
+            # token, position, and shared prefix), so the duplicate-index
+            # scatter is benign.
+            glue.extend_lens = self._tri_row_lens * bs
+            glue.extend_num_tokens = bs * len(self._tri_j)
+            chains_stack = torch.stack(chains)
+            glue.input_ids = chains_stack[:, self._tri_j_dev].reshape(-1)
+            glue.out_cache_loc = backbone_slots[:, self._tri_j_dev].reshape(-1)
+            glue.prefix_lens = [lens[i] for i in range(bs) for _ in range(num_steps)]
+        else:
+            glue.extend_lens = [1] * (bs * num_steps)
+            glue.extend_num_tokens = bs * num_steps
+            glue.input_ids = torch.cat(chains) if bs > 1 else chains[0]
+            glue.out_cache_loc = backbone_slots.view(-1)
+            glue.prefix_lens = [s - 1 for s in seq_host]
         glue.seq_lens = seq_cpu.to(self.device, non_blocking=True)
         glue.seq_lens_cpu = seq_cpu
         glue.seq_lens_sum = sum(seq_host)
         glue.orig_seq_lens = glue.seq_lens.to(torch.int32)
-        glue.prefix_lens = [s - 1 for s in seq_host]
         self.profiler.mark("glue_mut")
         return self._forward(glue, tag="glue")
 
@@ -777,6 +1009,8 @@ class EnumDraftEngine:
             for carrier in carriers
             for row in variant.sel_rows_pool
         ]
+        # See _glue_forward: mrope models index this list per row.
+        branch.multimodal_inputs = [None] * len(branch.reqs)
         branch.req_pool_indices = (
             torch.cat(
                 [carrier.branch_rows[variant.sel_rows_dev] for carrier in carriers]
@@ -909,6 +1143,7 @@ class EnumDraftEngine:
             token_lists=[state.committed_tokens for state in states],
             prefix_slots=[state.committed_slots for state in states],
             tag="advance",
+            mamba_slots=self._seat_mamba_slots(states),
         )
         scratch_batches.append(advance_batch)
         node0_logits = self._forward(advance_batch, tag="advance")
@@ -933,6 +1168,8 @@ class EnumDraftEngine:
         branch.reqs = [
             req for carrier in carriers for req in carrier.branch_reqs[:f_live]
         ]
+        # See _glue_forward: mrope models index this list per row.
+        branch.multimodal_inputs = [None] * len(branch.reqs)
         branch.req_pool_indices = (
             torch.cat([carrier.branch_rows[:f_live] for carrier in carriers])
             if bs > 1
@@ -946,6 +1183,17 @@ class EnumDraftEngine:
         branch.seq_lens_cpu = seq_cpu
         branch.seq_lens_sum = None
         branch.orig_seq_lens = branch.seq_lens.to(torch.int32)
+        if self._hybrid:
+            # All case-0 chains start from node 0: fork the freshly advanced
+            # seat state into every live case-0 row before the first decode.
+            self._fork_mamba_states(
+                src_slots=torch.cat(
+                    [state.mamba_slot.repeat(f_live) for state in states]
+                ),
+                dst_slots=torch.cat(
+                    [carrier.branch_mamba_slots[:f_live] for carrier in carriers]
+                ),
+            )
         self.profiler.mark("case0_mut")
         logits, step_slots = self._decode_step(
             branch, node0_guesses.reshape(-1), tag="case0"
@@ -973,6 +1221,7 @@ class EnumDraftEngine:
         states: list[_DraftReqState],
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
+        scratch_mamba_slots: list[torch.Tensor],
     ) -> dict:
         num_steps, fanout = self.num_steps, self.fanout
         num_cases = num_steps + 1
@@ -982,12 +1231,34 @@ class EnumDraftEngine:
         for key in keys:
             self._evict_seat(key)
 
+        # Hybrid: stage the subround's state slots up front. The backbone
+        # advances ONE slot per seat in place; the node checkpoints it passes
+        # through are copied into the future carrier glue slots (glue slot g
+        # <- node-(g+1) state, the same invariant a fast round's glue forward
+        # establishes). All takes ride scratch_mamba_slots so an aborted
+        # subround can't leak them; the carrier build removes the two
+        # persistent tensors on donation (the scratch_batches.remove idiom).
+        glue_mamba_flat = branch_mamba_flat = backbone_mamba_slots = None
+        if self._hybrid:
+            backbone_mamba_slots = self._mamba_arena.take(bs)
+            glue_mamba_flat = self._mamba_arena.take(bs * num_steps)
+            branch_mamba_flat = self._mamba_arena.take(bs * num_cases * fanout)
+            scratch_mamba_slots += [
+                backbone_mamba_slots,
+                glue_mamba_flat,
+                branch_mamba_flat,
+            ]
+        glue_ckpt_slots = (
+            glue_mamba_flat.view(bs, num_steps) if glue_mamba_flat is not None else None
+        )
+
         # -- Phase 1: advance the committed prefix; last logits = node 0 ----
         node_logits: list[torch.Tensor] = []
         advance_batch, advance_slots = self._extend_batch(
             token_lists=[state.committed_tokens for state in states],
             prefix_slots=[state.committed_slots for state in states],
             tag="advance",
+            mamba_slots=self._seat_mamba_slots(states),
         )
         scratch_batches.append(advance_batch)
         logits = self._forward(advance_batch, tag="advance")
@@ -1007,14 +1278,28 @@ class EnumDraftEngine:
                 ],
                 prefix_slots=[state.committed_slots for state in states],
                 tag="backbone",
+                mamba_slots=backbone_mamba_slots,
             )
             scratch_batches.append(backbone_batch)
             scratch_slots.append(first_slots)
             backbone_slot_steps.append(first_slots)
+            if self._hybrid:
+                # The backbone decodes over node-0 state without touching the
+                # seat slot itself: fork it into the dedicated backbone slot.
+                self._fork_mamba_states(
+                    src_slots=self._seat_mamba_slots(states),
+                    dst_slots=backbone_mamba_slots,
+                )
             logits = self._forward(backbone_batch, tag="backbone")
             node_logits.append(logits)
             guesses.append(torch.topk(logits, fanout, dim=-1).indices)
-            for _ in range(num_steps - 1):
+            if self._hybrid and num_steps >= 2:
+                # Node-1 checkpoint (fork source for case-1 branch rows); the
+                # extend just advanced the backbone slot past c_1.
+                self._fork_mamba_states(
+                    src_slots=backbone_mamba_slots, dst_slots=glue_ckpt_slots[:, 0]
+                )
+            for step_idx in range(num_steps - 1):
                 next_tokens = guesses[-1][:, 0]
                 backbone_tokens.append(next_tokens)
                 logits, step_slots = self._decode_step(
@@ -1024,6 +1309,16 @@ class EnumDraftEngine:
                 backbone_slot_steps.append(step_slots)
                 node_logits.append(logits)
                 guesses.append(torch.topk(logits, fanout, dim=-1).indices)
+                if self._hybrid and step_idx < num_steps - 2:
+                    # Node-(step_idx+2) checkpoint. The final decode needs no
+                    # copy: case K forks straight from the backbone slot,
+                    # which ends this loop holding node-K state (glue slot
+                    # K-1 stays stale until the next fast round's fork
+                    # rewrites it -- it is never read before that).
+                    self._fork_mamba_states(
+                        src_slots=backbone_mamba_slots,
+                        dst_slots=glue_ckpt_slots[:, step_idx + 1],
+                    )
 
         # -- Phase 3: branch chains for every (case, guess) -----------------
         # Row order: (req 0: (a0,f0), (a0,f1) ... (aK,fF-1)), (req 1: ...).
@@ -1055,9 +1350,30 @@ class EnumDraftEngine:
             token_lists=branch_token_lists,
             prefix_slots=branch_prefix_slots,
             tag="branch",
+            mamba_slots=branch_mamba_flat,
         )
         scratch_batches.append(branch_batch)
         scratch_slots.append(branch_first_slots)
+        if self._hybrid:
+            # Fork node states into every branch row before its extend reads
+            # them: case 0 <- seat slot, cases 1..K-1 <- the checkpoints,
+            # case K <- the backbone slot itself (it ended at node K).
+            case_of_row_dev = self._fanout_variants[self.fanout].case_of_row_dev
+            self._fork_mamba_states(
+                src_slots=torch.cat(
+                    [
+                        torch.cat(
+                            [
+                                states[i].mamba_slot,
+                                glue_ckpt_slots[i, : num_steps - 1],
+                                backbone_mamba_slots[i : i + 1],
+                            ]
+                        )[case_of_row_dev]
+                        for i in range(bs)
+                    ]
+                ),
+                dst_slots=branch_mamba_flat,
+            )
         logits = self._forward(branch_batch, tag="branch")
         chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
         for _ in range(num_steps - 1):
@@ -1079,8 +1395,11 @@ class EnumDraftEngine:
             branch_batch=branch_batch,
             scratch_batches=scratch_batches,
             scratch_slots=scratch_slots,
+            scratch_mamba_slots=scratch_mamba_slots,
             backbone_cpu=backbone_cpu,
             backbone_slots_dev=backbone_slots_dev,
+            glue_mamba_flat=glue_mamba_flat,
+            branch_mamba_flat=branch_mamba_flat,
         )
         return packed
 
@@ -1174,8 +1493,11 @@ class EnumDraftEngine:
         branch_batch: ScheduleBatch,
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
+        scratch_mamba_slots: list[torch.Tensor],
         backbone_cpu: list[list[int]],
         backbone_slots_dev: torch.Tensor,
+        glue_mamba_flat: Optional[torch.Tensor],
+        branch_mamba_flat: Optional[torch.Tensor],
     ) -> None:
         """Donate this slow subround's branch rows + a freshly built glue
         batch to per-seat carriers (pool rows persist until the seat closes;
@@ -1184,8 +1506,18 @@ class EnumDraftEngine:
         if not self._enable_glue_fast_path:
             return
         # The branch batch's pool rows survive the round; its KV slots are
-        # already tracked in scratch_slots and freed as usual.
+        # already tracked in scratch_slots and freed as usual. On hybrid the
+        # rows' mamba slots survive WITH the rows (the fixed row->slot binding
+        # is what keeps the mapping written at alloc valid), so they move from
+        # the scratch list to carrier ownership here -- identity-filtered, not
+        # list.remove, which would trip tensor __eq__.
         scratch_batches.remove(branch_batch)
+        if glue_mamba_flat is not None:
+            scratch_mamba_slots[:] = [
+                slots
+                for slots in scratch_mamba_slots
+                if slots is not glue_mamba_flat and slots is not branch_mamba_flat
+            ]
         glue_batch, glue_slots = self._extend_batch(
             token_lists=[
                 state.committed_tokens + backbone_cpu[i][: g + 1]
@@ -1198,6 +1530,7 @@ class EnumDraftEngine:
                 for g in range(self.num_steps)
             ],
             tag="glue_build",
+            mamba_slots=glue_mamba_flat,
         )
         # Build-time extend slots are placeholders (no forward ran); the fast
         # path re-points out_cache_loc at each round's backbone slots.
@@ -1207,6 +1540,14 @@ class EnumDraftEngine:
         rows_per_seat = (num_steps + 1) * self.fanout
         glue_rows_all = glue_batch.req_pool_indices.view(bs, num_steps)
         branch_rows_all = branch_batch.req_pool_indices.view(bs, rows_per_seat)
+        glue_mamba_all = (
+            glue_mamba_flat.view(bs, num_steps) if glue_mamba_flat is not None else None
+        )
+        branch_mamba_all = (
+            branch_mamba_flat.view(bs, rows_per_seat)
+            if branch_mamba_flat is not None
+            else None
+        )
         for i, (key, state) in enumerate(zip(keys, states)):
             self._seat_carriers[key] = _SeatCarrier(
                 glue_rows=glue_rows_all[i],
@@ -1216,6 +1557,12 @@ class EnumDraftEngine:
                     i * rows_per_seat : (i + 1) * rows_per_seat
                 ],
                 synced_len=state.committed_slots.numel(),
+                glue_mamba_slots=(
+                    glue_mamba_all[i] if glue_mamba_all is not None else None
+                ),
+                branch_mamba_slots=(
+                    branch_mamba_all[i] if branch_mamba_all is not None else None
+                ),
             )
         self._glue_template = glue_batch
         self._branch_template = branch_batch
@@ -1227,11 +1574,45 @@ class EnumDraftEngine:
             return
         for req in carrier.glue_reqs + carrier.branch_reqs:
             if req.req_pool_idx is not None:
+                # The carrier's mamba slots are engine-owned (returned to the
+                # arena below); null the preset so no pool path can ever treat
+                # the row free as a slot free.
+                req.mamba_pool_idx = None
                 self.model_runner.req_to_token_pool.free(req)
+        if carrier.glue_mamba_slots is not None:
+            self._mamba_arena.give_back(carrier.glue_mamba_slots)
+            self._mamba_arena.give_back(carrier.branch_mamba_slots)
 
     # ------------------------------------------------------------------ #
     # Batch plumbing (bench_one_batch harness pattern)
     # ------------------------------------------------------------------ #
+
+    def _seat_mamba_slots(self, states: list[_DraftReqState]) -> Optional[torch.Tensor]:
+        """Per-seat state slots for an advance batch (None on pure-KV)."""
+        if not self._hybrid:
+            return None
+        return torch.cat([state.mamba_slot for state in states])
+
+    def _fork_mamba_states(
+        self, *, src_slots: torch.Tensor, dst_slots: torch.Tensor
+    ) -> None:
+        """Batched recurrent-state fork (conv + ssm), src[i] -> dst[i].
+
+        Slot ids are virtual (allocator space); translate before the physical
+        pool op. Repeated sources are fine, src/dst stay disjoint by
+        construction (seat / glue / branch / backbone / stash slots never
+        alias). The flatten also materializes strided column views -- the
+        fused copy kernel consumes raw index arrays, not strides.
+        """
+        pool = self.model_runner.req_to_token_pool
+        pool.mamba_pool.copy_from(
+            src_indices=pool.translate_mamba_indices(
+                src_slots.reshape(-1).contiguous()
+            ),
+            dst_indices=pool.translate_mamba_indices(
+                dst_slots.reshape(-1).contiguous()
+            ),
+        )
 
     def _extend_batch(
         self,
@@ -1239,11 +1620,21 @@ class EnumDraftEngine:
         token_lists: list[list[int]],
         prefix_slots: list[torch.Tensor],
         tag: str,
+        mamba_slots: Optional[torch.Tensor] = None,
     ) -> tuple[ScheduleBatch, torch.Tensor]:
         """Extend each row's tokens beyond its (slot-shared) prefix.
 
+        ``mamba_slots`` (hybrid only, one engine-owned state slot per row) is
+        preset on each Req so ``HybridReqToTokenPool.alloc`` binds the row to
+        it instead of fresh-allocating -- a fresh alloc would flag the slot
+        for a silent zero on the next forward, destroying the forked state.
+
         Returns (batch, newly_allocated_slots_flat).
         """
+        if self._hybrid:
+            assert mamba_slots is not None and mamba_slots.numel() == len(
+                token_lists
+            ), f"hybrid {tag} batch must preset one mamba slot per row"
         reqs = []
         for i, tokens in enumerate(token_lists):
             req = Req(
@@ -1256,6 +1647,8 @@ class EnumDraftEngine:
             req.logprob_start_len = -1
             req.prefix_indices = prefix_slots[i].to(self.device)
             req.set_extend_range(prefix_slots[i].numel(), len(tokens))
+            if mamba_slots is not None:
+                req.mamba_pool_idx = mamba_slots[i]
             reqs.append(req)
         batch = ScheduleBatch.init_new(
             reqs=reqs,
@@ -1267,6 +1660,13 @@ class EnumDraftEngine:
             spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         batch.prepare_for_extend()
+        # A non-empty clear list means some row slipped past the preset and
+        # fresh-allocated a slot: the next forward would zero it silently
+        # (prepare_for_extend already consumed the per-req needs_clear flags
+        # into this batch field, so this is the one observable trace).
+        assert (
+            not self._hybrid or batch.mamba_clear_indices is None
+        ), f"hybrid {tag} batch fresh-allocated mamba slots (preset missed)"
         if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
             batch.input_ids = batch.prefill_input_ids_cpu.to(
                 batch.device, non_blocking=True
@@ -1316,6 +1716,7 @@ class EnumDraftEngine:
         self,
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
+        scratch_mamba_slots: list[torch.Tensor],
     ) -> None:
         for slots in scratch_slots:
             if slots is not None and slots.numel() > 0:
@@ -1323,4 +1724,10 @@ class EnumDraftEngine:
         for batch in scratch_batches:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:
+                    # Preset mamba slots are engine-owned (seat slots persist,
+                    # transients return via scratch_mamba_slots below); null
+                    # them so nothing downstream can ever double-free one.
+                    req.mamba_pool_idx = None
                     self.model_runner.req_to_token_pool.free(req)
+        for slots in scratch_mamba_slots:
+            self._mamba_arena.give_back(slots)
