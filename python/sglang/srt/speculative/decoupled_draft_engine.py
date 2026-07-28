@@ -200,7 +200,11 @@ class _SeatCarrier:
     token c_{g+1} on top of committed + c_1..c_g. Prefixes are slot-shared
     ACROSS ROWS OF THE SAME FORWARD: per layer, the batched KV write precedes
     the attention read, and c_g's KV depends only on its own row, so row g+1
-    reads row g's fresh KV exactly as a sequential chain would.
+    reads row g's fresh KV exactly as a sequential chain would. (Fused-extend
+    mode rides these same rows next to the seat row with delta-prepended
+    extends -- see ``_fused_extend_forward``; roles, pool-row content
+    maintenance, and mamba slot bindings are unchanged, only the fork-source
+    timing moves.)
 
     ``branch_rows``: (K+1)*F persistent decode rows; each round only seq_lens
     and the pool-row tail entries move, then the K chain steps run as plain
@@ -432,6 +436,13 @@ class EnumDraftEngine:
             if exclude_dead_guess is not None
             else envs.SGLANG_ENABLE_DECOUPLED_DEAD_GUESS_EXCLUSION.get()
         )
+        # Fused fast-path extend: advance + glue as ONE batched forward (see
+        # _fused_extend_forward). Env kill switch, read once (init-static);
+        # off restores the two-forward advance + glue round.
+        self._enable_fused_extend = envs.SGLANG_ENABLE_DECOUPLED_FUSED_EXTEND.get()
+        # Per-delta-length row-gather patterns for the fused extend's assembly
+        # (host lists; fast-path delta lengths recur, so the cache stays tiny).
+        self._fused_gather_patterns: dict[int, list[int]] = {}
         # Reusable batch shells for assembled fast subrounds (retained from
         # slow rounds; per-round fields are fully rebound before each use).
         self._glue_template: Optional[ScheduleBatch] = None
@@ -629,6 +640,9 @@ class EnumDraftEngine:
           re-draft is deterministic), so one K-row extend re-materializes
           its KV and yields all node logits; the branch phase runs as plain
           decode replays assembled from the seat's retained carrier rows.
+          With the fused extend (default, see _fused_extend_forward) the
+          advance folds in as one more row per seat, so the whole pre-branch
+          phase is a single (K+1)-row-per-seat forward.
         - **case-0 miss round** (commit fell outside the last block, carrier
           exists): a drafter miss mirrors a verifier select miss, so the
           next commit is necessarily a single fallback bonus -- only the
@@ -805,8 +819,6 @@ class EnumDraftEngine:
         bs = len(states)
         carriers = [self._seat_carriers[key] for key in keys]
         variant = self._fanout_variant(f_live)
-        allocator = self.model_runner.token_to_kv_pool_allocator
-        pool = self.model_runner.req_to_token_pool
 
         # -- Winning chains: the selected units' chains ARE the new backbone
         # (the host mirror was synced during matching).
@@ -821,11 +833,18 @@ class EnumDraftEngine:
         # slot instead.
         chains_mat = torch.stack(chains) if self._exclude_dead_guess else None
 
-        # -- Advance the committed prefix (node 0 logits), as on the slow
-        # path; its freshly written KV slots feed the carrier row updates.
-        # The advance runs IN PLACE on the seat's mamba slot (the only phase
-        # ever allowed to): afterwards it holds exactly node-0 state.
+        # -- Seat (advance) rows: one fresh pool row per seat extending the
+        # committed delta; the only phase that ever runs IN PLACE on the
+        # seat's mamba slot. Fused mode uses the batch purely as the
+        # ALLOCATION vehicle (pool row + delta KV slots + hybrid seat-slot
+        # binding via the preset) -- the forward that actually writes the
+        # delta KV is the fused extend below, where the seat row's last
+        # position yields node-0 logits. Non-fused mode forwards it here,
+        # exactly as on the slow path.
         base_lens = [state.committed_slots.numel() for state in states]
+        delta_lens = [
+            len(state.committed_tokens) - base_lens[i] for i, state in enumerate(states)
+        ]
         advance_batch, advance_slots = self._extend_batch(
             token_lists=[state.committed_tokens for state in states],
             prefix_slots=[state.committed_slots for state in states],
@@ -833,69 +852,92 @@ class EnumDraftEngine:
             mamba_slots=self._seat_mamba_slots(states),
         )
         scratch_batches.append(advance_batch)
-        node0_logits = self._forward(advance_batch, tag="advance")
-        # Graph-runner logits live in a static output buffer that the NEXT
-        # forward overwrites -- consume them (topk) before the glue forward,
-        # exactly like the slow path consumes each step's logits immediately.
-        # (The in-place mask writes into that same buffer; it is consumed by
-        # the topk on the next line and rewritten by the next replay.)
-        if chains_mat is not None:
-            node0_logits.scatter_(-1, chains_mat[:, :1], float("-inf"))
-        node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices  # [bs, f]
+        if not self._enable_fused_extend:
+            node0_logits = self._forward(advance_batch, tag="advance")
+            # Graph-runner logits live in a static output buffer that the NEXT
+            # forward overwrites -- consume them (topk) before the glue
+            # forward, exactly like the slow path consumes each step's logits
+            # immediately. (The in-place mask writes into that same buffer; it
+            # is consumed by the topk on the next line and rewritten by the
+            # next replay.)
+            if chains_mat is not None:
+                node0_logits.scatter_(-1, chains_mat[:, :1], float("-inf"))
+            node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices
         self._absorb_advance_slots(states, advance_slots)
 
         # -- Carrier pool rows: broadcast the committed delta, then scatter
         # this round's backbone slots into the glue triangle + branch cases.
-        backbone_slots = allocator.alloc(bs * num_steps)
-        if backbone_slots is None:
-            raise RuntimeError("drafter KV pool exhausted (glue backbone)")
-        scratch_slots.append(backbone_slots)
-        backbone_slots = backbone_slots.view(bs, num_steps)
-        for i, (state, carrier) in enumerate(zip(states, carriers)):
-            new_len = state.committed_slots.numel()
-            synced = min(carrier.synced_len, base_lens[i])
-            pool.req_to_token[carrier.all_rows, synced:new_len] = state.committed_slots[
-                synced:new_len
-            ].to(torch.int32)
-            carrier.synced_len = new_len
-            slots_i32 = backbone_slots[i].to(torch.int32)
-            comb_rows = carrier.comb_rows_for(
-                f_live=f_live, tri_g=self._tri_g, br_r_pool=variant.br_r_pool
-            )
-            pool.req_to_token[comb_rows, variant.comb_j + new_len] = slots_i32[
-                variant.comb_j
-            ]
-        self.profiler.mark("carrier_sync")
+        backbone_slots = self._sync_carrier_rows(
+            states=states,
+            carriers=carriers,
+            base_lens=base_lens,
+            variant=variant,
+            f_live=f_live,
+            scratch_slots=scratch_slots,
+        )
 
-        # -- Glue extend: all K backbone tokens in one forward = node 1..K
-        # logits; their KV lands in this round's backbone slots.
         if self._hybrid:
-            # Every glue row re-scans its chain prefix from node-0 state (see
-            # _glue_forward), so all K rows fork from the seat slot -- the
-            # advance above left it holding exactly node 0. Row g's slot then
-            # naturally ends the glue forward holding node-(g+1) state.
+            # All K glue rows fork their state from the SEAT slot before the
+            # forward that runs them; what the copy HOLDS differs by mode.
+            # Fused: the seat slot still carries the PRE-advance state
+            # (nothing ran on it yet -- the fused forward itself advances it
+            # by the delta), so each glue row's linear layers re-scan
+            # delta + c_1..c_{g+1} from the pre-advance copy. Non-fused: the
+            # advance above already left node-0 state, and each glue row
+            # re-scans only c_1..c_{g+1} (see _glue_forward). Either way glue
+            # row g's slot ends its forward holding node-(g+1) state, so the
+            # branch fork below is mode-blind.
             self._fork_mamba_states(
                 src_slots=torch.cat(
                     [state.mamba_slot.repeat(num_steps) for state in states]
                 ),
                 dst_slots=torch.cat([carrier.glue_mamba_slots for carrier in carriers]),
             )
-        glue_logits = self._glue_forward(
-            carriers=carriers,
-            states=states,
-            chains=chains,
-            backbone_slots=backbone_slots,
-        )
-        glue_view = glue_logits.view(bs, num_steps, -1)
-        if chains_mat is not None and num_steps >= 2:
-            # Node a's dead token is c_{a+1}: glue row g holds node g+1, so
-            # rows 0..K-2 mask c_2..c_K; node K (row K-1) keeps its full top-F
-            # (a full accept's bonus is unconstrained).
-            glue_view[:, : num_steps - 1].scatter_(
-                -1, chains_mat[:, 1:].unsqueeze(-1), float("-inf")
+        if self._enable_fused_extend:
+            # -- Fused extend: seat + glue rows in ONE forward. The glue chain
+            # tokens are the matched commit's winning unit -- KNOWN values,
+            # never derived from the advance's logits -- so the two phases
+            # have no data dependency; per-seat row r yields node-r logits.
+            fused_logits = self._fused_extend_forward(
+                carriers=carriers,
+                chains=chains,
+                backbone_slots=backbone_slots,
+                seat_reqs=advance_batch.reqs,
+                seat_rows=advance_batch.req_pool_indices,
+                seat_input_ids=advance_batch.input_ids,
+                seat_delta_slots=advance_slots,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
             )
-        glue_guesses = torch.topk(glue_view, f_live, dim=-1).indices  # [bs, K, f]
-        guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
+            fused_view = fused_logits.view(bs, num_steps + 1, -1)
+            # Consume the static logits buffer (mask + topk) before the first
+            # branch replay overwrites it. Node a's dead token is c_{a+1}, so
+            # rows 0..K-1 mask c_1..c_K; node K keeps its full top-F (a full
+            # accept's bonus is unconstrained).
+            if chains_mat is not None:
+                fused_view[:, :num_steps].scatter_(
+                    -1, chains_mat.unsqueeze(-1), float("-inf")
+                )
+            guesses_stack = torch.topk(fused_view, f_live, dim=-1).indices
+        else:
+            # -- Glue extend: all K backbone tokens in one forward = node 1..K
+            # logits; their KV lands in this round's backbone slots.
+            glue_logits = self._glue_forward(
+                carriers=carriers,
+                states=states,
+                chains=chains,
+                backbone_slots=backbone_slots,
+            )
+            glue_view = glue_logits.view(bs, num_steps, -1)
+            if chains_mat is not None and num_steps >= 2:
+                # Node a's dead token is c_{a+1}: glue row g holds node g+1,
+                # so rows 0..K-2 mask c_2..c_K; node K (row K-1) keeps its
+                # full top-F (a full accept's bonus is unconstrained).
+                glue_view[:, : num_steps - 1].scatter_(
+                    -1, chains_mat[:, 1:].unsqueeze(-1), float("-inf")
+                )
+            glue_guesses = torch.topk(glue_view, f_live, dim=-1).indices
+            guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
 
         # -- Branch chains: K decode replays on the assembled carrier rows.
         if self._hybrid:
@@ -934,6 +976,165 @@ class EnumDraftEngine:
             chain_steps=chain_steps,
             new_backbones=new_backbones,
         )
+
+    def _sync_carrier_rows(
+        self,
+        *,
+        states: list[_DraftReqState],
+        carriers: list[_SeatCarrier],
+        base_lens: list[int],
+        variant: _FanoutVariant,
+        f_live: int,
+        scratch_slots: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Broadcast the committed delta into every carrier pool row, then
+        scatter freshly allocated backbone slots into the glue triangle +
+        branch case prefixes. Returns the backbone slots as [bs, K]."""
+        num_steps = self.num_steps
+        bs = len(states)
+        pool = self.model_runner.req_to_token_pool
+        backbone_slots = self.model_runner.token_to_kv_pool_allocator.alloc(
+            bs * num_steps
+        )
+        if backbone_slots is None:
+            raise RuntimeError("drafter KV pool exhausted (glue backbone)")
+        scratch_slots.append(backbone_slots)
+        backbone_slots = backbone_slots.view(bs, num_steps)
+        for i, (state, carrier) in enumerate(zip(states, carriers)):
+            new_len = state.committed_slots.numel()
+            synced = min(carrier.synced_len, base_lens[i])
+            pool.req_to_token[carrier.all_rows, synced:new_len] = state.committed_slots[
+                synced:new_len
+            ].to(torch.int32)
+            carrier.synced_len = new_len
+            slots_i32 = backbone_slots[i].to(torch.int32)
+            comb_rows = carrier.comb_rows_for(
+                f_live=f_live, tri_g=self._tri_g, br_r_pool=variant.br_r_pool
+            )
+            pool.req_to_token[comb_rows, variant.comb_j + new_len] = slots_i32[
+                variant.comb_j
+            ]
+        self.profiler.mark("carrier_sync")
+        return backbone_slots
+
+    def _fused_gather_pattern(self, delta_len: int) -> list[int]:
+        """Per-seat gather rows over the [delta | chain] source layout (length
+        delta_len + K): the seat row takes the delta, glue row g takes the
+        delta then chain[:g + 1]. The pattern depends only on the delta
+        length, and fast-path deltas repeat a handful of lengths (<= K + 1),
+        so the cache is effectively write-once."""
+        pattern = self._fused_gather_patterns.get(delta_len)
+        if pattern is None:
+            delta_part = list(range(delta_len))
+            pattern = list(delta_part)
+            for g in range(self.num_steps):
+                pattern.extend(delta_part)
+                pattern.extend(range(delta_len, delta_len + g + 1))
+            self._fused_gather_patterns[delta_len] = pattern
+        return pattern
+
+    def _fused_extend_forward(
+        self,
+        *,
+        carriers: list[_SeatCarrier],
+        chains: list[torch.Tensor],
+        backbone_slots: torch.Tensor,  # [bs, K]
+        seat_reqs: list,
+        seat_rows: torch.Tensor,  # [bs], the advance batch's pool rows
+        seat_input_ids: torch.Tensor,  # flat [sum(delta_lens)], device
+        seat_delta_slots: torch.Tensor,  # flat [sum(delta_lens)], device
+        base_lens: list[int],
+        delta_lens: list[int],
+    ) -> torch.Tensor:
+        """Advance + glue as ONE batched extend (the fast round's fusion).
+
+        Per seat the rows are [seat, glue 0..K-1] (seat FIRST): the seat row
+        extends the committed delta (last logits = node 0; on hybrid it also
+        advances the seat's state slot in place), and glue row g extends
+        delta + c_1..c_{g+1} (last logits = node g+1). Prepending the delta
+        is forced by extend contiguity: the delta's KV does not exist before
+        this forward, so it cannot sit in a glue row's prefix region.
+
+        KV plumbing (full-attn layers): a glue row's delta positions point
+        out_cache_loc at the SEAT's delta slots, and its chain positions at
+        the shared backbone slots -- so K+1 rows write each delta slot and
+        multiple rows write each backbone slot. Every writer produces the
+        SAME values (same token, same absolute position, same prefix
+        contents), which makes this the benign same-forward write-then-read
+        pattern the glue triangle already relies on: per layer, the batched
+        KV write precedes every attention read, so whichever duplicate lands
+        is correct by the time any row reads it.
+        """
+        num_steps = self.num_steps
+        bs = len(carriers)
+        rows_per_seat = num_steps + 1
+        # Generic extend shell (rebind-only, row-count independent) -- the
+        # same reuse discipline as _glue_forward.
+        fused = self._glue_template
+        fused.reqs = [
+            req
+            for i, carrier in enumerate(carriers)
+            for req in [seat_reqs[i]] + carrier.glue_reqs
+        ]
+        # mrope models (Qwen3.5 family) index multimodal_inputs per row in
+        # ForwardBatch.init_new; rebind to the fused row count (text-only).
+        fused.multimodal_inputs = [None] * len(fused.reqs)
+        fused.req_pool_indices = torch.cat(
+            [
+                rows
+                for i, carrier in enumerate(carriers)
+                for rows in (seat_rows[i : i + 1], carrier.glue_rows)
+            ]
+        )
+        fused.extend_logprob_start_lens = [0] * (bs * rows_per_seat)
+        fused.extend_lens = [
+            row_len
+            for i in range(bs)
+            for row_len in [delta_lens[i]]
+            + [delta_lens[i] + g + 1 for g in range(num_steps)]
+        ]
+        fused.prefix_lens = [
+            base_lens[i] for i in range(bs) for _ in range(rows_per_seat)
+        ]
+        seq_host = [
+            prefix + row_len
+            for prefix, row_len in zip(fused.prefix_lens, fused.extend_lens)
+        ]
+        # Row contents: input ids and out_cache_loc share ONE gather. Per seat
+        # the source is [delta | chain] (ids) aligned with
+        # [delta slots | backbone slots] (locations), and the row layout
+        # repeats the delta then takes a growing chain prefix.
+        src_id_pieces: list[torch.Tensor] = []
+        src_slot_pieces: list[torch.Tensor] = []
+        gather_rows: list[int] = []
+        src_offset = 0
+        delta_offset = 0
+        for i in range(bs):
+            delta_len = delta_lens[i]
+            src_id_pieces.append(
+                seat_input_ids[delta_offset : delta_offset + delta_len]
+            )
+            src_id_pieces.append(chains[i])
+            src_slot_pieces.append(
+                seat_delta_slots[delta_offset : delta_offset + delta_len]
+            )
+            src_slot_pieces.append(backbone_slots[i])
+            gather_rows.extend(
+                src_offset + entry for entry in self._fused_gather_pattern(delta_len)
+            )
+            src_offset += delta_len + num_steps
+            delta_offset += delta_len
+        gather = torch.tensor(gather_rows, dtype=torch.int64, device=self.device)
+        fused.input_ids = torch.cat(src_id_pieces)[gather]
+        fused.out_cache_loc = torch.cat(src_slot_pieces)[gather]
+        fused.extend_num_tokens = len(gather_rows)
+        seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
+        fused.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        fused.seq_lens_cpu = seq_cpu
+        fused.seq_lens_sum = sum(seq_host)
+        fused.orig_seq_lens = fused.seq_lens.to(torch.int32)
+        self.profiler.mark("fused_mut")
+        return self._forward(fused, tag="fused_extend")
 
     def _glue_forward(
         self,

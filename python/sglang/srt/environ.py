@@ -384,6 +384,9 @@ class Envs:
     # CUDA event consumed on the drafter's IPC thread (the copy_done pattern)
     # instead of a blocking D2H on the drafter loop. ZMQ data plane only.
     SGLANG_ENABLE_DECOUPLED_EVENTED_PUSH = EnvBool(True)
+    # Decoupled spec: fuse the drafter fast round's advance + glue extends
+    # into one batched forward; False restores the two-forward path.
+    SGLANG_ENABLE_DECOUPLED_FUSED_EXTEND = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
