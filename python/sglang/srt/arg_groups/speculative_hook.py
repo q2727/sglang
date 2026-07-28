@@ -207,13 +207,19 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
     if int(server_args.decoupled_spec_rank) < 0:
         raise ValueError("--decoupled-spec-rank must be non-negative.")
 
-    # page_size == 1: on each commit the drafter truncates its mirror request
-    # back to the committed prefix at token granularity before re-extending the
-    # next enumeration tree; page-aligned truncation isn't implemented.
-    if server_args.page_size is not None and server_args.page_size > 1:
+    # page_size == 1 is a DRAFTER-only contract: on each commit the drafter
+    # truncates its mirror request back to the committed prefix at token
+    # granularity and shares nested branch prefixes by raw slot id; both
+    # break at page granularity (partial-page write conflicts at every fork
+    # point) and page-aligned COW isn't implemented. The VERIFIER has no such
+    # dependency -- its verify path is the colocated one (paged-capable), the
+    # enum landing buffer is seat-indexed (no KV), and the wire carries token
+    # ids only -- so a paged backend (e.g. trtllm_mha's page 64 on sm100) is
+    # fine there, and the two engines' page sizes are independent.
+    if is_drafter and server_args.page_size is not None and server_args.page_size > 1:
         raise ValueError(
-            "decoupled speculative decoding requires page_size == 1, "
-            f"got {server_args.page_size}."
+            "the decoupled DRAFTER requires page_size == 1 (token-granular "
+            f"truncation and slot-id prefix sharing), got {server_args.page_size}."
         )
 
     # The verifier runs many concurrent user requests, so default its running

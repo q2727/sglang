@@ -425,7 +425,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+            # Deterministic split-tile prefill needs at least 2GB of
+            # workspace; raise-only so a LARGER value survives -- whether from
+            # the user (big-head models like 235B overflow 2GB planning the
+            # largest prefill cuda-graph bucket) or a smaller arch-specific
+            # set() above (is_set() can't tell those apart).
+            if envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() < 2048 * 1024 * 1024:
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
