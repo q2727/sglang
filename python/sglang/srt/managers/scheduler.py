@@ -837,6 +837,20 @@ class Scheduler(
             self.decoupled_verify_manager = None
             return
 
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() != 0:
+            # TP > 1: rank 0 owns the whole decoupled plane -- the single
+            # wire endpoint (a second bind would EADDRINUSE), the landing
+            # buffer, the C6 gate, and the select. The gate outcome depends
+            # on wall-clock block arrival, which is NOT deterministic across
+            # the replicated TP schedulers (rank 0 could see the block while
+            # rank 1 times out -> divergent verify inputs -> collective
+            # desync); instead rank 0's select result is broadcast at decode
+            # launch (VerifyWorker._select_units_tp_safe).
+            self.decoupled_verify_manager = None
+            return
+
         from sglang.srt.speculative.decoupled_verify_manager import (
             DecoupledVerifyManager,
         )

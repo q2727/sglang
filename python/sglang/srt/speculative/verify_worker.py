@@ -36,6 +36,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import ServerArgs
@@ -220,6 +225,15 @@ class VerifyWorker(BaseVerifyWorker):
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
 
+        # TP > 1: rank 0 owns the enum plane (buffer contents, C6 gate,
+        # select) because gate outcomes follow wall-clock block arrival and
+        # must not be decided per replicated rank; the selected units are
+        # broadcast so every rank builds the identical verify input
+        # (_select_units_tp_safe). Manager injection (select_gate /
+        # commit_relay) only happens on rank 0 by construction.
+        self._tp_rank = get_tensor_model_parallel_rank()
+        self._tp_size = get_tensor_model_parallel_world_size()
+
         # The GPU landing buffer is sized off req_to_token, which exists only
         # after the scheduler allocates memory pools (alloc_memory_pool below).
         self.enum_buffer: Optional[DecoupledEnumBuffer] = None
@@ -309,8 +323,7 @@ class VerifyWorker(BaseVerifyWorker):
             )
 
         select_input: EnumSelectInput = batch.spec_info
-        selected, hits = self._select_enum_units(batch, select_input)
-        self.select_hits_queue.append(hits)
+        selected = self._select_units_tp_safe(batch, select_input)
 
         # The selected unit IS the verify row: [root(=real bonus), K drafts].
         draft_input = EagleDraftInput(
@@ -345,6 +358,33 @@ class VerifyWorker(BaseVerifyWorker):
             fanout=self.speculative_fanout,
             unit_width=self.speculative_num_draft_tokens,
         )
+
+    def _select_units_tp_safe(
+        self, batch: ScheduleBatch, select_input: EnumSelectInput
+    ) -> torch.Tensor:
+        """Select on TP rank 0, broadcast the winning units to every rank.
+
+        Only rank 0 holds landed blocks (the manager and its IPC thread exist
+        there alone) and only rank 0 ran the C6 gate; replicating the select
+        per rank would fork on arrival timing. The broadcast doubles as the
+        barrier that holds ranks > 0 while rank 0 finishes its bounded gate
+        wait. select_hits_queue is likewise rank-0-only (its consumer, the
+        manager's accounting, lives there).
+        """
+        if self._tp_size == 1:
+            selected, hits = self._select_enum_units(batch, select_input)
+            self.select_hits_queue.append(hits)
+            return selected
+        if self._tp_rank == 0:
+            selected, hits = self._select_enum_units(batch, select_input)
+            self.select_hits_queue.append(hits)
+        else:
+            selected = torch.empty(
+                (len(batch.reqs), self.speculative_num_draft_tokens),
+                dtype=torch.int64,
+                device=self.device,
+            )
+        return get_tp_group().broadcast(selected, src=0)
 
     def _verify(self, batch: ScheduleBatch) -> GenerationBatchResult:
         batch_output = run_eagle_verify(
