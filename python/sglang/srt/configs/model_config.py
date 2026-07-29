@@ -102,6 +102,19 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def _standalone_spec_draft() -> bool:
+    """True when the draft model is a full STANDALONE model (it must keep its
+    own architecture); only NEXTN/MTP drafts remap to the MTP head class.
+    Falls back to False (remap, the historical behavior) when the runtime
+    context is not initialized (e.g. offline config inspection)."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        return get_server_args().speculative_algorithm == "STANDALONE"
+    except Exception:
+        return False
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -640,11 +653,16 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3MoeForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-        if is_draft_model and self.hf_config.architectures[0] in [
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-            "InternS2PreviewForConditionalGeneration",
-        ]:
+        if (
+            is_draft_model
+            and not _standalone_spec_draft()
+            and self.hf_config.architectures[0]
+            in [
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
+            ]
+        ):
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
