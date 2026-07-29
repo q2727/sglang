@@ -409,6 +409,16 @@ class Envs:
     # deltas, capture-bucket overflow) or entirely (construction failure,
     # this switch off).
     SGLANG_ENABLE_DECOUPLED_EXTEND_GRAPH = EnvBool(True)
+    # Decoupled spec: spend the drafter's enumeration columns per accept case
+    # instead of uniformly. Case a < K is only reached by verify REJECTING
+    # backbone token c_{a+1}, so its bonus is a rank-2+ candidate, while case
+    # K's bonus (the full-accept continuation) is unconstrained: budget case
+    # K -> F, case K-1 -> min(2, F), shallower cases -> 1 column each. The
+    # block keeps its (K+1) x F wire shape with the unbudgeted cells poisoned,
+    # so the verifier is unchanged; at K=3, F=4 the branch phase costs exactly
+    # what uniform F=2 costs. Full width only -- when the adaptive-fanout
+    # controller lowers the width, the round falls back to uniform.
+    SGLANG_ENABLE_DECOUPLED_PER_CASE_FANOUT = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

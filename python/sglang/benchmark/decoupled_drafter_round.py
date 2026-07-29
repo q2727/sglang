@@ -100,6 +100,15 @@ def _parse_args() -> argparse.Namespace:
         "fused): isolates graph-vs-eager divergence with matched semantics.",
     )
     parser.add_argument(
+        "--extra-decode-bs",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Extra decode-graph capture batch sizes, on top of the uniform "
+        "round shapes below. A per-case fanout budget forwards sum(budgets) "
+        "rows per seat, which is none of those shapes.",
+    )
+    parser.add_argument(
         "--effective-fanout",
         type=int,
         default=None,
@@ -307,6 +316,7 @@ def main() -> None:
         mem_fraction_static=args.mem_fraction_static,
         cuda_graph_bs_decode=sorted(
             {args.batch_size, args.batch_size * args.fanout, branch_rows}
+            | set(args.extra_decode_bs or ())
         ),
         disable_cuda_graph=args.disable_cuda_graph,
         # The engine owns row lifecycle (ReqToTokenPool.free) and forks mamba

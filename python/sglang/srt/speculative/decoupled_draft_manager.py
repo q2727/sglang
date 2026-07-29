@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -91,6 +91,13 @@ class DecoupledDraftManager:
         self._round_ct = 0
         self._round_time_s = 0.0
         self._push_time_s = 0.0
+        # Idle accounting (the prerun / 1:N capacity question: is the drafter
+        # starved waiting for commits, or saturated?). Only counted while at
+        # least one seat is open, so pre-traffic polling never inflates it.
+        self._open_seats = 0
+        self._idle_time_s = 0.0
+        self._starved_round_ct = 0
+        self._idle_since: Optional[float] = None
         # Top-1 prerun rides the ZMQ block message's speculative flag; the
         # CUDA IPC row header has no flag word yet.
         self._enable_top1_prerun = (
@@ -157,6 +164,8 @@ class DecoupledDraftManager:
                 if self._enable_top1_prerun and self._prerun_keys:
                     self._run_preruns()
                 else:
+                    if self._open_seats > 0 and self._idle_since is None:
+                        self._idle_since = time.monotonic()
                     time.sleep(_IDLE_WAIT_S)
                 continue
             try:
@@ -187,8 +196,16 @@ class DecoupledDraftManager:
         return segment.round_lens[0] if segment.round_lens else 0
 
     def _apply_controls_and_draft(self, ready) -> None:
+        # Close the idle window this batch of controls ended (see the idle
+        # accounting fields): everything below is drafter-busy time.
+        idle_s = 0.0
+        if self._idle_since is not None:
+            idle_s = time.monotonic() - self._idle_since
+            self._idle_since = None
+            self._idle_time_s += idle_s
         for draft_key in ready.close_keys:
             self.engine.close(draft_key)
+            self._open_seats = max(0, self._open_seats - 1)
         touched: dict[DraftReqKey, None] = {}
         confirmed: dict[DraftReqKey, None] = {}
         for sync in ready.sync_messages:
@@ -199,6 +216,7 @@ class DecoupledDraftManager:
                 committed_outputs=list(sync.committed_outputs),
             )
             touched[sync.draft_key] = None
+            self._open_seats += 1
         for segment in ready.ready_commit_segments:
             if not self.engine.has(segment.draft_key):
                 continue
@@ -222,15 +240,22 @@ class DecoupledDraftManager:
             round_s = time.monotonic() - round_start
             self._round_ct += 1
             self._round_time_s += round_s
+            if idle_s > 0.0:
+                self._starved_round_ct += 1
+                # Only the first round of a control batch waited; later ones
+                # (1:N, multi-verifier) started with work already queued.
+                idle_s = 0.0
             self._maybe_adjust_fanout(round_ms=1000.0 * round_s)
             if self._round_ct % 200 == 0:
                 logger.info(
                     "decoupled drafter rounds: ct=%d avg_ms=%.1f push_ms=%.2f "
-                    "last_bs=%d fast=%d slow=%d eff_fanout=%d "
-                    "prerun_hit=%d prerun_miss=%d",
+                    "idle_ms=%.2f starved=%.0f%% last_bs=%d fast=%d slow=%d "
+                    "eff_fanout=%d prerun_hit=%d prerun_miss=%d",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
                     1000.0 * self._push_time_s / self._round_ct,
+                    1000.0 * self._idle_time_s / self._round_ct,
+                    100.0 * self._starved_round_ct / self._round_ct,
                     len(draft_keys),
                     self.engine.hit_ct,
                     self.engine.miss_ct,

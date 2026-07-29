@@ -50,8 +50,10 @@ the static width W = 2K + 1 with repeats of its last real token, the
 full-attention plane runs the uniform-W replay contract, and hybrid (GDN)
 models feed TRUE per-row lengths through a graph-static device buffer so the
 recurrent plane never scans a pad -- see ``_fused_extend_graph_forward`` and
-``GDNAttnBackend._forward_draft_extend_v2`` for the two planes' contracts. The
-eager fused path remains the mandatory per-round fallback.
+``GDNAttnBackend._forward_draft_extend_v2`` for the two planes' contracts. A
+miss round's seat advance replays that same graph in its no-glue degenerate
+shape (rows = seats; see ``_advance_graph_forward``). The eager path remains
+the mandatory per-round fallback for both.
 
 A miss round (the commit fell outside the last block) collapses to case 0:
 the verifier's select missed the same block the same way and falls back, so
@@ -210,6 +212,9 @@ class _CascadeMetadata(msgspec.Struct):
     prefix_lens: torch.Tensor  # [seats]
     tail_page_table: torch.Tensor  # [rows, 2K+2]
     tail_lens: torch.Tensor  # [rows]
+    # arange(rows): the row of every per-step tail append, built once with the
+    # round's metadata instead of once per decode step.
+    row_indices: torch.Tensor  # [rows]
 
 
 class _SlowRoundPages(msgspec.Struct):
@@ -232,14 +237,22 @@ class _SlowRoundPages(msgspec.Struct):
 
 
 class _FanoutVariant(msgspec.Struct):
-    """Row selections + scatter templates for one effective fanout f <= F.
+    """Row selections + scatter templates for one per-case column budget.
 
     Branch rows keep their full-F pool layout (case-major, F rows per case);
-    a variant selects the first f rows of every case. Two row numberings
-    coexist: ``*_pool`` indexes the seat's full branch-row tensor, ``*_sel``
-    indexes the selected (packed) batch order.
+    a variant selects the first ``budgets[c]`` rows of case c -- uniformly
+    ``f_live`` everywhere for the adaptive-width path, or the skewed per-case
+    budget (case K takes the full width, shallower cases less: their bonus is
+    a rank-2+ candidate by construction). Two row numberings coexist:
+    ``*_pool`` indexes the seat's full branch-row tensor, ``*_sel`` indexes
+    the selected (packed) batch order.
     """
 
+    f_live: int  # effective width this variant was built for (its cache key)
+    budgets: list[int]  # live guess columns per accept case
+    # [1, K+1, F] bool marking the columns PAST each case's budget, or None
+    # when the budget is uniform (a plain top-f_live grid needs no masking).
+    guess_dead_mask: Optional[torch.Tensor]
     sel_rows_pool: list[int]  # selected per-seat row offsets, full-F layout
     sel_rows_dev: torch.Tensor  # same, device tensor
     br_r_pool: torch.Tensor  # case-prefix scatter rows, full-F layout
@@ -330,6 +343,11 @@ class _SeatCarrier:
         # Combined scatter rows per effective fanout (values/cols come from
         # the engine's per-fanout templates); built lazily, dies with the seat.
         self._comb_rows_cache: dict[int, torch.Tensor] = {}
+        # Branch-phase row selection per effective fanout (Req stubs + pool
+        # rows). Round-INVARIANT: the variant's row selection depends only on
+        # the width, so both the host list and the row gather are built once
+        # per seat and width and only rebound each round.
+        self._branch_sel_cache: dict[int, tuple[list, torch.Tensor]] = {}
 
     def comb_rows_for(
         self, *, f_live: int, tri_g: torch.Tensor, br_r_pool: torch.Tensor
@@ -339,6 +357,17 @@ class _SeatCarrier:
             rows = torch.cat([self.glue_rows[tri_g], self.branch_rows[br_r_pool]])
             self._comb_rows_cache[f_live] = rows
         return rows
+
+    def branch_sel_for(self, *, variant: _FanoutVariant) -> tuple[list, torch.Tensor]:
+        """(Req stubs, pool rows) of this seat's selected branch rows."""
+        sel = self._branch_sel_cache.get(variant.f_live)
+        if sel is None:
+            sel = (
+                [self.branch_reqs[row] for row in variant.sel_rows_pool],
+                self.branch_rows[variant.sel_rows_dev],
+            )
+            self._branch_sel_cache[variant.f_live] = sel
+        return sel
 
 
 class _MambaStateArena:
@@ -509,13 +538,15 @@ class _DraftExtendWorkerShim:
 
 
 class _ExtendGraphRound(msgspec.Struct):
-    """Per-fast-round staging for the fused-extend graph path.
+    """Per-round staging for the fused-extend graph path (fast rounds' fused
+    shape and miss rounds' advance-only degenerate shape alike).
 
-    page_size == 1: ``w_slots`` [bs, K+1, W] gives every fused row a private
-    W-slot write window (plane 0 pads the seat row, planes 1..K are the glue
-    rows' whole windows). The eager duplicate-write trick is off on this
-    path: pad tokens differ across rows, so the identical-value argument that
-    makes shared-slot writes benign no longer covers the whole window.
+    page_size == 1: ``w_slots`` [bs, rows_per_seat, W] gives every graph row a
+    private W-slot write window (plane 0 pads the seat row, planes 1..K -- a
+    fast round only -- are the glue rows' whole windows). The eager
+    duplicate-write trick is off on this path: pad tokens differ across rows,
+    so the identical-value argument that makes shared-slot writes benign no
+    longer covers the whole window.
 
     page_size > 1: glue rows already own private arena pages wide enough for
     W (span_max = P - 1 + W by construction); only the seat row's pad tail
@@ -647,18 +678,6 @@ class EnumDraftEngine:
         num_cases = self.num_steps + 1
         tri_g = [g for g in range(self.num_steps) for j in range(g + 1)]
         tri_j = [j for g in range(self.num_steps) for j in range(g + 1)]
-        br_r = [
-            c * self.fanout + f
-            for c in range(num_cases)
-            for f in range(self.fanout)
-            for j in range(c)
-        ]
-        br_j = [
-            j for c in range(num_cases) for f in range(self.fanout) for j in range(c)
-        ]
-        br_c = [
-            c for c in range(num_cases) for f in range(self.fanout) for j in range(c)
-        ]
         self._tri_g = torch.tensor(tri_g, dtype=torch.int64, device=self.device)
         self._tri_j = tri_j
         # Hybrid glue rows re-scan their nested chain prefix (see
@@ -666,29 +685,23 @@ class EnumDraftEngine:
         # input tokens c_1..c_{g+1} and their (shared) backbone KV slots.
         self._tri_j_dev = torch.tensor(tri_j, dtype=torch.int64, device=self.device)
         self._tri_row_lens = [g + 1 for g in range(self.num_steps)]
-        self._br_r = torch.tensor(br_r, dtype=torch.int64, device=self.device)
-        self._br_j = torch.tensor(br_j, dtype=torch.int64, device=self.device)
-        self._br_case = torch.tensor(br_c, dtype=torch.int64, device=self.device)
-        self._comb_j = torch.tensor(tri_j + br_j, dtype=torch.int64, device=self.device)
-        self._case_of_row = [c for c in range(num_cases) for _ in range(self.fanout)]
-        # Per-effective-fanout row selections / templates (full F seeded here;
-        # smaller widths built on first use by the adaptive-fanout controller).
-        rows_per_seat = num_cases * self.fanout
+        # The full uniform grid: every case enumerated at full F. The slow
+        # (bootstrap) round always builds exactly this shape, so it keeps its
+        # own handle -- a per-case budget must never reach it.
+        self._full_grid_variant = self._build_fanout_variant(
+            f_live=self.fanout, budgets=[self.fanout] * num_cases
+        )
+        # Per-effective-fanout row selections / templates (full width seeded
+        # here; smaller widths built on first use by the adaptive-fanout
+        # controller).
+        self._per_case_budgets = self._resolve_per_case_budgets()
         self._fanout_variants: dict[int, _FanoutVariant] = {
-            self.fanout: _FanoutVariant(
-                sel_rows_pool=list(range(rows_per_seat)),
-                sel_rows_dev=torch.arange(
-                    rows_per_seat, dtype=torch.int64, device=self.device
-                ),
-                br_r_pool=self._br_r,
-                br_r_sel=self._br_r,
-                br_j=self._br_j,
-                br_case=self._br_case,
-                comb_j=self._comb_j,
-                case_of_row=self._case_of_row,
-                case_of_row_dev=torch.tensor(
-                    self._case_of_row, dtype=torch.int64, device=self.device
-                ),
+            self.fanout: (
+                self._full_grid_variant
+                if self._per_case_budgets is None
+                else self._build_fanout_variant(
+                    f_live=self.fanout, budgets=self._per_case_budgets
+                )
             )
         }
         # Dead-guess exclusion (see the env var's comment): fast-path rounds
@@ -1276,33 +1289,57 @@ class EnumDraftEngine:
             return None
         return (case, guesses_row.index(bonus))
 
-    def _fanout_variant(self, f_live: int) -> _FanoutVariant:
-        """Row selections + scatter templates for an effective fanout: the
-        first ``f_live`` of every case's F branch rows (full-F pool layout is
-        untouched, so any width <= F reuses the same carrier rows)."""
-        variant = self._fanout_variants.get(f_live)
-        if variant is not None:
-            return variant
+    def _resolve_per_case_budgets(self) -> Optional[list[int]]:
+        """Skewed per-case guess-column budget for fast rounds, or None (one
+        uniform width for every case) when the knob is off / F == 1.
+
+        Case a < K is only ever reached by verify REJECTING backbone token
+        c_{a+1}, so that case's bonus is a rank-2+ candidate by construction
+        (the exclusion already hands it the slot) -- worth one column. Case K's
+        bonus is the unconstrained full-accept continuation, worth the whole
+        width. Budget: case K -> F, case K-1 -> min(2, F), every shallower
+        case -> 1; at K=3, F=4 that is [1, 1, 2, 4] = 8 branch rows, exactly
+        the uniform-F2 row cost. The wire block stays (K+1) x F with the
+        unbudgeted cells poisoned, so the verifier is oblivious.
+        """
+        if self.fanout < 2 or not envs.SGLANG_ENABLE_DECOUPLED_PER_CASE_FANOUT.get():
+            return None
+        budgets = [1] * (self.num_steps + 1)
+        budgets[self.num_steps] = self.fanout
+        if self.num_steps >= 1:
+            budgets[self.num_steps - 1] = min(2, self.fanout)
+        return budgets
+
+    def _build_fanout_variant(
+        self, *, f_live: int, budgets: list[int]
+    ) -> _FanoutVariant:
+        """Row selections + scatter templates for one per-case column budget
+        (a uniform width f is just ``budgets == [f] * (K+1)``).
+
+        Selected rows keep their FULL-F pool position (case c, column f -> row
+        c * F + f), so every budget vector reuses the same carrier rows; only
+        which of them a round forwards changes.
+        """
         num_cases = self.num_steps + 1
-        sel_rows_pool = [
-            c * self.fanout + f for c in range(num_cases) for f in range(f_live)
-        ]
-        br_r_pool = [
-            c * self.fanout + f
-            for c in range(num_cases)
-            for f in range(f_live)
-            for _ in range(c)
-        ]
-        br_r_sel = [
-            c * f_live + f
-            for c in range(num_cases)
-            for f in range(f_live)
-            for _ in range(c)
-        ]
-        br_j = [j for c in range(num_cases) for _ in range(f_live) for j in range(c)]
-        br_c = [c for c in range(num_cases) for _ in range(f_live) for _ in range(c)]
-        case_of_row = [c for c in range(num_cases) for _ in range(f_live)]
-        variant = _FanoutVariant(
+        fanout = self.fanout
+        sel_offsets = [sum(budgets[:c]) for c in range(num_cases)]
+        cases_cols = [(c, f) for c in range(num_cases) for f in range(budgets[c])]
+        sel_rows_pool = [c * fanout + f for c, f in cases_cols]
+        br_r_pool = [c * fanout + f for c, f in cases_cols for _ in range(c)]
+        br_r_sel = [sel_offsets[c] + f for c, f in cases_cols for _ in range(c)]
+        br_j = [j for c, _ in cases_cols for j in range(c)]
+        br_c = [c for c, _ in cases_cols for _ in range(c)]
+        case_of_row = [c for c, _ in cases_cols]
+        guess_dead_mask = None
+        if min(budgets) != max(budgets):
+            live = torch.zeros((1, num_cases, fanout), dtype=torch.bool)
+            for c, budget in enumerate(budgets):
+                live[0, c, :budget] = True
+            guess_dead_mask = live.logical_not().to(self.device)
+        return _FanoutVariant(
+            f_live=f_live,
+            budgets=list(budgets),
+            guess_dead_mask=guess_dead_mask,
             sel_rows_pool=sel_rows_pool,
             sel_rows_dev=torch.tensor(
                 sel_rows_pool, dtype=torch.int64, device=self.device
@@ -1319,7 +1356,20 @@ class EnumDraftEngine:
                 case_of_row, dtype=torch.int64, device=self.device
             ),
         )
-        self._fanout_variants[f_live] = variant
+
+    def _fanout_variant(self, f_live: int) -> _FanoutVariant:
+        """Row selections + scatter templates for an effective fanout: the
+        first ``f_live`` of every case's F branch rows -- or the skewed
+        per-case budget, seeded at full width when that knob is on (a lowered
+        width always falls back to uniform, so the adaptive controller keeps
+        its old behavior). The full-F pool layout is untouched, so any width
+        <= F reuses the same carrier rows."""
+        variant = self._fanout_variants.get(f_live)
+        if variant is None:
+            variant = self._build_fanout_variant(
+                f_live=f_live, budgets=[f_live] * (self.num_steps + 1)
+            )
+            self._fanout_variants[f_live] = variant
         return variant
 
     def _fast_round(
@@ -1336,6 +1386,10 @@ class EnumDraftEngine:
         bs = len(states)
         carriers = [self._seat_carriers[key] for key in keys]
         variant = self._fanout_variant(f_live)
+        # Guess columns to take per node: the live width, or the FULL width
+        # under a per-case budget (the grid is then trimmed by poisoning, so
+        # the block keeps its fixed (K+1) x F shape).
+        guess_width = f_live if variant.guess_dead_mask is None else self.fanout
 
         # -- Winning chains: the selected units' chains ARE the new backbone
         # (the host mirror was synced during matching).
@@ -1366,7 +1420,10 @@ class EnumDraftEngine:
         # written: the two paths bind different page tables / write slots and
         # must never mix within a round.
         graph_round = self._stage_extend_graph_round(
-            bs=bs, delta_lens=delta_lens, scratch_slots=scratch_slots
+            bs=bs,
+            delta_lens=delta_lens,
+            scratch_slots=scratch_slots,
+            rows_per_seat=self.num_steps + 1,
         )
         advance_batch, advance_slots = self._extend_batch(
             token_lists=[state.committed_tokens for state in states],
@@ -1385,7 +1442,7 @@ class EnumDraftEngine:
             # next replay.)
             if chains_mat is not None:
                 node0_logits.scatter_(-1, chains_mat[:, :1], float("-inf"))
-            node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices
+            node0_guesses = torch.topk(node0_logits, guess_width, dim=-1).indices
         self._absorb_advance_slots(states, advance_slots)
 
         # -- Carrier pool rows: broadcast the committed delta, then scatter
@@ -1464,7 +1521,7 @@ class EnumDraftEngine:
                 fused_view[:, :num_steps].scatter_(
                     -1, chains_mat.unsqueeze(-1), float("-inf")
                 )
-            guesses_stack = torch.topk(fused_view, f_live, dim=-1).indices
+            guesses_stack = torch.topk(fused_view, guess_width, dim=-1).indices
         else:
             # -- Glue extend: all K backbone tokens in one forward = node 1..K
             # logits; their KV lands in this round's backbone slots (page 1)
@@ -1484,8 +1541,17 @@ class EnumDraftEngine:
                 glue_view[:, : num_steps - 1].scatter_(
                     -1, chains_mat[:, 1:].unsqueeze(-1), float("-inf")
                 )
-            glue_guesses = torch.topk(glue_view, f_live, dim=-1).indices
+            glue_guesses = torch.topk(glue_view, guess_width, dim=-1).indices
             guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
+        if variant.guess_dead_mask is not None:
+            # Per-case budget: the top-k ran at FULL width, so poison every
+            # column past its case's budget. The block ships those cells dead
+            # (-1, matching nothing on either side) and the branch phase below
+            # drafts only the budgeted ones.
+            guesses_stack = guesses_stack.masked_fill(variant.guess_dead_mask, -1)
+            branch_guesses = guesses_stack.reshape(bs, -1)[:, variant.sel_rows_dev]
+        else:
+            branch_guesses = guesses_stack
 
         if self._paged:
             # Branch prefixes (boundary tail + delta + case backbone) now
@@ -1521,17 +1587,19 @@ class EnumDraftEngine:
         chain_steps = self._branch_decode_chain(
             carriers=carriers,
             states=states,
-            guesses_stack=guesses_stack,
+            branch_guesses=branch_guesses,
             backbone_slots=backbone_slots,
             scratch_slots=scratch_slots,
             variant=variant,
-            f_live=f_live,
         )
         return self._pack_and_mirror(
             states=states,
             guesses_stack=guesses_stack,
             chain_steps=chain_steps,
             new_backbones=new_backbones,
+            sel_rows_dev=(
+                None if variant.guess_dead_mask is None else variant.sel_rows_dev
+            ),
         )
 
     def _sync_carrier_rows(
@@ -1922,20 +1990,29 @@ class EnumDraftEngine:
     # ------------------------------------------------------------------ #
 
     def _stage_extend_graph_round(
-        self, *, bs: int, delta_lens: list[int], scratch_slots: list[torch.Tensor]
+        self,
+        *,
+        bs: int,
+        delta_lens: list[int],
+        scratch_slots: list[torch.Tensor],
+        rows_per_seat: int,
     ) -> Optional[_ExtendGraphRound]:
-        """Decide graph vs eager for this fast round and stage the pad slots.
+        """Decide graph vs eager for this round and stage the pad slots.
+
+        ``rows_per_seat`` is K+1 for a fast round's fused shape (seat + glue
+        rows) and 1 for a miss round's advance-only degenerate shape.
 
         Every check is host-static so the choice is final before any carrier
         state is written. Per-round fallback triggers: no runner (kill switch
-        or construction failure), a delta beyond the padded window
-        (defensive; catch-up merges miss the glue fast path anyway), a row
-        count over the captured buckets, or KV-pool exhaustion on the pad
-        staging (the eager path needs fewer slots).
+        or construction failure), a delta outside the padded window
+        (defensive; catch-up merges miss the glue fast path anyway, and an
+        empty delta has no last real token to pad with), a row count over the
+        captured buckets, or KV-pool exhaustion on the pad staging (the eager
+        path needs fewer slots).
         """
         if self._extend_graph_runner is None:
             return None
-        rows = bs * (self.num_steps + 1)
+        rows = bs * rows_per_seat
         if rows > self._extend_graph_max_rows:
             return None
         if (
@@ -1943,7 +2020,9 @@ class EnumDraftEngine:
             and rows not in self._extend_graph_capture_rows
         ):
             return None
-        if any(delta_len > self.num_steps + 1 for delta_len in delta_lens):
+        if any(
+            delta_len < 1 or delta_len > self.num_steps + 1 for delta_len in delta_lens
+        ):
             return None
         if self._paged:
             pad_slots = self.model_runner.token_to_kv_pool_allocator.alloc(
@@ -1963,7 +2042,7 @@ class EnumDraftEngine:
             return None
         scratch_slots.append(w_slots)
         return _ExtendGraphRound(
-            w_slots=w_slots.view(bs, self.num_steps + 1, self._extend_graph_width),
+            w_slots=w_slots.view(bs, rows_per_seat, self._extend_graph_width),
             seat_pad_flats=None,
         )
 
@@ -2001,6 +2080,29 @@ class EnumDraftEngine:
             self._extend_graph_const_cache[rows] = consts
         return consts
 
+    def _extend_graph_seat_pads(
+        self,
+        *,
+        seat: int,
+        base_len: int,
+        delta_len: int,
+        graph_round: _ExtendGraphRound,
+    ) -> torch.Tensor:
+        """Seat row ``seat``'s W - delta pad slots: its own w_slots plane tail
+        at page_size == 1, else the round's throwaway pad pages entered at the
+        offset that keeps in-page offset == logical position offset (the
+        invariant paged tables are derived from). Both the write targets and
+        the page-table entries come from here, so the two can never disagree.
+        """
+        width = self._extend_graph_width
+        if not self._paged:
+            return graph_round.w_slots[seat, 0, delta_len:width]
+        new_len = base_len + delta_len
+        pad_offset = new_len - self._page_floor(new_len)
+        return graph_round.seat_pad_flats[
+            seat, pad_offset : pad_offset + width - delta_len
+        ]
+
     def _extend_graph_out_cache_loc(
         self,
         *,
@@ -2023,19 +2125,19 @@ class EnumDraftEngine:
         for i, carrier in enumerate(carriers):
             delta_len = delta_lens[i]
             pieces.append(seat_delta_slots[delta_offset : delta_offset + delta_len])
-            if self._paged:
-                new_len = base_lens[i] + delta_len
-                pad_offset = new_len - self._page_floor(new_len)
-                pieces.append(
-                    graph_round.seat_pad_flats[
-                        i, pad_offset : pad_offset + width - delta_len
-                    ]
+            pieces.append(
+                self._extend_graph_seat_pads(
+                    seat=i,
+                    base_len=base_lens[i],
+                    delta_len=delta_len,
+                    graph_round=graph_round,
                 )
+            )
+            if self._paged:
                 tail = base_lens[i] - self._page_floor(base_lens[i])
                 for g in range(self.num_steps):
                     pieces.append(carrier.glue_private_slots[g, tail : tail + width])
             else:
-                pieces.append(graph_round.w_slots[i, 0, delta_len:width])
                 pieces.append(graph_round.w_slots[i, 1:].reshape(-1))
             delta_offset += delta_len
         return torch.cat(pieces)
@@ -2052,23 +2154,21 @@ class EnumDraftEngine:
         uniform post-write seq_len (base + W) makes paged backends resolve
         every window position through the page table, so pads must point at
         owned junk -- never left stale (the no-stale-mapping discipline) and
-        never routed into a live page. The paged column arithmetic keeps
-        in-page offset == logical offset, the invariant page tables are
-        derived from; the seat row itself is transient (freed with the
-        advance batch), so these entries die with the round."""
+        never routed into a live page. The seat row itself is transient
+        (freed with the advance batch), so these entries die with the round."""
         pool = self.model_runner.req_to_token_pool
         width = self._extend_graph_width
         for i in range(len(base_lens)):
             new_len = base_lens[i] + delta_lens[i]
-            end = base_lens[i] + width
-            if self._paged:
-                pad_offset = new_len - self._page_floor(new_len)
-                pads = graph_round.seat_pad_flats[
-                    i, pad_offset : pad_offset + end - new_len
-                ]
-            else:
-                pads = graph_round.w_slots[i, 0, delta_lens[i] : width]
-            pool.req_to_token[seat_rows[i], new_len:end] = pads.to(torch.int32)
+            pads = self._extend_graph_seat_pads(
+                seat=i,
+                base_len=base_lens[i],
+                delta_len=delta_lens[i],
+                graph_round=graph_round,
+            )
+            pool.req_to_token[seat_rows[i], new_len : base_lens[i] + width] = pads.to(
+                torch.int32
+            )
 
     def _extend_graph_assemble_rows(
         self,
@@ -2209,8 +2309,6 @@ class EnumDraftEngine:
         bs * (K+1) * W replay logits at each row's last REAL position -- the
         same contract as the eager fused forward's per-row last logits.
         """
-        width = self._extend_graph_width
-        rows = len(carriers) * (self.num_steps + 1)
         fused, true_lens_host, node_offsets = self._extend_graph_assemble_rows(
             carriers=carriers,
             chains=chains,
@@ -2222,6 +2320,40 @@ class EnumDraftEngine:
             delta_lens=delta_lens,
             graph_round=graph_round,
         )
+        return self._extend_graph_replay(
+            fused=fused,
+            rows=len(carriers) * (self.num_steps + 1),
+            true_lens_host=true_lens_host,
+            node_offsets=node_offsets,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            tag="fused_graph",
+        )
+
+    def _extend_graph_replay(
+        self,
+        *,
+        fused: ScheduleBatch,
+        rows: int,
+        true_lens_host: list[int],
+        node_offsets: list[int],
+        base_lens: list[int],
+        delta_lens: list[int],
+        tag: str,
+    ) -> torch.Tensor:
+        """Replay one assembled DRAFT_EXTEND_V2 shell (fused rows or the
+        advance-only degenerate shape) and gather the node logits.
+
+        Carries the dual-plane length contract described by
+        ``_fused_extend_graph_forward``: the full-attn plane sees the uniform
+        padded width W everywhere, the recurrent plane the TRUE per-row scan
+        lengths. Row counts below the smallest captured bucket replay padded;
+        the runner points those rows at reserved pool row 0 and the GDN plane
+        scans them through its junk state slot, so they cannot touch any real
+        row's state. ``base_lens`` / ``delta_lens`` are debug-probe context
+        only.
+        """
+        width = self._extend_graph_width
         width_tensor, width_list = self._extend_graph_consts_for(rows)
         spec_info = EagleDraftExtendInput(
             hidden_states=None,  # STANDALONE: the enum drafter feeds token ids only
@@ -2242,7 +2374,7 @@ class EnumDraftEngine:
         spec_info.gdn_true_extend_lens_tensor = torch.tensor(
             true_lens_host, dtype=torch.int32
         ).to(self.device, non_blocking=True)
-        self.profiler.mark("fused_graph_mut")
+        self.profiler.mark(f"{tag}_mut")
         try:
             fused.forward_mode = ForwardMode.DRAFT_EXTEND_V2
             fused.spec_info = spec_info
@@ -2274,7 +2406,7 @@ class EnumDraftEngine:
                 :, : forward_batch.mrope_positions.shape[1]
             ].copy_(forward_batch.mrope_positions)
         logits_output = runner.execute(forward_batch)
-        self.profiler.mark("fused_graph_fwd")
+        self.profiler.mark(f"{tag}_fwd")
         if envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
             # Observation-only probe (no second forward, so no recurrent
             # -state double-advance): per row, which of the W window
@@ -2296,6 +2428,166 @@ class EnumDraftEngine:
         # The gather copies out of the runner's private static logits buffer
         # before any later replay could overwrite it.
         return logits_output.next_token_logits[node_gather]
+
+    def _advance_graph_assemble_rows(
+        self,
+        *,
+        seat_reqs: list,
+        seat_rows: torch.Tensor,
+        seat_input_ids: torch.Tensor,
+        seat_delta_slots: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+        graph_round: _ExtendGraphRound,
+    ) -> tuple[ScheduleBatch, list[int], list[int]]:
+        """Bind the fused shell for an ADVANCE-ONLY graph round: ONE row per
+        seat (its committed delta, padded to W), no glue plane.
+
+        Row semantics, write targets and both planes' length contract are the
+        fast round's seat row verbatim -- only the glue rows are absent -- so
+        the delta's KV lands in the same real allocator slots and a hybrid
+        seat's state slot advances by exactly the delta. Returns (shell,
+        per-row true lengths, per-row node-0 flat logit offsets).
+        """
+        width = self._extend_graph_width
+        bs = len(base_lens)
+        fused = self._glue_template
+        fused.reqs = list(seat_reqs)
+        # mrope models (Qwen3.5 family) index multimodal_inputs per row in
+        # ForwardBatch.init_new; rebind to this round's row count (text-only).
+        fused.multimodal_inputs = [None] * bs
+        fused.req_pool_indices = seat_rows
+        fused.extend_logprob_start_lens = [0] * bs
+        _, width_list = self._extend_graph_consts_for(bs)
+        fused.extend_lens = list(width_list)
+        fused.prefix_lens = list(base_lens)
+        gather_rows: list[int] = []
+        node_offsets: list[int] = []
+        slot_pieces: list[torch.Tensor] = []
+        delta_offset = 0
+        for i, delta_len in enumerate(delta_lens):
+            # The fused gather pattern's FIRST row IS the seat row (the delta
+            # padded with repeats of its last real index); the glue rows this
+            # round does not have follow it.
+            gather_rows.extend(
+                delta_offset + entry
+                for entry in self._extend_graph_gather_pattern(delta_len)[:width]
+            )
+            node_offsets.append(i * width + delta_len - 1)
+            slot_pieces.append(
+                seat_delta_slots[delta_offset : delta_offset + delta_len]
+            )
+            slot_pieces.append(
+                self._extend_graph_seat_pads(
+                    seat=i,
+                    base_len=base_lens[i],
+                    delta_len=delta_len,
+                    graph_round=graph_round,
+                )
+            )
+            delta_offset += delta_len
+        gather = torch.tensor(gather_rows, dtype=torch.int64, device=self.device)
+        fused.input_ids = seat_input_ids[gather]
+        fused.out_cache_loc = torch.cat(slot_pieces)
+        fused.extend_num_tokens = bs * width
+        self._extend_graph_bind_seat_pads(
+            seat_rows=seat_rows,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            graph_round=graph_round,
+        )
+        # DRAFT_EXTEND_V2 prepare contract: the ScheduleBatch view carries the
+        # PRE-write lengths; orig stays post-write like the eager shell.
+        seq_cpu = torch.tensor(base_lens, dtype=torch.int64)
+        fused.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        fused.seq_lens_cpu = seq_cpu
+        fused.seq_lens_sum = sum(base_lens)
+        fused.orig_seq_lens = (fused.seq_lens + width).to(torch.int32)
+        return fused, list(delta_lens), node_offsets
+
+    def _advance_forward(
+        self,
+        *,
+        states: list[_DraftReqState],
+        base_lens: list[int],
+        scratch_batches: list[ScheduleBatch],
+        scratch_slots: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance the seats' committed delta on its own (the miss round's
+        first phase; a fast round folds the same work into the fused extend).
+        Returns (node-0 logits [bs, vocab], the delta's new KV slots).
+
+        The advance rides the SAME captured DRAFT_EXTEND_V2 graph as a fast
+        round's fused extend, in its no-glue degenerate shape (rows = seats,
+        one W-padded delta window each). Staging happens before any KV is
+        written so the choice is final for the round; any check failing keeps
+        the eager extend forward.
+        """
+        delta_lens = [
+            len(state.committed_tokens) - base_lens[i] for i, state in enumerate(states)
+        ]
+        graph_round = self._stage_extend_graph_round(
+            bs=len(states),
+            delta_lens=delta_lens,
+            scratch_slots=scratch_slots,
+            rows_per_seat=1,
+        )
+        advance_batch, advance_slots = self._extend_batch(
+            token_lists=[state.committed_tokens for state in states],
+            prefix_slots=[state.committed_slots for state in states],
+            tag="advance",
+            mamba_slots=self._seat_mamba_slots(states),
+        )
+        scratch_batches.append(advance_batch)
+        if graph_round is None:
+            return self._forward(advance_batch, tag="advance"), advance_slots
+        node0_logits = self._advance_graph_forward(
+            seat_reqs=advance_batch.reqs,
+            seat_rows=advance_batch.req_pool_indices,
+            seat_input_ids=advance_batch.input_ids,
+            seat_delta_slots=advance_slots,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            graph_round=graph_round,
+        )
+        return node0_logits, advance_slots
+
+    def _advance_graph_forward(
+        self,
+        *,
+        seat_reqs: list,
+        seat_rows: torch.Tensor,
+        seat_input_ids: torch.Tensor,
+        seat_delta_slots: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+        graph_round: _ExtendGraphRound,
+    ) -> torch.Tensor:
+        """A miss round's seat advance as ONE captured DRAFT_EXTEND_V2 replay.
+
+        Reuses the fast round's graph (zero extra capture) in its degenerate
+        no-glue shape: rows = seats, each the seat's delta padded to W. Returns
+        node-0 logits [bs, vocab] -- the same contract as the eager advance's
+        per-row last logits.
+        """
+        fused, true_lens_host, node_offsets = self._advance_graph_assemble_rows(
+            seat_reqs=seat_reqs,
+            seat_rows=seat_rows,
+            seat_input_ids=seat_input_ids,
+            seat_delta_slots=seat_delta_slots,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            graph_round=graph_round,
+        )
+        return self._extend_graph_replay(
+            fused=fused,
+            rows=len(base_lens),
+            true_lens_host=true_lens_host,
+            node_offsets=node_offsets,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            tag="advance_graph",
+        )
 
     def _glue_forward(
         self,
@@ -2377,32 +2669,33 @@ class EnumDraftEngine:
         *,
         carriers: list[_SeatCarrier],
         states: list[_DraftReqState],
-        guesses_stack: torch.Tensor,
+        branch_guesses: torch.Tensor,
         backbone_slots: Optional[torch.Tensor],
         scratch_slots: list[torch.Tensor],
         variant: _FanoutVariant,
-        f_live: int,
     ) -> list[torch.Tensor]:
+        """Run the (case, guess) chains as K decode replays on the seats'
+        selected carrier rows. ``branch_guesses`` holds each selected row's
+        first token in the batch's row order (case-major, budgeted columns).
+
+        Everything the row SELECTION determines -- the Req stubs, the pool-row
+        gather, the mrope row list -- is round-invariant per (seat, width) and
+        comes from the seats' caches; only the seq-len family is rebuilt (the
+        rebind-only discipline of _glue_template).
+        """
         num_steps = self.num_steps
         branch = self._branch_template
-        branch.reqs = [
-            carrier.branch_reqs[row]
-            for carrier in carriers
-            for row in variant.sel_rows_pool
-        ]
+        sels = [carrier.branch_sel_for(variant=variant) for carrier in carriers]
+        if len(sels) == 1:
+            branch.reqs, branch.req_pool_indices = sels[0]
+        else:
+            branch.reqs = [req for reqs, _ in sels for req in reqs]
+            branch.req_pool_indices = torch.cat([rows for _, rows in sels])
         # See _glue_forward: mrope models index this list per row.
         branch.multimodal_inputs = [None] * len(branch.reqs)
-        branch.req_pool_indices = (
-            torch.cat(
-                [carrier.branch_rows[variant.sel_rows_dev] for carrier in carriers]
-            )
-            if len(carriers) > 1
-            else carriers[0].branch_rows[variant.sel_rows_dev]
-        )
+        lens = [state.committed_slots.numel() for state in states]
         seq_host = [
-            state.committed_slots.numel() + case
-            for state in states
-            for case in variant.case_of_row
+            base_len + case for base_len in lens for case in variant.case_of_row
         ]
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
         branch.seq_lens = seq_cpu.to(self.device, non_blocking=True)
@@ -2411,13 +2704,13 @@ class EnumDraftEngine:
         branch.orig_seq_lens = branch.seq_lens.to(torch.int32)
         cascade = self._build_branch_cascade(
             states=states,
+            lens=lens,
             backbone_slots=backbone_slots,
             variant=variant,
-            f_live=f_live,
         )
         self.profiler.mark("branch_mut")
         logits, step_slots = self._decode_step(
-            branch, guesses_stack.reshape(-1), tag="branch", cascade=cascade
+            branch, branch_guesses.reshape(-1), tag="branch", cascade=cascade
         )
         scratch_slots.append(step_slots)
         chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
@@ -2433,9 +2726,9 @@ class EnumDraftEngine:
         self,
         *,
         states: list[_DraftReqState],
+        lens: list[int],
         backbone_slots: Optional[torch.Tensor],
         variant: _FanoutVariant,
-        f_live: int,
     ) -> Optional[_CascadeMetadata]:
         """Shared-prefix cascade inputs for this round's branch chain, or None
         below the L2 threshold (where per-row re-reads are effectively free
@@ -2448,11 +2741,10 @@ class EnumDraftEngine:
             # slots, so the dedup the cascade exists for is gone.
             return None
         min_prefix = self._cascade_min_prefix_len
-        lens = [state.committed_slots.numel() for state in states]
         if min_prefix <= 0 or min(lens) < min_prefix:
             return None
         seats = len(states)
-        rows_per_seat = (self.num_steps + 1) * f_live
+        rows_per_seat = len(variant.sel_rows_pool)
         prefix_page_table = torch.zeros(
             (seats, max(lens)), dtype=torch.int32, device=self.device
         )
@@ -2478,6 +2770,9 @@ class EnumDraftEngine:
             prefix_lens=torch.tensor(lens, dtype=torch.int32, device=self.device),
             tail_page_table=tail_page_table,
             tail_lens=tail_lens,
+            row_indices=torch.arange(
+                seats * rows_per_seat, dtype=torch.int64, device=self.device
+            ),
         )
 
     def _absorb_advance_slots(
@@ -2799,14 +3094,12 @@ class EnumDraftEngine:
         # No dead-guess exclusion here: the fallback round this block serves
         # commits a freely decoded bonus (no rejection constrains it).
         base_lens = [state.committed_slots.numel() for state in states]
-        advance_batch, advance_slots = self._extend_batch(
-            token_lists=[state.committed_tokens for state in states],
-            prefix_slots=[state.committed_slots for state in states],
-            tag="advance",
-            mamba_slots=self._seat_mamba_slots(states),
+        node0_logits, advance_slots = self._advance_forward(
+            states=states,
+            base_lens=base_lens,
+            scratch_batches=scratch_batches,
+            scratch_slots=scratch_slots,
         )
-        scratch_batches.append(advance_batch)
-        node0_logits = self._forward(advance_batch, tag="advance")
         # Consume the graph runner's static logits buffer before the next
         # forward overwrites it.
         node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices  # [bs, f]
@@ -3046,7 +3339,7 @@ class EnumDraftEngine:
             # Fork node states into every branch row before its extend reads
             # them: case 0 <- seat slot, cases 1..K-1 <- the checkpoints,
             # case K <- the backbone slot itself (it ended at node K).
-            case_of_row_dev = self._fanout_variants[self.fanout].case_of_row_dev
+            case_of_row_dev = self._full_grid_variant.case_of_row_dev
             self._fork_mamba_states(
                 src_slots=torch.cat(
                     [
@@ -3104,6 +3397,7 @@ class EnumDraftEngine:
         guesses_stack: torch.Tensor,
         chain_steps: list[torch.Tensor],
         new_backbones: list[list[int]],
+        sel_rows_dev: Optional[torch.Tensor] = None,
     ) -> dict:
         """Pack units [guess, chain_1..chain_K] and arm the fast path.
 
@@ -3111,12 +3405,16 @@ class EnumDraftEngine:
         the CUDA IPC data plane can push it D2D (the ZMQ path D2Hs it). Each
         seat keeps the block on device (next round's glue input) plus an
         async pinned host mirror (next round's hit test). A partial unit grid
-        (case-0 miss round, adaptive fanout) is padded to the full block here.
+        (case-0 miss round, adaptive fanout, per-case budget) is padded to the
+        full block here.
         """
         num_cases = self.num_steps + 1
         bs = len(states)
         guesses_stack, chain_steps = self._expand_units(
-            guesses_stack=guesses_stack, chain_steps=chain_steps, bs=bs
+            guesses_stack=guesses_stack,
+            chain_steps=chain_steps,
+            bs=bs,
+            sel_rows_dev=sel_rows_dev,
         )
         chains = torch.stack(chain_steps, dim=1).view(
             bs, num_cases, self.fanout, self.num_steps
@@ -3146,16 +3444,25 @@ class EnumDraftEngine:
         self,
         *,
         guesses_stack: torch.Tensor,  # [bs, cases_live, f_live]
-        chain_steps: list[torch.Tensor],  # each [bs * cases_live * f_live]
+        chain_steps: list[torch.Tensor],  # each [bs * rows_live]
         bs: int,
+        sel_rows_dev: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Pad a partial unit grid (fewer live cases and/or guesses) to the
         full (K+1) x F block: dead guess cells are poisoned with -1 (matches
         no vocab token on either side) and dead chains with 0 (never read
         behind a poisoned guess). The wire/mirror shape never changes, so the
-        verifier is oblivious to both the case-0 collapse and the adaptive
-        fanout."""
+        verifier is oblivious to the case-0 collapse, the adaptive fanout and
+        the per-case budget alike.
+
+        ``sel_rows_dev`` (per-case budget rounds) makes the chain steps scatter
+        by full-grid ROW instead of by rectangular slice -- their guess grid
+        already arrives full-width, poisoned outside the budget."""
         num_cases, fanout = self.num_steps + 1, self.fanout
+        if sel_rows_dev is not None:
+            return guesses_stack, self._scatter_chain_rows(
+                chain_steps=chain_steps, bs=bs, sel_rows_dev=sel_rows_dev
+            )
         cases_live, f_live = guesses_stack.shape[1], guesses_stack.shape[2]
         if cases_live == num_cases and f_live == fanout:
             return guesses_stack, chain_steps
@@ -3174,6 +3481,24 @@ class EnumDraftEngine:
             full_step[:, :cases_live, :f_live] = step.view(bs, cases_live, f_live)
             full_steps.append(full_step.view(-1))
         return full_guesses, full_steps
+
+    def _scatter_chain_rows(
+        self,
+        *,
+        chain_steps: list[torch.Tensor],  # each [bs * rows_live]
+        bs: int,
+        sel_rows_dev: torch.Tensor,  # full-grid row of each live row
+    ) -> list[torch.Tensor]:
+        """Scatter a ragged (per-case budget) round's chain steps into the full
+        (K+1) x F row grid. Unbudgeted rows stay 0 -- never read, since their
+        guess cell ships poisoned."""
+        rows = (self.num_steps + 1) * self.fanout
+        full_steps: list[torch.Tensor] = []
+        for step in chain_steps:
+            full_step = torch.zeros((bs, rows), dtype=step.dtype, device=self.device)
+            full_step[:, sel_rows_dev] = step.view(bs, -1)
+            full_steps.append(full_step.view(-1))
+        return full_steps
 
     def _build_seat_carriers(
         self,
@@ -3481,10 +3806,9 @@ class EnumDraftEngine:
         if cascade is not None:
             # Append this step's KV slot to each row's private tail, then
             # advance the tail lengths so the kernel covers the new token.
-            rows = cascade.tail_lens.shape[0]
-            cascade.tail_page_table[
-                torch.arange(rows, device=self.device), cascade.tail_lens.long()
-            ] = batch.out_cache_loc.to(torch.int32)
+            cascade.tail_page_table[cascade.row_indices, cascade.tail_lens.long()] = (
+                batch.out_cache_loc.to(torch.int32)
+            )
             cascade.tail_lens.add_(1)
         self.profiler.mark(f"{tag}_step_prep")
         forward_batch = ForwardBatch.init_new(
