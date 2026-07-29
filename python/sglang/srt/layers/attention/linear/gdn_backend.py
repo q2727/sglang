@@ -15,9 +15,10 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
@@ -25,6 +26,9 @@ from sglang.srt.utils.common import rank0_log
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update,
     )
 
 if is_cuda() or is_hip():
@@ -338,6 +342,147 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
+        # DRAFT_EXTEND_V2 (uniform padded-width extend) static metadata; only
+        # populated by init_cuda_graph_state on a dedicated draft-extend
+        # instance (the decoupled drafter's fused-extend graph). Per captured
+        # batch size, doubled real/pad half-row buffers -- see
+        # _forward_draft_extend_v2 for the construction.
+        self.draft_extend_v2_num_tokens_per_req = 0
+        self.draft_extend_v2_cu_seqlens_list: list[torch.Tensor] = []
+        self.draft_extend_v2_row_starts_list: list[torch.Tensor] = []
+        self.draft_extend_v2_state_indices_list: list[torch.Tensor] = []
+        self.draft_extend_v2_has_initial_state_list: list[torch.Tensor] = []
+        # PHYSICAL mamba slot every DRAFT_EXTEND_V2 pad segment (pad half-rows
+        # and bucket-padding rows) scans from and writes back to. Poisoning
+        # pads (kernel skip) is NOT safe here: a skipped segment leaves its
+        # output positions uninitialized, and whatever the transient graph
+        # buffer held (NaN on some processes) becomes the pad hidden state,
+        # then pad K/V. Glue rows share their KV page between real prefix and
+        # pads, so an additive causal mask turns one NaN K in a masked column
+        # into NaN for every REAL query of the row. A real (junk) slot makes
+        # every pad segment a genuine finite scan instead. Set by the
+        # decoupled engine before graph capture.
+        self.draft_extend_v2_pad_state_slot: Optional[int] = None
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        # DRAFT_EXTEND_V2 buffers, one set per captured batch size (the
+        # captured kernels bind these tensors by pointer, so replay prep must
+        # refresh them in place). Even half-row boundaries are shape
+        # constants (row r's window starts at r * W); only the odd
+        # (true-length) boundaries and the real halves' slot ids move.
+        num_tokens_per_req = max_num_tokens // max_bs
+        self.draft_extend_v2_num_tokens_per_req = num_tokens_per_req
+        self.draft_extend_v2_cu_seqlens_list = []
+        self.draft_extend_v2_row_starts_list = []
+        self.draft_extend_v2_state_indices_list = []
+        self.draft_extend_v2_has_initial_state_list = []
+        for i in range(max_bs):
+            bs = i + 1
+            row_starts = torch.arange(
+                0,
+                (bs + 1) * num_tokens_per_req,
+                num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            cu_seqlens = torch.zeros(
+                (2 * bs + 1,), dtype=torch.int32, device=self.device
+            )
+            cu_seqlens[0::2] = row_starts
+            cu_seqlens[1::2] = row_starts[:bs]
+            self.draft_extend_v2_cu_seqlens_list.append(cu_seqlens)
+            # Separate start tensor (not a strided view of cu_seqlens) so the
+            # replay-prep odd-boundary rewrite never copies from overlapping
+            # storage.
+            self.draft_extend_v2_row_starts_list.append(row_starts[:bs].clone())
+            self.draft_extend_v2_state_indices_list.append(
+                torch.full(
+                    (2 * bs,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
+            has_initial_state = torch.zeros(
+                (2 * bs,), dtype=torch.bool, device=self.device
+            )
+            # Real halves always continue a forked recurrent state (the
+            # decoupled engine never extends from an empty prefix on this
+            # path); pad halves start cold and are skipped via the poisoned
+            # slot id anyway.
+            has_initial_state[0::2] = True
+            self.draft_extend_v2_has_initial_state_list.append(has_initial_state)
+
+    def _replay_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        spec_info,
+        seq_lens_cpu,
+        num_padding=None,
+        in_capture: bool = False,
+        mamba_track_indices=None,
+    ):
+        if forward_mode.is_draft_extend_v2():
+            return self._draft_extend_v2_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                spec_info=spec_info,
+                in_capture=in_capture,
+            )
+        return super()._replay_metadata(
+            bs,
+            req_pool_indices,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu,
+            num_padding=num_padding,
+            in_capture=in_capture,
+            mamba_track_indices=mamba_track_indices,
+        )
+
+    def _draft_extend_v2_metadata(
+        self, *, bs: int, req_pool_indices: torch.Tensor, spec_info, in_capture: bool
+    ) -> ForwardMetadata:
+        """Refresh the doubled half-row buffers for one capture / replay prep.
+
+        Every non-real segment (pad half-rows always; bucket-padding rows'
+        halves at replay; everything at capture) points at the engine's junk
+        pad-state slot and SCANS for real -- see the field comment on
+        ``draft_extend_v2_pad_state_slot`` for why skipping instead (poison)
+        NaN-poisons downstream rows. Replay writes the real halves'
+        translated slot ids and the true scan lengths from
+        ``spec_info.gdn_true_extend_lens_tensor``.
+        """
+        pad_state = self.draft_extend_v2_pad_state_slot
+        assert pad_state is not None, (
+            "DRAFT_EXTEND_V2 requires draft_extend_v2_pad_state_slot (set by "
+            "the decoupled engine before graph capture)"
+        )
+        cu_seqlens = self.draft_extend_v2_cu_seqlens_list[bs - 1]
+        row_starts = self.draft_extend_v2_row_starts_list[bs - 1]
+        state_indices = self.draft_extend_v2_state_indices_list[bs - 1]
+        if in_capture:
+            state_indices.fill_(pad_state)
+            cu_seqlens[1::2] = row_starts + self.draft_extend_v2_num_tokens_per_req
+        else:
+            true_lens = spec_info.gdn_true_extend_lens_tensor
+            num_real_rows = min(true_lens.shape[0], bs)
+            mamba_indices = self._translate_mamba_indices(
+                self.req_to_token_pool.get_mamba_indices(req_pool_indices[:bs])
+            ).to(torch.int32)
+            # Bucket-padding rows alias req_to_token row 0; scan them through
+            # the junk slot too (their input ids are the runner's zero fill).
+            mamba_indices[num_real_rows:] = pad_state
+            state_indices[0::2] = mamba_indices
+            state_indices[1::2] = pad_state
+            cu_seqlens[1::2] = row_starts
+            cu_seqlens[1 : 2 * num_real_rows : 2] += true_lens[:num_real_rows].to(
+                torch.int32
+            )
+        return ForwardMetadata(
+            query_start_loc=cu_seqlens,
+            mamba_cache_indices=state_indices,
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -452,6 +597,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            return self._forward_draft_extend_v2(
+                layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
+            )
         seq_len = mixed_qkv.shape[0]
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
@@ -652,6 +801,119 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _forward_draft_extend_v2(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        """DRAFT_EXTEND_V2 (uniform padded-width extend) for the GDN plane.
+
+        The decoupled drafter's fused-extend CUDA graph feeds every request
+        row as a FIXED W-token window -- real tokens then repeats of the last
+        real token -- because the full-attention plane replays a constant
+        strided-query layout. A recurrent plane cannot simply scan those
+        windows: unlike causal attention, where a pad SUFFIX is never
+        attended by any real position and its poison stays local, scanning a
+        pad token folds it into the row's post-scan slot state permanently.
+        The trick is that the row layout is a shape constant but the SCAN
+        LENGTHS are data: the GDN kernels read their per-row loop bounds from
+        a device ``cu_seqlens`` at execution time, so one captured graph
+        replays any true-length pattern.
+
+        Each W window is therefore split into two half-rows over one shared
+        ``cu_seqlens`` of static shape ``[2 * rows + 1]``: the REAL half
+        ``[r * W, r * W + true_len)`` scans from the row's forked state slot
+        and writes the post-scan state back, and the PAD half
+        ``[r * W + true_len, (r + 1) * W)`` carries a poisoned slot id, which
+        both kernels honor by skipping state load and writeback -- pad
+        activations come out as garbage, contained by the suffix argument
+        above (no per-position op mixes them into real positions and the
+        engine never gathers pad logits). The recurrent (decode-family)
+        kernel replaces the chunked prefill kernel here because the chunk
+        scheduler derives host-side lengths from ``cu_seqlens`` (a D2H sync a
+        captured graph cannot contain), while the recurrent kernel's loop
+        bound is a device read; window widths are small (W = 2K + 1), the
+        same regime the recurrent verify kernel already serves.
+        """
+        metadata = self.forward_metadata
+        cu_seqlens = metadata.query_start_loc  # [2 * rows + 1]
+        cache_indices = metadata.mamba_cache_indices  # [2 * rows], odd poisoned
+        num_half_rows = cu_seqlens.shape[0] - 1
+        has_initial_states = self.draft_extend_v2_has_initial_state_list[
+            num_half_rows // 2 - 1
+        ]
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        seq_len = mixed_qkv.shape[0]
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=layer_cache.conv[0],
+            has_initial_state=has_initial_states,
+            cache_indices=cache_indices,
+            query_start_loc=cu_seqlens,
+            # Host-side grid bound only (max per-half-row width, a shape
+            # constant); the real per-row bounds are the device cu_seqlens.
+            seq_lens_cpu=[self.draft_extend_v2_num_tokens_per_req] * num_half_rows,
+        ).transpose(0, 1)[:seq_len]
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+            # Contiguous [1, T, H, D] outputs, same as the eager extend path.
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+            )
+            # reshape, not view: last-dim splits of the conv output are
+            # non-contiguous strided views.
+            query = query.reshape(1, seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.reshape(1, seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.reshape(1, seq_len, layer.num_v_heads, layer.head_v_dim)
+        core_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            initial_state_source=layer_cache.temporal,
+            initial_state_indices=cache_indices,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+        )
+        # Sanitize the pad positions to zeros. The kernels leave pad-half
+        # outputs undefined (uninitialized transient memory, or NaN from the
+        # short-segment scan itself); if that garbage carries NaN it becomes
+        # the pads' K/V at the full-attention layers, and rows whose KV page
+        # mixes real prefix and pads (the glue rows) then NaN their REAL
+        # queries through additive causal masking. Positions are compared
+        # against the DEVICE cu_seqlens' odd (true-end) boundaries, so one
+        # captured mask op replays correctly for any true-length pattern.
+        width = self.draft_extend_v2_num_tokens_per_req
+        pos = torch.arange(seq_len, device=core_out.device)
+        real_end = cu_seqlens[2 * (pos // width) + 1].to(torch.int64)
+        real_mask = pos < real_end
+        return torch.where(
+            real_mask.view(1, seq_len, *([1] * (core_out.dim() - 2))),
+            core_out,
+            torch.zeros((), dtype=core_out.dtype, device=core_out.device),
+        )
 
     def _replayssm_target_verify(
         self,

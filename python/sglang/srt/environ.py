@@ -354,6 +354,21 @@ class Envs:
     # control-plane send, arrival wait, block transport latency). Pure host
     # timestamps -- cheap, but debug instrumentation only.
     SGLANG_DEBUG_DECOUPLED_VERIFY_PROFILE = EnvBool(False)
+    # Decoupled spec: run every fused-extend GRAPH round through the eager
+    # fused path as well and log per-node logit divergence. CAVEAT: the
+    # second forward re-advances the recurrent plane's states (the fork
+    # copies were consumed by the first), so from the second fused round on
+    # the engine state is poisoned -- only the FIRST logged round of a fresh
+    # seat is trustworthy. Debug instrumentation only.
+    SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_DIFF = EnvBool(False)
+    # Decoupled spec: observation-only NaN probe for fused-extend graph
+    # rounds (no second forward, state stays clean): logs which of each
+    # row's W window positions carry NaN logits. Debug instrumentation only.
+    SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK = EnvBool(False)
+    # Decoupled spec: bisect probe -- feed the GDN plane full-width scan
+    # lengths (no pad half-rows). Corrupts states/guesses by design; only
+    # for localizing which plane injects NaN. Debug instrumentation only.
+    SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_FULLSCAN = EnvBool(False)
     # Decoupled spec: after each round the drafter bets the most likely next
     # commit (full accept + its own top bonus guess), pre-runs that round and
     # ships the block early into the speculative buffer generation. A right
@@ -387,6 +402,13 @@ class Envs:
     # Decoupled spec: fuse the drafter fast round's advance + glue extends
     # into one batched forward; False restores the two-forward path.
     SGLANG_ENABLE_DECOUPLED_FUSED_EXTEND = EnvBool(True)
+    # Decoupled spec: replay the drafter fast round's fused extend as one
+    # captured DRAFT_EXTEND_V2 CUDA graph -- every fused row padded to the
+    # static width W = 2K+1 -- instead of launching it eagerly. Requires the
+    # fused extend; falls back to the eager fused path per round (catch-up
+    # deltas, capture-bucket overflow) or entirely (construction failure,
+    # this switch off).
+    SGLANG_ENABLE_DECOUPLED_EXTEND_GRAPH = EnvBool(True)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

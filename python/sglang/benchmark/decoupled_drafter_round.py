@@ -14,6 +14,7 @@ Example (drafter defaults from the e2e setup)::
 
 import argparse
 import logging
+import os
 import random
 import time
 from typing import Optional
@@ -90,6 +91,13 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Correctness mode: drive a fast-path engine and a slow-path "
         "engine with identical commits and diff their blocks each round.",
+    )
+    parser.add_argument(
+        "--compare-graph",
+        action="store_true",
+        help="Variant of --compare where BOTH engines run the glue fast "
+        "path and only the extend-graph differs (fast=graph, slow=eager "
+        "fused): isolates graph-vs-eager divergence with matched semantics.",
     )
     parser.add_argument(
         "--effective-fanout",
@@ -204,7 +212,10 @@ def _compare_engines(
             model_runner=model_runner,
             num_steps=args.num_steps,
             fanout=args.fanout,
-            enable_glue_fast_path=False,
+            # --compare-graph: the reference runs the SAME glue fast path,
+            # only eager (no extend graph) -- matched fused semantics.
+            enable_glue_fast_path=args.compare_graph,
+            enable_extend_graph=False,
             exclude_dead_guess=False,
         ),
     }
@@ -298,6 +309,12 @@ def main() -> None:
             {args.batch_size, args.batch_size * args.fanout, branch_rows}
         ),
         disable_cuda_graph=args.disable_cuda_graph,
+        # The engine owns row lifecycle (ReqToTokenPool.free) and forks mamba
+        # state with copy_from -- both incompatible with radix tracking; the
+        # real drafter launches with the same two settings.
+        disable_radix_cache=True,
+        mamba_radix_cache_strategy="no_buffer",
+        page_size=int(os.environ.get("BENCH_PAGE_SIZE", "1")),
     )
     if args.attention_backend is not None:
         server_args_kwargs["attention_backend"] = args.attention_backend
@@ -318,7 +335,7 @@ def main() -> None:
         model_runner.server_args.cuda_graph_bs_decode,
     )
 
-    if args.compare:
+    if args.compare or args.compare_graph:
         _compare_engines(model_runner=model_runner, vocab_size=vocab_size, args=args)
         return
 

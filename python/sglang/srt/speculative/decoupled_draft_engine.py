@@ -44,6 +44,15 @@ freed at the end of the round: a wrong branch is never selected, and the next
 commit re-extends from the committed prefix (keep-winning-branch KV is a
 listed future optimization).
 
+Fast rounds can replay the fused extend as ONE captured DRAFT_EXTEND_V2 CUDA
+graph (``SGLANG_ENABLE_DECOUPLED_EXTEND_GRAPH``): every fused row is padded to
+the static width W = 2K + 1 with repeats of its last real token, the
+full-attention plane runs the uniform-W replay contract, and hybrid (GDN)
+models feed TRUE per-row lengths through a graph-static device buffer so the
+recurrent plane never scans a pad -- see ``_fused_extend_graph_forward`` and
+``GDNAttnBackend._forward_draft_extend_v2`` for the two planes' contracts. The
+eager fused path remains the mandatory per-round fallback.
+
 A miss round (the commit fell outside the last block) collapses to case 0:
 the verifier's select missed the same block the same way and falls back, so
 the next commit can only be a single bonus -- only the F case-0 chains are
@@ -63,6 +72,7 @@ models take exactly the old paths.
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from array import array
@@ -80,9 +90,10 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.decoupled_spec_io import DraftReqKey
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
@@ -234,6 +245,9 @@ class _FanoutVariant(msgspec.Struct):
     br_r_pool: torch.Tensor  # case-prefix scatter rows, full-F layout
     br_r_sel: torch.Tensor  # case-prefix scatter rows, selected numbering
     br_j: torch.Tensor  # case-prefix scatter cols (backbone slot j)
+    # Accept case per case-prefix entry; the graph round's chain-source plane
+    # (case c's prefix reads glue row c-1 == w_slots plane c).
+    br_case: torch.Tensor
     comb_j: torch.Tensor  # glue triangle cols + br_j
     case_of_row: list[int]  # accept case per selected row
     case_of_row_dev: torch.Tensor  # same, device tensor (hybrid fork gather)
@@ -429,6 +443,92 @@ class _KVPageArena:
         )
 
 
+class _ExtendGraphRunnerFacade:
+    """Read-through view of the drafter's ModelRunner for the fused-extend
+    graph stack (runner + dedicated attention backends).
+
+    Two surfaces are overridden; everything else delegates to the real runner:
+
+    - ``server_args``: the drafter role hook nulls
+      ``speculative_num_draft_tokens`` (a spec-shaped ModelRunner would
+      corrupt the engine's 1-token decode graphs), but the draft-extend
+      runner and its backends size their fixed-width buffers from exactly
+      that field -- they get a patched copy carrying W and the fused-row
+      capture buckets instead.
+    - ``graph_shared_output``: the process-shared logits buffer is sized
+      max_decode_bs x 1 rows (the drafter is spec-free), while the extend
+      graph anchors max_rows x W full-width logits rows; a private buffer
+      both fits that and keeps decode replays from ever clobbering
+      not-yet-consumed extend logits.
+
+    Attribute WRITES land on the facade (e.g. the runner's replay publishes
+    ``war_fastpath_read_done_event`` onto its model runner); that is
+    intentional -- the drafter's dedicated event loop never consumes those
+    scheduler-side rails.
+    """
+
+    def __init__(self, *, model_runner, server_args, graph_shared_output) -> None:
+        self._model_runner = model_runner
+        self.server_args = server_args
+        self.graph_shared_output = graph_shared_output
+
+    def __getattr__(self, name: str):
+        return getattr(self._model_runner, name)
+
+
+class _DraftExtendWorkerShim:
+    """Duck-typed ``EagleDraftWorker`` surface for the draft-extend graph
+    runner -- exactly the fields its ``__init__`` / capture read (the
+    attention-unittest harness precedent,
+    test/kits/attention_unittest/runner_modes/speculative_draft_extend_runner).
+    STANDALONE keeps the runner's target-hidden-state plumbing off: the enum
+    drafter feeds token ids only."""
+
+    def __init__(
+        self,
+        *,
+        draft_runner,
+        draft_extend_attn_backend,
+        num_steps: int,
+        num_draft_tokens: int,
+    ) -> None:
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        self.draft_runner = draft_runner
+        self.target_worker = SimpleNamespace(model_runner=draft_runner)
+        self.draft_extend_attn_backend = draft_extend_attn_backend
+        self.topk = 1
+        self.speculative_num_steps = num_steps
+        self.speculative_num_draft_tokens = num_draft_tokens
+        self.server_args = draft_runner.server_args
+        self.model_config = draft_runner.model_config
+        self.speculative_algorithm = SpeculativeAlgorithm.STANDALONE
+        self.eagle_use_aux_hidden_state = False
+        self.hot_token_id = None
+        EagleDraftWorker._init_dsa_index_share_state(self)
+
+
+class _ExtendGraphRound(msgspec.Struct):
+    """Per-fast-round staging for the fused-extend graph path.
+
+    page_size == 1: ``w_slots`` [bs, K+1, W] gives every fused row a private
+    W-slot write window (plane 0 pads the seat row, planes 1..K are the glue
+    rows' whole windows). The eager duplicate-write trick is off on this
+    path: pad tokens differ across rows, so the identical-value argument that
+    makes shared-slot writes benign no longer covers the whole window.
+
+    page_size > 1: glue rows already own private arena pages wide enough for
+    W (span_max = P - 1 + W by construction); only the seat row's pad tail
+    needs ``seat_pad_flats`` [bs, pad_span] -- page-aligned throwaway
+    allocator pages expanded to flat slots (column q holds in-page offset
+    q % P, preserving the offset == logical-position invariant paged tables
+    are derived from).
+    """
+
+    w_slots: Optional[torch.Tensor]
+    seat_pad_flats: Optional[torch.Tensor]
+
+
 class EnumDraftEngine:
     """Per-request committed KV + one enumeration tree per commit round."""
 
@@ -439,6 +539,7 @@ class EnumDraftEngine:
         num_steps: int,
         fanout: int,
         enable_glue_fast_path: bool = True,
+        enable_extend_graph: bool = True,
         exclude_dead_guess: Optional[bool] = None,
     ) -> None:
         self.model_runner = model_runner
@@ -555,6 +656,9 @@ class EnumDraftEngine:
         br_j = [
             j for c in range(num_cases) for f in range(self.fanout) for j in range(c)
         ]
+        br_c = [
+            c for c in range(num_cases) for f in range(self.fanout) for j in range(c)
+        ]
         self._tri_g = torch.tensor(tri_g, dtype=torch.int64, device=self.device)
         self._tri_j = tri_j
         # Hybrid glue rows re-scan their nested chain prefix (see
@@ -564,6 +668,7 @@ class EnumDraftEngine:
         self._tri_row_lens = [g + 1 for g in range(self.num_steps)]
         self._br_r = torch.tensor(br_r, dtype=torch.int64, device=self.device)
         self._br_j = torch.tensor(br_j, dtype=torch.int64, device=self.device)
+        self._br_case = torch.tensor(br_c, dtype=torch.int64, device=self.device)
         self._comb_j = torch.tensor(tri_j + br_j, dtype=torch.int64, device=self.device)
         self._case_of_row = [c for c in range(num_cases) for _ in range(self.fanout)]
         # Per-effective-fanout row selections / templates (full F seeded here;
@@ -578,6 +683,7 @@ class EnumDraftEngine:
                 br_r_pool=self._br_r,
                 br_r_sel=self._br_r,
                 br_j=self._br_j,
+                br_case=self._br_case,
                 comb_j=self._comb_j,
                 case_of_row=self._case_of_row,
                 case_of_row_dev=torch.tensor(
@@ -599,6 +705,51 @@ class EnumDraftEngine:
         # Per-delta-length row-gather patterns for the fused extend's assembly
         # (host lists; fast-path delta lengths recur, so the cache stays tiny).
         self._fused_gather_patterns: dict[int, list[int]] = {}
+        # Fused-extend CUDA graph (fast rounds only): pad every fused row to
+        # the static width W = (K+1) + K (the deepest lockstep delta plus the
+        # K chain positions) and replay ONE captured DRAFT_EXTEND_V2 graph
+        # instead of ~2(K+1) eager kernel launch waves. Eager fused stays the
+        # mandatory fallback: per round (catch-up deltas past the window,
+        # capture-bucket overflow) and entirely (kill switch, or any
+        # construction failure inside _build_extend_graph_runner).
+        self._extend_graph_width = 2 * self.num_steps + 1
+        self._extend_graph_pad_span = (
+            self._page_roundup(self._page_size - 1 + self._extend_graph_width)
+            if self._paged
+            else 0
+        )
+        self._extend_graph_disable_padding = bool(
+            model_runner.server_args.disable_cuda_graph_padding
+        )
+        self._extend_graph_gather_patterns: dict[int, list[int]] = {}
+        self._extend_graph_const_cache: dict[int, tuple[torch.Tensor, list[int]]] = {}
+        self._extend_graph_capture_rows: frozenset[int] = frozenset()
+        self._extend_graph_max_rows = 0
+        self._extend_graph_runner = None
+        self._extend_graph_backend = None
+        if (
+            self._enable_fused_extend
+            and self.num_steps >= 1
+            and enable_extend_graph
+            and envs.SGLANG_ENABLE_DECOUPLED_EXTEND_GRAPH.get()
+        ):
+            self._extend_graph_runner = self._build_extend_graph_runner()
+        if self._extend_graph_runner is not None and self._paged:
+            # Graph rounds run pad queries at positions past the written
+            # region, and paged resolution sends those reads into the REAL
+            # page's never-written offsets (their K/V writes went to junk
+            # slots): uninitialized pool memory. On processes where that
+            # memory holds NaN bit patterns, the pad hidden states go NaN,
+            # the pads' K/V (written into the row's own arena page) go NaN,
+            # and an additive causal mask then leaks NaN from masked columns
+            # into the row's REAL queries. One init-time zero-fill makes
+            # every never-written slot read as zeros instead -- finite
+            # garbage is harmless (pad outputs are discarded by design).
+            for k_layer, v_layer in zip(
+                self._cow_kv_pool.k_buffer, self._cow_kv_pool.v_buffer
+            ):
+                k_layer.zero_()
+                v_layer.zero_()
         # Reusable batch shells for assembled fast subrounds (retained from
         # slow rounds; per-round fields are fully rebound before each use).
         self._glue_template: Optional[ScheduleBatch] = None
@@ -607,6 +758,198 @@ class EnumDraftEngine:
         self.miss_ct = 0
         self.profiler = _RoundProfiler(
             enabled=envs.SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE.get()
+        )
+
+    # ------------------------------------------------------------------ #
+    # Fused-extend CUDA graph: construction (init-time)
+    # ------------------------------------------------------------------ #
+
+    def _build_extend_graph_runner(self):
+        """Build the DRAFT_EXTEND_V2 graph stack -- dedicated attention
+        backend, worker shim, runner (which captures in its __init__). Any
+        failure logs once and leaves the engine on the eager fused path."""
+        try:
+            return self._build_extend_graph_runner_impl()
+        except Exception:
+            logger.warning(
+                "decoupled fused-extend graph disabled: construction failed; "
+                "falling back to the eager fused extend",
+                exc_info=True,
+            )
+            return None
+
+    def _build_extend_graph_runner_impl(self):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+        from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
+        from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+            EAGLEDraftExtendCudaGraphRunner,
+        )
+
+        model_runner = self.model_runner
+        graph_config = model_runner.server_args.cuda_graph_config
+        if (
+            graph_config is None
+            or graph_config.decode.backend == Backend.DISABLED
+            or not graph_config.decode.bs
+        ):
+            logger.info("decoupled fused-extend graph off: CUDA graphs disabled")
+            return None
+        if self._hybrid and not self._extend_graph_hybrid_supported():
+            return None
+        rows_per_seat = self.num_steps + 1
+        # Row buckets: a fused fast round always holds seats x (K+1) rows, so
+        # bucket exactly on those multiples. Rows are capped at the decode
+        # config's max bs: any round able to run its branch phase (seats x
+        # (K+1) x f_live rows through the decode graphs) fits it, and the cap
+        # bounds the private full-width logits buffer (max_rows x W x vocab).
+        row_buckets = sorted(
+            {
+                seats * rows_per_seat
+                for seats in graph_config.decode.bs
+                if seats * rows_per_seat <= max(graph_config.decode.bs)
+            }
+        )
+        if not row_buckets:
+            logger.info(
+                "decoupled fused-extend graph off: no seats x (K+1) row bucket "
+                "fits the decode capture list"
+            )
+            return None
+        facade = _ExtendGraphRunnerFacade(
+            model_runner=model_runner,
+            server_args=self._extend_graph_server_args(row_buckets=row_buckets),
+            graph_shared_output=GraphSharedOutput(
+                device=torch.device(model_runner.device),
+                max_rows=max(row_buckets) * self._extend_graph_width,
+            ),
+        )
+        backend = self._build_extend_graph_backend(runner_facade=facade)
+        self._extend_graph_backend = backend
+        shim = _DraftExtendWorkerShim(
+            draft_runner=facade,
+            draft_extend_attn_backend=backend,
+            num_steps=self.num_steps,
+            num_draft_tokens=self._extend_graph_width,
+        )
+        runner = EAGLEDraftExtendCudaGraphRunner(
+            shim,
+            draft_extend_attn_backend=backend,
+            speculative_num_steps=self.num_steps,
+        )
+        self._extend_graph_capture_rows = frozenset(runner.capture_bs)
+        self._extend_graph_max_rows = runner.max_bs
+        logger.info(
+            "decoupled fused-extend graph captured: width=%d row_buckets=%s",
+            self._extend_graph_width,
+            sorted(self._extend_graph_capture_rows),
+        )
+        return runner
+
+    def _extend_graph_hybrid_supported(self) -> bool:
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        main_backend = self.model_runner.attn_backend
+        if not (
+            isinstance(main_backend, HybridLinearAttnBackend)
+            and isinstance(main_backend.linear_attn_backend, GDNAttnBackend)
+        ):
+            # Only the GDN sidecar implements the true-length
+            # DRAFT_EXTEND_V2 plane (see GDNAttnBackend); other linear
+            # sidecars would silently scan the pads.
+            logger.info(
+                "decoupled fused-extend graph off: hybrid drafter without a "
+                "GDN linear plane (%s)",
+                type(main_backend).__name__,
+            )
+            return False
+        if self.model_runner.server_args.enable_page_major_kv_layout:
+            # The v2 GDN path runs the conv / recurrent kernels directly on
+            # the pool tensors; only the eager gather/scatter path handles
+            # the page-major envelope's strided state layout.
+            logger.info("decoupled fused-extend graph off: page-major mamba layout")
+            return False
+        return True
+
+    def _extend_graph_server_args(self, *, row_buckets: list[int]):
+        """Patched ServerArgs copy for the dedicated draft-extend graph stack.
+
+        The drafter role hook nulls ``speculative_num_draft_tokens`` (a
+        spec-shaped ModelRunner would corrupt the engine's 1-token decode
+        graphs, and on hybrid models the field sizes gigantic verify state
+        buffers), but the draft-extend runner and every attention backend it
+        constructs derive their fixed per-request width from exactly that
+        field -- restore it to W on the copy only. The copy also swaps the
+        decode capture buckets for the fused-ROW buckets, which is what
+        get_batch_sizes_to_capture reads for this runner.
+        """
+        args = copy.copy(self.model_runner.server_args)
+        # The shallow copy shares the provenance lists with the original;
+        # rebind fresh ones so the view's override cannot pollute the real
+        # args' audit log.
+        object.__setattr__(args, "_resolved_overrides", [])
+        object.__setattr__(args, "_runtime_mutations", [])
+        graph_config = copy.deepcopy(args.cuda_graph_config)
+        graph_config.decode.bs = list(row_buckets)
+        args.override(
+            "decoupled-extend-graph",
+            speculative_num_draft_tokens=self._extend_graph_width,
+            # The runner reads topk from server_args, not the worker shim; the
+            # role validator pins it to 1 on real drafter servers, but harness
+            # contexts (the round microbench) build ServerArgs without the
+            # decoupled hook and leave it None.
+            speculative_eagle_topk=1,
+            cuda_graph_config=graph_config,
+        )
+        return args
+
+    def _build_extend_graph_backend(self, *, runner_facade):
+        """DEDICATED attention backend for the fused-extend graphs. The
+        engine's main backend must never be reused here: the runner calls
+        init_cuda_graph_state on it, which re-allocates the buffers the
+        drafter's decode graphs already captured by pointer."""
+        from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
+        full_attn_backend = DraftBackendFactory(
+            runner_facade.server_args,
+            runner_facade,
+            1,  # topk: decoupled spec pins chain drafting
+            self.num_steps,
+        ).create_draft_extend_backend()
+        if not self._hybrid:
+            return full_attn_backend
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        # A hybrid drafter dispatches EVERY layer through the ForwardContext
+        # backend, so the dedicated instance must be a full wrapper. The
+        # factory's hybrid draft-extend entry returns only the full-attn
+        # plane (MTP draft models have no linear layers); the GDN plane is a
+        # fresh sidecar carrying its own DRAFT_EXTEND_V2 metadata buffers.
+        gdn_sidecar = GDNAttnBackend(runner_facade)
+        # Junk state slot every pad segment scans through (never skipped --
+        # a skipped segment's output stays uninitialized and NaN-poisons the
+        # row's KV page; see the sidecar field comment). Engine-owned arena
+        # slot, held for the engine's lifetime; translated once here -- the
+        # engine already rejects the pool variants with unstable translation
+        # (extra-buffer, replayssm) at construction.
+        pool = self.model_runner.req_to_token_pool
+        pad_state_slot = self._mamba_arena.take(1)
+        pad_state_phys = pool.translate_mamba_indices(pad_state_slot)
+        # Zero it like open() zeroes seat slots: the gating kernel loads the
+        # initial state UNCONDITIONALLY from the slot index (only the poison
+        # id means "cold"), and a fresh allocator slot is uninitialized
+        # memory -- NaN there and every pad scan starts from NaN.
+        pool.mamba_pool.clear_slots(pad_state_phys)
+        gdn_sidecar.draft_extend_v2_pad_state_slot = int(pad_state_phys.item())
+        return HybridLinearAttnBackend(
+            full_attn_backend,
+            gdn_sidecar,
+            self.model_runner.attn_backend.full_attn_layers,
         )
 
     # ------------------------------------------------------------------ #
@@ -957,6 +1300,7 @@ class EnumDraftEngine:
             for _ in range(c)
         ]
         br_j = [j for c in range(num_cases) for _ in range(f_live) for j in range(c)]
+        br_c = [c for c in range(num_cases) for _ in range(f_live) for _ in range(c)]
         case_of_row = [c for c in range(num_cases) for _ in range(f_live)]
         variant = _FanoutVariant(
             sel_rows_pool=sel_rows_pool,
@@ -966,6 +1310,7 @@ class EnumDraftEngine:
             br_r_pool=torch.tensor(br_r_pool, dtype=torch.int64, device=self.device),
             br_r_sel=torch.tensor(br_r_sel, dtype=torch.int64, device=self.device),
             br_j=torch.tensor(br_j, dtype=torch.int64, device=self.device),
+            br_case=torch.tensor(br_c, dtype=torch.int64, device=self.device),
             comb_j=torch.tensor(
                 self._tri_j + br_j, dtype=torch.int64, device=self.device
             ),
@@ -1017,6 +1362,12 @@ class EnumDraftEngine:
         delta_lens = [
             len(state.committed_tokens) - base_lens[i] for i, state in enumerate(states)
         ]
+        # Graph-vs-eager is decided HERE, before any carrier state is
+        # written: the two paths bind different page tables / write slots and
+        # must never mix within a round.
+        graph_round = self._stage_extend_graph_round(
+            bs=bs, delta_lens=delta_lens, scratch_slots=scratch_slots
+        )
         advance_batch, advance_slots = self._extend_batch(
             token_lists=[state.committed_tokens for state in states],
             prefix_slots=[state.committed_slots for state in states],
@@ -1048,6 +1399,7 @@ class EnumDraftEngine:
             variant=variant,
             f_live=f_live,
             scratch_slots=scratch_slots,
+            graph_round=graph_round,
         )
         if self._paged:
             # Seed the glue rows' private heads before the forward reads them.
@@ -1072,6 +1424,13 @@ class EnumDraftEngine:
                 ),
                 dst_slots=torch.cat([carrier.glue_mamba_slots for carrier in carriers]),
             )
+            if envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
+                self._log_mamba_state_nan(
+                    tag="post-fork",
+                    slots=torch.cat(
+                        [states[0].mamba_slot, carriers[0].glue_mamba_slots]
+                    ),
+                )
         if self._enable_fused_extend:
             # -- Fused extend: seat + glue rows in ONE forward. The glue chain
             # tokens are the matched commit's winning unit -- KNOWN values,
@@ -1087,7 +1446,15 @@ class EnumDraftEngine:
                 seat_delta_slots=advance_slots,
                 base_lens=base_lens,
                 delta_lens=delta_lens,
+                graph_round=graph_round,
             )
+            if self._hybrid and envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
+                self._log_mamba_state_nan(
+                    tag="post-fused",
+                    slots=torch.cat(
+                        [states[0].mamba_slot, carriers[0].glue_mamba_slots]
+                    ),
+                )
             fused_view = fused_logits.view(bs, num_steps + 1, -1)
             # Consume the static logits buffer (mask + topk) before the first
             # branch replay overwrites it. Node a's dead token is c_{a+1}, so
@@ -1176,6 +1543,7 @@ class EnumDraftEngine:
         variant: _FanoutVariant,
         f_live: int,
         scratch_slots: list[torch.Tensor],
+        graph_round: Optional[_ExtendGraphRound],
     ) -> Optional[torch.Tensor]:
         """Broadcast the committed delta into every carrier pool row, then
         scatter freshly allocated backbone slots into the glue triangle +
@@ -1183,11 +1551,26 @@ class EnumDraftEngine:
 
         page_size > 1 has no shared backbone slots to scatter (every row owns
         private copies) and dispatches to the private-page rebind, returning
-        None.
+        None. Graph rounds at page_size == 1 likewise keep no shared backbone
+        slots (every fused row writes its own W-slot window) and dispatch to
+        the graph rebind, returning None.
         """
         if self._paged:
             self._sync_carrier_rows_paged(
-                states=states, carriers=carriers, base_lens=base_lens
+                states=states,
+                carriers=carriers,
+                base_lens=base_lens,
+                bind_graph_width=graph_round is not None,
+            )
+            return None
+        if graph_round is not None:
+            self._sync_carrier_rows_graph(
+                states=states,
+                carriers=carriers,
+                base_lens=base_lens,
+                variant=variant,
+                f_live=f_live,
+                w_slots=graph_round.w_slots,
             )
             return None
         num_steps = self.num_steps
@@ -1223,6 +1606,7 @@ class EnumDraftEngine:
         states: list[_DraftReqState],
         carriers: list[_SeatCarrier],
         base_lens: list[int],
+        bind_graph_width: bool,
     ) -> None:
         """Page-aware carrier-row sync (see the module docstring's rule):
         broadcast only the seat's FULL pages (read-only by construction --
@@ -1239,6 +1623,13 @@ class EnumDraftEngine:
         rewritten, so no stale mapping from an earlier round -- including
         pages the seat has since freed or re-anchored -- can ever be
         dereferenced.
+
+        A graph round pads every fused row's query window to the static W and
+        runs it under a uniform post-write seq_len of base + W, so paged
+        backends resolve the pad positions through the page table too: the
+        binding then covers [anchor, base + W) = boundary tail + W entries,
+        which the carrier arena pages fit by construction
+        (span_max = P - 1 + W).
         """
         pool = self.model_runner.req_to_token_pool
         for i, (state, carrier) in enumerate(zip(states, carriers)):
@@ -1249,9 +1640,66 @@ class EnumDraftEngine:
                 synced:anchor
             ].to(torch.int32)
             carrier.synced_len = anchor
-            width = new_len - anchor + self.num_steps
+            if bind_graph_width:
+                width = (base_lens[i] - anchor) + self._extend_graph_width
+            else:
+                width = new_len - anchor + self.num_steps
             pool.req_to_token[carrier.all_rows, anchor : anchor + width] = (
                 carrier.all_private_slots[:, :width].to(torch.int32)
+            )
+        self.profiler.mark("carrier_sync")
+
+    def _sync_carrier_rows_graph(
+        self,
+        *,
+        states: list[_DraftReqState],
+        carriers: list[_SeatCarrier],
+        base_lens: list[int],
+        variant: _FanoutVariant,
+        f_live: int,
+        w_slots: torch.Tensor,
+    ) -> None:
+        """page_size == 1 carrier sync for a fused-extend GRAPH round: every
+        fused row writes its FULL padded W-token window into its OWN slots
+        (``w_slots`` plane), so no two rows share a write target -- the eager
+        duplicate-write trick is off because pad tokens differ across rows.
+        Reads rewire accordingly: a glue row's page table binds [base,
+        base + W) to its own plane, and branch case c's chain-prefix entries
+        point into glue row c-1's copies (page1 slot sharing -- the COW-free
+        analogue of the paged branch-head copy).
+
+        ``synced_len`` deliberately stays at the PRE-advance length: the glue
+        rows' [base, base + W) entries now reference this round's transient
+        w_slots (freed at round end), so the next round's shared broadcast
+        must re-cover [base, ...) with committed slots. Entries past the next
+        round's working set may keep pointing at freed ids -- consistent with
+        the freshness discipline, nothing ever reads past the bound region.
+        """
+        width = self._extend_graph_width
+        pool = self.model_runner.req_to_token_pool
+        br_plane = variant.br_case * width + variant.br_j
+        for i, (state, carrier) in enumerate(zip(states, carriers)):
+            new_len = state.committed_slots.numel()
+            base = base_lens[i]
+            delta = new_len - base
+            synced = min(carrier.synced_len, base)
+            pool.req_to_token[carrier.all_rows, synced:new_len] = state.committed_slots[
+                synced:new_len
+            ].to(torch.int32)
+            carrier.synced_len = base
+            # Glue rows own their whole window (delta re-writes + chain + pads).
+            pool.req_to_token[carrier.glue_rows, base : base + width] = w_slots[
+                i, 1:
+            ].to(torch.int32)
+            # Branch case prefixes source the chain from the glue-row copies:
+            # case c's entry j holds chain token c_{j+1}, which glue row c-1
+            # (= w_slots plane c) wrote at its column delta + j.
+            branch_rows = carrier.comb_rows_for(
+                f_live=f_live, tri_g=self._tri_g, br_r_pool=variant.br_r_pool
+            )[self._tri_g.numel() :]
+            branch_vals = w_slots[i].reshape(-1)[br_plane + delta]
+            pool.req_to_token[branch_rows, variant.br_j + new_len] = branch_vals.to(
+                torch.int32
             )
         self.profiler.mark("carrier_sync")
 
@@ -1283,6 +1731,7 @@ class EnumDraftEngine:
         seat_delta_slots: torch.Tensor,  # flat [sum(delta_lens)], device
         base_lens: list[int],
         delta_lens: list[int],
+        graph_round: Optional[_ExtendGraphRound],
     ) -> torch.Tensor:
         """Advance + glue as ONE batched extend (the fast round's fusion).
 
@@ -1306,6 +1755,27 @@ class EnumDraftEngine:
         glue row targets its own private slots, so the extend layout is
         unchanged but no two rows ever write through a shared page.
         """
+        graph_logits: Optional[torch.Tensor] = None
+        if graph_round is not None:
+            graph_logits = self._fused_extend_graph_forward(
+                carriers=carriers,
+                chains=chains,
+                seat_reqs=seat_reqs,
+                seat_rows=seat_rows,
+                seat_input_ids=seat_input_ids,
+                seat_delta_slots=seat_delta_slots,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
+                graph_round=graph_round,
+            )
+            if not envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_DIFF.get():
+                return graph_logits
+            # Diff probe: fall through to the eager fused body on the SAME
+            # staged inputs and report per-node divergence. Safe to double
+            # -run: both paths write identical values to every persistent
+            # location (KV real slots, GDN seat/glue states), so the second
+            # forward is a benign same-value rewrite; the caller consumes
+            # the EAGER logits (correct-by-construction reference).
         num_steps = self.num_steps
         bs = len(carriers)
         rows_per_seat = num_steps + 1
@@ -1386,7 +1856,36 @@ class EnumDraftEngine:
         fused.seq_lens_sum = sum(seq_host)
         fused.orig_seq_lens = fused.seq_lens.to(torch.int32)
         self.profiler.mark("fused_mut")
-        return self._forward(fused, tag="fused_extend")
+        eager_logits = self._forward(fused, tag="fused_extend")
+        if graph_logits is not None:
+            self._log_extend_graph_diff(
+                graph_logits=graph_logits,
+                eager_logits=eager_logits,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
+            )
+        return eager_logits
+
+    def _log_extend_graph_diff(
+        self,
+        *,
+        graph_logits: torch.Tensor,
+        eager_logits: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+    ) -> None:
+        """Diff-probe report (SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_DIFF): one
+        line per fused round with each node row's max-abs logit divergence
+        and top-1 agreement. Host syncs are fine here -- diagnosis only."""
+        diff = (graph_logits.float() - eager_logits.float()).abs().amax(dim=-1)
+        top_same = graph_logits.argmax(dim=-1) == eager_logits.argmax(dim=-1)
+        logger.info(
+            "extend-graph diff: base=%s delta=%s max_abs=%s top1_same=%s",
+            base_lens,
+            delta_lens,
+            [round(v, 4) for v in diff.tolist()],
+            top_same.tolist(),
+        )
 
     def _fused_out_cache_loc_paged(
         self,
@@ -1417,6 +1916,386 @@ class EnumDraftEngine:
                 )
             delta_offset += delta_len
         return torch.cat(pieces)
+
+    # ------------------------------------------------------------------ #
+    # Fused-extend CUDA graph: per-round path
+    # ------------------------------------------------------------------ #
+
+    def _stage_extend_graph_round(
+        self, *, bs: int, delta_lens: list[int], scratch_slots: list[torch.Tensor]
+    ) -> Optional[_ExtendGraphRound]:
+        """Decide graph vs eager for this fast round and stage the pad slots.
+
+        Every check is host-static so the choice is final before any carrier
+        state is written. Per-round fallback triggers: no runner (kill switch
+        or construction failure), a delta beyond the padded window
+        (defensive; catch-up merges miss the glue fast path anyway), a row
+        count over the captured buckets, or KV-pool exhaustion on the pad
+        staging (the eager path needs fewer slots).
+        """
+        if self._extend_graph_runner is None:
+            return None
+        rows = bs * (self.num_steps + 1)
+        if rows > self._extend_graph_max_rows:
+            return None
+        if (
+            self._extend_graph_disable_padding
+            and rows not in self._extend_graph_capture_rows
+        ):
+            return None
+        if any(delta_len > self.num_steps + 1 for delta_len in delta_lens):
+            return None
+        if self._paged:
+            pad_slots = self.model_runner.token_to_kv_pool_allocator.alloc(
+                bs * self._extend_graph_pad_span
+            )
+            if pad_slots is None:
+                return None
+            scratch_slots.append(pad_slots)
+            return _ExtendGraphRound(
+                w_slots=None,
+                seat_pad_flats=pad_slots.view(bs, self._extend_graph_pad_span),
+            )
+        w_slots = self.model_runner.token_to_kv_pool_allocator.alloc(
+            rows * self._extend_graph_width
+        )
+        if w_slots is None:
+            return None
+        scratch_slots.append(w_slots)
+        return _ExtendGraphRound(
+            w_slots=w_slots.view(bs, self.num_steps + 1, self._extend_graph_width),
+            seat_pad_flats=None,
+        )
+
+    def _extend_graph_gather_pattern(self, delta_len: int) -> list[int]:
+        """Graph twin of _fused_gather_pattern over the same [delta | chain]
+        source layout: every row padded to W by repeating its LAST REAL index
+        -- a valid vocab token, so pad embeddings stay in range; their K/V
+        and logits are computed and never read."""
+        pattern = self._extend_graph_gather_patterns.get(delta_len)
+        if pattern is None:
+            width = self._extend_graph_width
+            delta_part = list(range(delta_len))
+            pattern = delta_part + [delta_len - 1] * (width - delta_len)
+            for g in range(self.num_steps):
+                row = delta_part + list(range(delta_len, delta_len + g + 1))
+                pattern = pattern + row + [row[-1]] * (width - len(row))
+            self._extend_graph_gather_patterns[delta_len] = pattern
+        return pattern
+
+    def _extend_graph_consts_for(self, rows: int) -> tuple[torch.Tensor, list[int]]:
+        """(device int32 [rows] filled with W, host [W] * rows) -- the
+        uniform-width constants the full-attn plane's spec_info carries;
+        cached per row count (row counts recur across fast rounds)."""
+        consts = self._extend_graph_const_cache.get(rows)
+        if consts is None:
+            consts = (
+                torch.full(
+                    (rows,),
+                    self._extend_graph_width,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                [self._extend_graph_width] * rows,
+            )
+            self._extend_graph_const_cache[rows] = consts
+        return consts
+
+    def _extend_graph_out_cache_loc(
+        self,
+        *,
+        carriers: list[_SeatCarrier],
+        seat_delta_slots: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+        graph_round: _ExtendGraphRound,
+    ) -> torch.Tensor:
+        """W write slots per fused row (row order [seat, glue 0..K-1] per
+        seat): the seat row keeps its real allocator delta slots and pads
+        into engine-owned junk; glue rows write their WHOLE window into
+        private slots (page1: this round's w_slots plane; page>1: the
+        carrier's arena pages from the boundary-tail offset). Pad writes are
+        junk by construction -- they land in slots only pad queries can ever
+        resolve to."""
+        width = self._extend_graph_width
+        pieces: list[torch.Tensor] = []
+        delta_offset = 0
+        for i, carrier in enumerate(carriers):
+            delta_len = delta_lens[i]
+            pieces.append(seat_delta_slots[delta_offset : delta_offset + delta_len])
+            if self._paged:
+                new_len = base_lens[i] + delta_len
+                pad_offset = new_len - self._page_floor(new_len)
+                pieces.append(
+                    graph_round.seat_pad_flats[
+                        i, pad_offset : pad_offset + width - delta_len
+                    ]
+                )
+                tail = base_lens[i] - self._page_floor(base_lens[i])
+                for g in range(self.num_steps):
+                    pieces.append(carrier.glue_private_slots[g, tail : tail + width])
+            else:
+                pieces.append(graph_round.w_slots[i, 0, delta_len:width])
+                pieces.append(graph_round.w_slots[i, 1:].reshape(-1))
+            delta_offset += delta_len
+        return torch.cat(pieces)
+
+    def _extend_graph_bind_seat_pads(
+        self,
+        *,
+        seat_rows: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+        graph_round: _ExtendGraphRound,
+    ) -> None:
+        """Map the seat row's pad positions [base + delta, base + W): the
+        uniform post-write seq_len (base + W) makes paged backends resolve
+        every window position through the page table, so pads must point at
+        owned junk -- never left stale (the no-stale-mapping discipline) and
+        never routed into a live page. The paged column arithmetic keeps
+        in-page offset == logical offset, the invariant page tables are
+        derived from; the seat row itself is transient (freed with the
+        advance batch), so these entries die with the round."""
+        pool = self.model_runner.req_to_token_pool
+        width = self._extend_graph_width
+        for i in range(len(base_lens)):
+            new_len = base_lens[i] + delta_lens[i]
+            end = base_lens[i] + width
+            if self._paged:
+                pad_offset = new_len - self._page_floor(new_len)
+                pads = graph_round.seat_pad_flats[
+                    i, pad_offset : pad_offset + end - new_len
+                ]
+            else:
+                pads = graph_round.w_slots[i, 0, delta_lens[i] : width]
+            pool.req_to_token[seat_rows[i], new_len:end] = pads.to(torch.int32)
+
+    def _extend_graph_assemble_rows(
+        self,
+        *,
+        carriers: list[_SeatCarrier],
+        chains: list[torch.Tensor],
+        seat_reqs: list,
+        seat_rows: torch.Tensor,
+        seat_input_ids: torch.Tensor,
+        seat_delta_slots: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+        graph_round: _ExtendGraphRound,
+    ) -> tuple[ScheduleBatch, list[int], list[int]]:
+        """Bind the fused shell for a graph round (uniform W-token rows) and
+        return (shell, per-row true lengths, per-node flat logit offsets).
+
+        Same rows and row semantics as the eager fused extend -- per seat
+        [seat(delta), glue g(delta + g + 1)], prefix = pre-write committed
+        length -- only padded to the constant width and expressed in the
+        DRAFT_EXTEND_V2 prepare contract (pre-write ScheduleBatch seq_lens;
+        the caller bumps the ForwardBatch to post-write).
+        """
+        num_steps = self.num_steps
+        width = self._extend_graph_width
+        bs = len(carriers)
+        rows_per_seat = num_steps + 1
+        fused = self._glue_template
+        fused.reqs = [
+            req
+            for i, carrier in enumerate(carriers)
+            for req in [seat_reqs[i]] + carrier.glue_reqs
+        ]
+        # mrope models (Qwen3.5 family) index multimodal_inputs per row in
+        # ForwardBatch.init_new; rebind to the fused row count (text-only).
+        fused.multimodal_inputs = [None] * len(fused.reqs)
+        fused.req_pool_indices = torch.cat(
+            [
+                rows
+                for i, carrier in enumerate(carriers)
+                for rows in (seat_rows[i : i + 1], carrier.glue_rows)
+            ]
+        )
+        fused.extend_logprob_start_lens = [0] * (bs * rows_per_seat)
+        _, width_list = self._extend_graph_consts_for(bs * rows_per_seat)
+        fused.extend_lens = list(width_list)
+        fused.prefix_lens = [
+            base_lens[i] for i in range(bs) for _ in range(rows_per_seat)
+        ]
+        # Row contents: one padded gather over the [delta | chain] source per
+        # seat; the true row lengths (GDN plane) and the node-logit end
+        # offsets ride the same loop.
+        src_id_pieces: list[torch.Tensor] = []
+        gather_rows: list[int] = []
+        true_lens_host: list[int] = []
+        node_offsets: list[int] = []
+        src_offset = 0
+        delta_offset = 0
+        for i in range(bs):
+            delta_len = delta_lens[i]
+            src_id_pieces.append(
+                seat_input_ids[delta_offset : delta_offset + delta_len]
+            )
+            src_id_pieces.append(chains[i])
+            gather_rows.extend(
+                src_offset + entry
+                for entry in self._extend_graph_gather_pattern(delta_len)
+            )
+            row_base = i * rows_per_seat
+            true_lens_host.append(delta_len)
+            node_offsets.append(row_base * width + delta_len - 1)
+            for g in range(num_steps):
+                true_lens_host.append(delta_len + g + 1)
+                node_offsets.append((row_base + 1 + g) * width + delta_len + g)
+            src_offset += delta_len + num_steps
+            delta_offset += delta_len
+        gather = torch.tensor(gather_rows, dtype=torch.int64, device=self.device)
+        fused.input_ids = torch.cat(src_id_pieces)[gather]
+        fused.out_cache_loc = self._extend_graph_out_cache_loc(
+            carriers=carriers,
+            seat_delta_slots=seat_delta_slots,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            graph_round=graph_round,
+        )
+        fused.extend_num_tokens = bs * rows_per_seat * width
+        self._extend_graph_bind_seat_pads(
+            seat_rows=seat_rows,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            graph_round=graph_round,
+        )
+        # DRAFT_EXTEND_V2 prepare contract: the ScheduleBatch view carries the
+        # PRE-write lengths; orig stays post-write like the eager shell.
+        seq_cpu = torch.tensor(fused.prefix_lens, dtype=torch.int64)
+        fused.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        fused.seq_lens_cpu = seq_cpu
+        fused.seq_lens_sum = sum(fused.prefix_lens)
+        fused.orig_seq_lens = (fused.seq_lens + width).to(torch.int32)
+        return fused, true_lens_host, node_offsets
+
+    def _fused_extend_graph_forward(
+        self,
+        *,
+        carriers: list[_SeatCarrier],
+        chains: list[torch.Tensor],
+        seat_reqs: list,
+        seat_rows: torch.Tensor,
+        seat_input_ids: torch.Tensor,
+        seat_delta_slots: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+        graph_round: _ExtendGraphRound,
+    ) -> torch.Tensor:
+        """The fused extend as ONE captured DRAFT_EXTEND_V2 graph replay.
+
+        A captured graph replays a CONSTANT per-row query width, so every
+        fused row is padded to W = 2K + 1 with repeats of its last real
+        token. The dual-plane length contract that makes the pads safe:
+
+        - FULL-ATTENTION plane: uniform W everywhere (extend_seq_lens == W,
+          seq_lens == base + W post-write, per-row KV prefix re-derived as
+          seq_lens - W == base). Pads are a SUFFIX of each row's window, so
+          causality already isolates them: no real query position ever
+          attends a pad position, per-position ops never mix positions, and
+          the node-logit gather below touches only real end positions. Pad
+          K/V writes land in row-owned junk slots
+          (_extend_graph_out_cache_loc), pad logits are garbage nobody reads.
+        - GDN (recurrent) plane: a pad folded into a row's slot state would
+          corrupt it permanently, so the linear plane receives the TRUE
+          per-row lengths through spec_info.gdn_true_extend_lens_tensor,
+          refreshed into a graph-static device cu_seqlens at every replay
+          prep -- the GDN kernels read their loop bounds from device tensors,
+          which is what lets variable true lengths replay inside one
+          fixed-shape graph (GDNAttnBackend._forward_draft_extend_v2).
+
+        Returns node logits [bs * (K+1), vocab] gathered from the full
+        bs * (K+1) * W replay logits at each row's last REAL position -- the
+        same contract as the eager fused forward's per-row last logits.
+        """
+        width = self._extend_graph_width
+        rows = len(carriers) * (self.num_steps + 1)
+        fused, true_lens_host, node_offsets = self._extend_graph_assemble_rows(
+            carriers=carriers,
+            chains=chains,
+            seat_reqs=seat_reqs,
+            seat_rows=seat_rows,
+            seat_input_ids=seat_input_ids,
+            seat_delta_slots=seat_delta_slots,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            graph_round=graph_round,
+        )
+        width_tensor, width_list = self._extend_graph_consts_for(rows)
+        spec_info = EagleDraftExtendInput(
+            hidden_states=None,  # STANDALONE: the enum drafter feeds token ids only
+            num_correct_drafts=width_tensor,
+            num_accept_tokens=width_tensor,
+            num_tokens_per_req=width,
+        )
+        # Ad-hoc spec_info attrs, preset before every use (read directly
+        # downstream, never defensively): the full-attn plane's uniform width
+        # and the GDN plane's true per-row scan lengths.
+        spec_info.extend_seq_lens_tensor = width_tensor
+        spec_info.extend_seq_lens_cpu = list(width_list)
+        if envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_FULLSCAN.get():
+            # Bisect probe: no pad half-rows at all -- every row scans its
+            # full W window on the GDN plane. States and guesses go WRONG
+            # (pads fold into row-end states); only for localizing NaN.
+            true_lens_host = [width] * rows
+        spec_info.gdn_true_extend_lens_tensor = torch.tensor(
+            true_lens_host, dtype=torch.int32
+        ).to(self.device, non_blocking=True)
+        self.profiler.mark("fused_graph_mut")
+        try:
+            fused.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+            fused.spec_info = spec_info
+            forward_batch = ForwardBatch.init_new(
+                fused, self.model_runner, return_hidden_states_before_norm=False
+            )
+        finally:
+            # The shell is shared with the eager fused / glue paths; restore
+            # its extend identity immediately (the ForwardBatch carries its
+            # own references).
+            fused.forward_mode = ForwardMode.EXTEND
+            fused.spec_info = None
+        # v2 prepare contract: the forward sees POST-write lengths (the
+        # extend writes W slots per row); mutation stays on the ForwardBatch.
+        forward_batch.seq_lens = forward_batch.seq_lens + width
+        forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + width
+        forward_batch.seq_lens_sum = fused.seq_lens_sum + rows * width
+        runner = self._extend_graph_runner
+        assert runner.can_run_graph(forward_batch), (
+            "fused-extend graph precheck passed but the runner refused the "
+            f"batch (rows={rows})"
+        )
+        if forward_batch.mrope_positions is not None:
+            # The runner's replay feeds positions but not the mrope plane
+            # (EAGLE draft models are not mrope models); feed the captured
+            # buffer here so Qwen3.5-family drafters read real rotary
+            # positions. Text-only rows: mrope == positions replicated x3.
+            runner.buffers.mrope_positions[
+                :, : forward_batch.mrope_positions.shape[1]
+            ].copy_(forward_batch.mrope_positions)
+        logits_output = runner.execute(forward_batch)
+        self.profiler.mark("fused_graph_fwd")
+        if envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
+            # Observation-only probe (no second forward, so no recurrent
+            # -state double-advance): per row, which of the W window
+            # positions carry NaN logits. Pad positions are expected
+            # garbage; NaN at a REAL position (< true_len) is the defect.
+            window = logits_output.next_token_logits[: rows * width].view(
+                rows, width, -1
+            )
+            nan_mask = window.isnan().any(dim=-1).tolist()
+            logger.info(
+                "extend-graph nancheck: base=%s delta=%s true=%s nan_rows=%s",
+                base_lens,
+                delta_lens,
+                true_lens_host,
+                ["".join("N" if p else "." for p in row) for row in nan_mask],
+            )
+            self._log_extend_graph_attn_metadata(rows=rows)
+        node_gather = torch.tensor(node_offsets, dtype=torch.int64, device=self.device)
+        # The gather copies out of the runner's private static logits buffer
+        # before any later replay could overwrite it.
+        return logits_output.next_token_logits[node_gather]
 
     def _glue_forward(
         self,
@@ -1561,11 +2440,12 @@ class EnumDraftEngine:
         """Shared-prefix cascade inputs for this round's branch chain, or None
         below the L2 threshold (where per-row re-reads are effectively free
         and the two-call split only adds overhead)."""
-        if self._paged:
+        if self._paged or backbone_slots is None:
             # The cascade splits each row into shared-backbone-slot prefix +
             # token-granular private tail for the fa3 cascade kernel; at
-            # page_size > 1 there ARE no shared backbone slots (each row owns
-            # private copies), so the dedup the cascade exists for is gone.
+            # page_size > 1 -- and on page1 GRAPH rounds, where every fused
+            # row owns private window copies -- there ARE no shared backbone
+            # slots, so the dedup the cascade exists for is gone.
             return None
         min_prefix = self._cascade_min_prefix_len
         lens = [state.committed_slots.numel() for state in states]
@@ -2455,6 +3335,47 @@ class EnumDraftEngine:
         if not self._hybrid:
             return None
         return torch.cat([state.mamba_slot for state in states])
+
+    def _log_extend_graph_attn_metadata(self, *, rows: int) -> None:
+        """NANCHECK companion: dump the full-attn plane's DRAFT_EXTEND_V2
+        replay metadata views (for micro-vs-e2e diffing). trtllm-only shape;
+        other backends just skip. Debug instrumentation only."""
+        backend = self._extend_graph_backend
+        if backend is None:
+            return
+        full = backend.full_attn_backend if self._hybrid else backend
+        # Debug-only duck check: only the trtllm backend keeps this dict.
+        meta_by_bs = getattr(full, "draft_extend_metadata", None)
+        if not isinstance(meta_by_bs, dict) or rows not in meta_by_bs:
+            return
+        meta = meta_by_bs[rows]
+        logger.info(
+            "extend-graph attn-meta: cache_seqlens=%s cu_q=%s cu_k=%s max_q=%s "
+            "pt_head=%s",
+            meta.cache_seqlens_int32[:rows].tolist(),
+            meta.cu_seqlens_q[: rows + 1].tolist(),
+            meta.cu_seqlens_k[: rows + 1].tolist(),
+            meta.max_seq_len_q,
+            meta.page_table[:rows, :4].tolist(),
+        )
+
+    def _log_mamba_state_nan(self, *, tag: str, slots: torch.Tensor) -> None:
+        """NANCHECK probe: report NaN presence in the given (virtual) mamba
+        slots' conv + temporal state, per slot. Debug only (host syncs)."""
+        pool = self.model_runner.req_to_token_pool
+        phys = pool.translate_mamba_indices(slots.reshape(-1).contiguous())
+        st = pool.mamba_pool.mamba_cache
+        conv_nan = [
+            [bool(conv[:, p].isnan().any()) for conv in st.conv] for p in phys.tolist()
+        ]
+        temporal_nan = [bool(st.temporal[:, p].isnan().any()) for p in phys.tolist()]
+        logger.info(
+            "mamba-state nancheck[%s]: slots=%s conv_nan=%s temporal_nan=%s",
+            tag,
+            phys.tolist(),
+            conv_nan,
+            temporal_nan,
+        )
 
     def _fork_mamba_states(
         self, *, src_slots: torch.Tensor, dst_slots: torch.Tensor
