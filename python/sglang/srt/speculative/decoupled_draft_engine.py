@@ -12,9 +12,32 @@ it owns); every round is a re-extension from that prefix:
    bonus guesses g_{a, 0..F-1} for accept case ``a`` (c_{a+1} == g_{a,0}).
 3. **branches** (one batch of (K+1) x F scratch rows, extend + K-1 decodes):
    chain(a, f) = K tokens drafted after prefix + c_1..c_a + g_{a,f}. Nested
-   prefixes are shared by slot id (page_size == 1, read-only), never copied.
+   prefixes are shared read-only, never recomputed.
 4. **pack**: unit(a, f) = [g_{a,f}, chain_1..chain_K]; the block's stamp is
    the total committed length the tree grew from.
+
+Paged KV (page_size P > 1) changes only WHERE scratch KV lives, under one
+rule: rows share only the seat's FULL pages; everything from the round's
+page-floor anchor onward is per-row PRIVATE, in engine-owned arena pages.
+Sharing a partial page is unsound at P > 1 because a page-table entry maps P
+consecutive logical positions to ONE physical page: the span past the
+committed prefix mixes positions where all rows agree (delta, backbone c's)
+with positions where they diverge (guesses, chains), and rows writing
+different tokens through a shared page entry clobber each other. Each private
+region is anchored at a page floor, so a private slot's in-page offset equals
+its logical position's offset -- the invariant every paged attention backend
+derives its page table from, and what lets ``alloc_extend`` / ``alloc_decode``
+continue a private page in place. The head of a row's private region is
+seeded by a batched K/V copy (COW): glue rows take the seat's boundary tail
+before their extend, branch rows take boundary tail + delta + case backbone
+from the seat / their glue row after it -- rows x O(P) tokens, two batched
+copies per fast round, trivially cheap next to a forward. Frees are
+page-granular: committed truncation (prerun rollback, close) releases only
+pages fully past the cut, and the round-end scratch free excludes arena
+pages (the allocator frees whole pages, and extend/decode continuation slots
+land inside pages the arena still owns). At P == 1 the page floor equals the
+committed length, boundary tails are always empty, and every path
+degenerates to the original full slot-id sharing with zero copies.
 
 All scratch state (rows + KV slots written for backbone / branch tokens) is
 freed at the end of the round: a wrong branch is never selected, and the next
@@ -52,7 +75,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MHATokenToKVPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.decoupled_spec_io import DraftReqKey
@@ -174,6 +201,25 @@ class _CascadeMetadata(msgspec.Struct):
     tail_lens: torch.Tensor  # [rows]
 
 
+class _SlowRoundPages(msgspec.Struct):
+    """Private-page staging for one slow subround at page_size > 1 (mirrors
+    the mamba-slot staging): one transient page per backbone row (its
+    boundary-tail COW head; extend/decode continuations grow it in place),
+    and the carrier-lifetime pages for the glue/branch rows, taken up front
+    so the branch extend can target them and the carrier build can adopt
+    them (removed from the round's scratch list on donation -- the
+    ``scratch_batches.remove`` idiom -- so an aborted subround can't leak
+    them). ``*_flats`` are the pages expanded to flat slot ids (column q =
+    in-page offset q % P; see ``_page_flat_slots``)."""
+
+    backbone_pages: torch.Tensor  # [bs, 1]
+    backbone_flats: torch.Tensor  # [bs, P]
+    glue_pages: torch.Tensor  # [bs * K, pages_per_row]
+    glue_flats: torch.Tensor  # [bs * K, pages_per_row * P]
+    branch_pages: torch.Tensor  # [bs * (K+1) * F, pages_per_row]
+    branch_flats: torch.Tensor  # [bs * (K+1) * F, pages_per_row * P]
+
+
 class _FanoutVariant(msgspec.Struct):
     """Row selections + scatter templates for one effective fanout f <= F.
 
@@ -215,6 +261,13 @@ class _SeatCarrier:
     mapping (delta slots, then backbone slots) and is rewritten every round.
     Seats are independent so any hit subset of a batch can run the fast path
     (per-seat mixing); rows live until the seat closes.
+
+    At page_size > 1 each row additionally owns arena pages for its whole
+    lifetime (``*_private_slots`` are their flat slot ids): ``synced_len`` is
+    then always page-aligned (only FULL seat pages are shared), and the
+    private region past the round's anchor is re-bound to these pages every
+    round -- the fixed page ownership is what lets rows write divergent
+    tokens without touching any shared page.
     """
 
     def __init__(
@@ -227,6 +280,9 @@ class _SeatCarrier:
         synced_len: int,
         glue_mamba_slots: Optional[torch.Tensor] = None,  # [K] device
         branch_mamba_slots: Optional[torch.Tensor] = None,  # [(K+1)*F] device
+        glue_private_slots: Optional[torch.Tensor] = None,  # [K, W] device
+        branch_private_slots: Optional[torch.Tensor] = None,  # [(K+1)*F, W]
+        private_kv_pages: Optional[torch.Tensor] = None,  # [K+(K+1)*F, ppr]
     ) -> None:
         self.glue_rows = glue_rows
         self.branch_rows = branch_rows
@@ -243,6 +299,18 @@ class _SeatCarrier:
         # g's slot holds node-(g+1) state after each glue forward.
         self.glue_mamba_slots = glue_mamba_slots
         self.branch_mamba_slots = branch_mamba_slots
+        # page_size > 1 only (None otherwise): engine-arena pages owned by the
+        # rows for the carrier's lifetime, pre-expanded to flat slot ids. The
+        # concatenated view is ordered glue-then-branch to match ``all_rows``
+        # (the per-round private page-table write indexes them in lockstep).
+        self.glue_private_slots = glue_private_slots
+        self.branch_private_slots = branch_private_slots
+        self.private_kv_pages = private_kv_pages
+        self.all_private_slots = (
+            torch.cat([glue_private_slots, branch_private_slots])
+            if glue_private_slots is not None
+            else None
+        )
         # All carrier rows sharing the committed prefix (delta broadcast).
         self.all_rows = torch.cat([glue_rows, branch_rows])
         # Combined scatter rows per effective fanout (values/cols come from
@@ -305,6 +373,62 @@ class _MambaStateArena:
         )
 
 
+class _KVPageArena:
+    """Engine-owned KV page free-list in front of the paged allocator
+    (page_size > 1 only) -- the mamba arena's twin for physical KV pages.
+
+    Carrier rows need PRIVATE pages whose slots the engine binds manually
+    (fast-path page tables and out_cache_loc are engine-built), and the
+    round-end scratch free is page-granular: ``PagedTokenToKVPoolAllocator
+    .free`` releases the WHOLE page containing any freed slot, while extend /
+    decode continuation slots land INSIDE pages this arena still owns.
+    ``owned_pages`` (grow-only, tiny) is the membership set the scratch free
+    filters against so an arena page is never handed back to the global pool
+    behind the arena's back. Ids are physical page ids (slot // page_size);
+    take/give_back never sync.
+    """
+
+    def __init__(self, *, allocator, page_size: int, sizing_hint: str) -> None:
+        self._allocator = allocator
+        self._page_size = page_size
+        self._sizing_hint = sizing_hint
+        self._free_pages: Optional[torch.Tensor] = None
+        self.owned_pages = torch.empty((0,), dtype=torch.int64, device=allocator.device)
+
+    def take(self, num_pages: int) -> torch.Tensor:
+        free = self._free_pages
+        num_free = 0 if free is None else free.numel()
+        if num_pages == 0:
+            # Degenerate widths (e.g. K == 0) must not dereference an empty
+            # free list.
+            return torch.empty((0,), dtype=torch.int64, device=self._allocator.device)
+        if num_free < num_pages:
+            grow = num_pages - num_free
+            slots = self._allocator.alloc(grow * self._page_size)
+            if slots is None:
+                raise RuntimeError(
+                    "drafter KV page arena exhausted "
+                    f"(want {grow} more pages, "
+                    f"{self._allocator.available_size()} tokens free in the "
+                    f"pool allocator); {self._sizing_hint}"
+                )
+            # alloc is page-aligned: row k of the [grow, P] view is one page.
+            grown = slots.view(grow, self._page_size)[:, 0] // self._page_size
+            self.owned_pages = torch.cat([self.owned_pages, grown])
+            free = grown if free is None else torch.cat([free, grown])
+        taken = free[:num_pages]
+        self._free_pages = free[num_pages:]
+        return taken
+
+    def give_back(self, pages: torch.Tensor) -> None:
+        if pages.numel() == 0:
+            return
+        pages = pages.reshape(-1)
+        self._free_pages = (
+            pages if self._free_pages is None else torch.cat([self._free_pages, pages])
+        )
+
+
 class EnumDraftEngine:
     """Per-request committed KV + one enumeration tree per commit round."""
 
@@ -362,6 +486,38 @@ class EnumDraftEngine:
                     f"seats x {slots_per_seat} (1 seat + K glue + (K+1)*F "
                     f"branch + 2 transient; K={self.num_steps}, "
                     f"F={self.fanout})"
+                ),
+            )
+        # Paged-KV geometry (init-static; see the module docstring's sharing
+        # rule). All paged behavior gates on _paged -- never on a backend
+        # name -- and P == 1 keeps every original path bit-identical.
+        self._page_size = int(model_runner.token_to_kv_pool_allocator.page_size)
+        self._paged = self._page_size > 1
+        self._cow_kv_pool: Optional[MHATokenToKVPool] = None
+        self._kv_page_arena: Optional[_KVPageArena] = None
+        self._pages_per_carrier_row = 0
+        if self._paged:
+            self._cow_kv_pool = self._resolve_cow_kv_pool(model_runner=model_runner)
+            # Worst private span per carrier row: a boundary tail (< P) + a
+            # fast-round delta (<= K + 1: the deepest accept case, or a
+            # prerun's full bet) + the K backbone/chain positions the blanket
+            # page-table write binds to arena slots each round. Decode-step
+            # page crossings past this span take throwaway allocator pages,
+            # so the arena never needs to cover them.
+            span_max = (self._page_size - 1) + (self.num_steps + 1) + self.num_steps
+            self._pages_per_carrier_row = (
+                span_max + self._page_size - 1
+            ) // self._page_size
+            pages_per_seat = (
+                self.num_steps + (self.num_steps + 1) * self.fanout
+            ) * self._pages_per_carrier_row + 1
+            self._kv_page_arena = _KVPageArena(
+                allocator=model_runner.token_to_kv_pool_allocator,
+                page_size=self._page_size,
+                sizing_hint=(
+                    f"budget ~seats x {pages_per_seat} pages of KV headroom "
+                    f"for the engine page arena (K={self.num_steps}, "
+                    f"F={self.fanout}, page_size={self._page_size})"
                 ),
             )
         self._tree_cache = _ScratchTreeCache(
@@ -527,9 +683,19 @@ class EnumDraftEngine:
         the pre-bet block, not the bet one)."""
         base_len = len(state.committed_tokens) - state.prerun_len
         if state.committed_slots.numel() > base_len:
-            self.model_runner.token_to_kv_pool_allocator.free(
-                state.committed_slots[base_len:]
-            )
+            # Page-granular truncate: only pages FULLY past the cut are freed
+            # (the allocator frees the whole page containing any freed slot,
+            # and the boundary page still holds committed KV). Bet slots left
+            # in the boundary page are stale but harmless: they sit past the
+            # seat's seq_len, and the next advance's alloc_extend resumes at
+            # last_loc + 1 -- the exact same slots -- overwriting them before
+            # anything can read them. At page_size == 1 the roundup is the
+            # identity and this is the original token-granular free.
+            free_from = self._page_roundup(base_len)
+            if state.committed_slots.numel() > free_from:
+                self.model_runner.token_to_kv_pool_allocator.free(
+                    state.committed_slots[free_from:]
+                )
             state.committed_slots = state.committed_slots[:base_len]
         state.committed_tokens = state.committed_tokens[:base_len]
         if state.prerun_mamba_stash is not None:
@@ -661,6 +827,9 @@ class EnumDraftEngine:
         # (slow-path transients; carrier-destined slots are appended too and
         # removed on donation, so an aborted slow round cannot leak them).
         scratch_mamba_slots: list[torch.Tensor] = []
+        # page_size > 1 only: KV arena pages with the same lifecycle (slow-path
+        # backbone transients + carrier-destined pages until donation).
+        scratch_kv_pages: list[torch.Tensor] = []
         self.profiler.start_round()
         try:
             hit_keys: list[DraftReqKey] = []
@@ -717,6 +886,7 @@ class EnumDraftEngine:
                         scratch_batches,
                         scratch_slots,
                         scratch_mamba_slots,
+                        scratch_kv_pages,
                     )
                 )
             if len(parts) == 1:
@@ -733,7 +903,9 @@ class EnumDraftEngine:
                 "units_device": torch.cat([part["units_device"] for part in parts]),
             }
         finally:
-            self._free_scratch(scratch_batches, scratch_slots, scratch_mamba_slots)
+            self._free_scratch(
+                scratch_batches, scratch_slots, scratch_mamba_slots, scratch_kv_pages
+            )
             self.profiler.mark("free")
 
     def _match_seat(
@@ -867,6 +1039,8 @@ class EnumDraftEngine:
 
         # -- Carrier pool rows: broadcast the committed delta, then scatter
         # this round's backbone slots into the glue triangle + branch cases.
+        # (page_size > 1 dispatches to the private-page rebind instead and
+        # returns None -- backbone KV then lives per row, never shared.)
         backbone_slots = self._sync_carrier_rows(
             states=states,
             carriers=carriers,
@@ -875,6 +1049,11 @@ class EnumDraftEngine:
             f_live=f_live,
             scratch_slots=scratch_slots,
         )
+        if self._paged:
+            # Seed the glue rows' private heads before the forward reads them.
+            self._cow_carrier_glue_heads(
+                states=states, carriers=carriers, base_lens=base_lens
+            )
 
         if self._hybrid:
             # All K glue rows fork their state from the SEAT slot before the
@@ -921,12 +1100,14 @@ class EnumDraftEngine:
             guesses_stack = torch.topk(fused_view, f_live, dim=-1).indices
         else:
             # -- Glue extend: all K backbone tokens in one forward = node 1..K
-            # logits; their KV lands in this round's backbone slots.
+            # logits; their KV lands in this round's backbone slots (page 1)
+            # or in each glue row's private pages (page > 1).
             glue_logits = self._glue_forward(
                 carriers=carriers,
                 states=states,
                 chains=chains,
                 backbone_slots=backbone_slots,
+                base_lens=base_lens,
             )
             glue_view = glue_logits.view(bs, num_steps, -1)
             if chains_mat is not None and num_steps >= 2:
@@ -938,6 +1119,15 @@ class EnumDraftEngine:
                 )
             glue_guesses = torch.topk(glue_view, f_live, dim=-1).indices
             guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
+
+        if self._paged:
+            # Branch prefixes (boundary tail + delta + case backbone) now
+            # exist only in the seat's partial page and the glue rows'
+            # private pages -- copy each selected row's head into its own
+            # pages before the chain decodes read them.
+            self._cow_carrier_branch_heads(
+                states=states, carriers=carriers, base_lens=base_lens, variant=variant
+            )
 
         # -- Branch chains: K decode replays on the assembled carrier rows.
         if self._hybrid:
@@ -986,10 +1176,20 @@ class EnumDraftEngine:
         variant: _FanoutVariant,
         f_live: int,
         scratch_slots: list[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Broadcast the committed delta into every carrier pool row, then
         scatter freshly allocated backbone slots into the glue triangle +
-        branch case prefixes. Returns the backbone slots as [bs, K]."""
+        branch case prefixes. Returns the backbone slots as [bs, K].
+
+        page_size > 1 has no shared backbone slots to scatter (every row owns
+        private copies) and dispatches to the private-page rebind, returning
+        None.
+        """
+        if self._paged:
+            self._sync_carrier_rows_paged(
+                states=states, carriers=carriers, base_lens=base_lens
+            )
+            return None
         num_steps = self.num_steps
         bs = len(states)
         pool = self.model_runner.req_to_token_pool
@@ -1017,6 +1217,44 @@ class EnumDraftEngine:
         self.profiler.mark("carrier_sync")
         return backbone_slots
 
+    def _sync_carrier_rows_paged(
+        self,
+        *,
+        states: list[_DraftReqState],
+        carriers: list[_SeatCarrier],
+        base_lens: list[int],
+    ) -> None:
+        """Page-aware carrier-row sync (see the module docstring's rule):
+        broadcast only the seat's FULL pages (read-only by construction --
+        the seat never grows a full page again), then bind the private region
+        [anchor, anchor + w) of EVERY carrier row to its own arena pages.
+
+        The anchor is the page floor of the pre-advance committed length, so
+        a private slot's in-page offset equals its logical position's offset
+        (the alignment paged attention backends and alloc_extend/alloc_decode
+        assume). w = boundary tail + delta + K covers every prefix entry any
+        row reads this round; entries the chain decodes append past w are
+        written by alloc_decode itself. Writing all rows (not just the
+        selected fanout subset) keeps every entry a round can read freshly
+        rewritten, so no stale mapping from an earlier round -- including
+        pages the seat has since freed or re-anchored -- can ever be
+        dereferenced.
+        """
+        pool = self.model_runner.req_to_token_pool
+        for i, (state, carrier) in enumerate(zip(states, carriers)):
+            new_len = state.committed_slots.numel()
+            anchor = self._page_floor(base_lens[i])
+            synced = min(carrier.synced_len, anchor)
+            pool.req_to_token[carrier.all_rows, synced:anchor] = state.committed_slots[
+                synced:anchor
+            ].to(torch.int32)
+            carrier.synced_len = anchor
+            width = new_len - anchor + self.num_steps
+            pool.req_to_token[carrier.all_rows, anchor : anchor + width] = (
+                carrier.all_private_slots[:, :width].to(torch.int32)
+            )
+        self.profiler.mark("carrier_sync")
+
     def _fused_gather_pattern(self, delta_len: int) -> list[int]:
         """Per-seat gather rows over the [delta | chain] source layout (length
         delta_len + K): the seat row takes the delta, glue row g takes the
@@ -1038,7 +1276,7 @@ class EnumDraftEngine:
         *,
         carriers: list[_SeatCarrier],
         chains: list[torch.Tensor],
-        backbone_slots: torch.Tensor,  # [bs, K]
+        backbone_slots: Optional[torch.Tensor],  # [bs, K]; None at page > 1
         seat_reqs: list,
         seat_rows: torch.Tensor,  # [bs], the advance batch's pool rows
         seat_input_ids: torch.Tensor,  # flat [sum(delta_lens)], device
@@ -1063,7 +1301,10 @@ class EnumDraftEngine:
         contents), which makes this the benign same-forward write-then-read
         pattern the glue triangle already relies on: per layer, the batched
         KV write precedes every attention read, so whichever duplicate lands
-        is correct by the time any row reads it.
+        is correct by the time any row reads it. At page_size > 1 the
+        duplicate-write trick is off (see _fused_out_cache_loc_paged): each
+        glue row targets its own private slots, so the extend layout is
+        unchanged but no two rows ever write through a shared page.
         """
         num_steps = self.num_steps
         bs = len(carriers)
@@ -1103,7 +1344,9 @@ class EnumDraftEngine:
         # Row contents: input ids and out_cache_loc share ONE gather. Per seat
         # the source is [delta | chain] (ids) aligned with
         # [delta slots | backbone slots] (locations), and the row layout
-        # repeats the delta then takes a growing chain prefix.
+        # repeats the delta then takes a growing chain prefix. (At page > 1
+        # write targets are per-row, so only the ids ride the gather; slots
+        # come from _fused_out_cache_loc_paged.)
         src_id_pieces: list[torch.Tensor] = []
         src_slot_pieces: list[torch.Tensor] = []
         gather_rows: list[int] = []
@@ -1115,10 +1358,11 @@ class EnumDraftEngine:
                 seat_input_ids[delta_offset : delta_offset + delta_len]
             )
             src_id_pieces.append(chains[i])
-            src_slot_pieces.append(
-                seat_delta_slots[delta_offset : delta_offset + delta_len]
-            )
-            src_slot_pieces.append(backbone_slots[i])
+            if not self._paged:
+                src_slot_pieces.append(
+                    seat_delta_slots[delta_offset : delta_offset + delta_len]
+                )
+                src_slot_pieces.append(backbone_slots[i])
             gather_rows.extend(
                 src_offset + entry for entry in self._fused_gather_pattern(delta_len)
             )
@@ -1126,7 +1370,15 @@ class EnumDraftEngine:
             delta_offset += delta_len
         gather = torch.tensor(gather_rows, dtype=torch.int64, device=self.device)
         fused.input_ids = torch.cat(src_id_pieces)[gather]
-        fused.out_cache_loc = torch.cat(src_slot_pieces)[gather]
+        if self._paged:
+            fused.out_cache_loc = self._fused_out_cache_loc_paged(
+                carriers=carriers,
+                seat_delta_slots=seat_delta_slots,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
+            )
+        else:
+            fused.out_cache_loc = torch.cat(src_slot_pieces)[gather]
         fused.extend_num_tokens = len(gather_rows)
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
         fused.seq_lens = seq_cpu.to(self.device, non_blocking=True)
@@ -1136,13 +1388,44 @@ class EnumDraftEngine:
         self.profiler.mark("fused_mut")
         return self._forward(fused, tag="fused_extend")
 
+    def _fused_out_cache_loc_paged(
+        self,
+        *,
+        carriers: list[_SeatCarrier],
+        seat_delta_slots: torch.Tensor,
+        base_lens: list[int],
+        delta_lens: list[int],
+    ) -> torch.Tensor:
+        """Fused-extend write targets at page_size > 1. The seat row keeps its
+        allocator-grown delta slots (standard paged growth on its own pages);
+        glue row g's delta + chain positions map to its OWN private slots
+        [q0, q0 + dl + g + 1) with q0 = the seat's boundary-tail length --
+        the page1 trick of duplicate-writing the seat's delta slots would
+        route every glue row's writes through the seat's partial page, whose
+        later positions hold divergent tokens across rows. The rows still
+        recompute the delta redundantly (extend contiguity forces that); only
+        the write targets move."""
+        pieces: list[torch.Tensor] = []
+        delta_offset = 0
+        for i, carrier in enumerate(carriers):
+            delta_len = delta_lens[i]
+            q0 = base_lens[i] - self._page_floor(base_lens[i])
+            pieces.append(seat_delta_slots[delta_offset : delta_offset + delta_len])
+            for g in range(self.num_steps):
+                pieces.append(
+                    carrier.glue_private_slots[g, q0 : q0 + delta_len + g + 1]
+                )
+            delta_offset += delta_len
+        return torch.cat(pieces)
+
     def _glue_forward(
         self,
         *,
         carriers: list[_SeatCarrier],
         states: list[_DraftReqState],
         chains: list[torch.Tensor],
-        backbone_slots: torch.Tensor,
+        backbone_slots: Optional[torch.Tensor],
+        base_lens: list[int],
     ) -> torch.Tensor:
         num_steps = self.num_steps
         bs = len(states)
@@ -1162,7 +1445,7 @@ class EnumDraftEngine:
         lens = [state.committed_slots.numel() for state in states]
         seq_host = [lens[i] + g + 1 for i in range(bs) for g in range(num_steps)]
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
-        if self._hybrid:
+        if self._hybrid or self._paged:
             # GDN extend scans a row's extend tokens from its OWN slot's state
             # and cannot see node states produced by sibling rows of the same
             # forward, so the one-token stagger doesn't work for the linear
@@ -1172,12 +1455,30 @@ class EnumDraftEngine:
             # semantically: every row writes token c_{j+1}'s K/V to the SAME
             # backbone slot j, and the values are identical across rows (same
             # token, position, and shared prefix), so the duplicate-index
-            # scatter is benign.
+            # scatter is benign. page_size > 1 (pure-KV included) needs the
+            # same triangle for a different reason: the stagger reads sibling
+            # rows' fresh chain KV through shared slot entries, but a paged
+            # page-table entry maps P positions to ONE page and cannot stitch
+            # per-token slots from different rows' private pages -- each row
+            # must own (and hence re-extend) its whole chain prefix.
             glue.extend_lens = self._tri_row_lens * bs
             glue.extend_num_tokens = bs * len(self._tri_j)
             chains_stack = torch.stack(chains)
             glue.input_ids = chains_stack[:, self._tri_j_dev].reshape(-1)
-            glue.out_cache_loc = backbone_slots[:, self._tri_j_dev].reshape(-1)
+            if self._paged:
+                # Row g's chain positions [new_len, new_len + g + 1) live at
+                # its private slots [q0, q0 + g + 1); q0 = boundary tail +
+                # delta (the advance ran before this forward, so the anchor
+                # is the PRE-advance page floor and the head was COW'd with
+                # tail + delta by _cow_carrier_glue_heads).
+                pieces: list[torch.Tensor] = []
+                for i, carrier in enumerate(carriers):
+                    q0 = lens[i] - self._page_floor(base_lens[i])
+                    for g in range(num_steps):
+                        pieces.append(carrier.glue_private_slots[g, q0 : q0 + g + 1])
+                glue.out_cache_loc = torch.cat(pieces)
+            else:
+                glue.out_cache_loc = backbone_slots[:, self._tri_j_dev].reshape(-1)
             glue.prefix_lens = [lens[i] for i in range(bs) for _ in range(num_steps)]
         else:
             glue.extend_lens = [1] * (bs * num_steps)
@@ -1198,7 +1499,7 @@ class EnumDraftEngine:
         carriers: list[_SeatCarrier],
         states: list[_DraftReqState],
         guesses_stack: torch.Tensor,
-        backbone_slots: torch.Tensor,
+        backbone_slots: Optional[torch.Tensor],
         scratch_slots: list[torch.Tensor],
         variant: _FanoutVariant,
         f_live: int,
@@ -1253,13 +1554,19 @@ class EnumDraftEngine:
         self,
         *,
         states: list[_DraftReqState],
-        backbone_slots: torch.Tensor,
+        backbone_slots: Optional[torch.Tensor],
         variant: _FanoutVariant,
         f_live: int,
     ) -> Optional[_CascadeMetadata]:
         """Shared-prefix cascade inputs for this round's branch chain, or None
         below the L2 threshold (where per-row re-reads are effectively free
         and the two-call split only adds overhead)."""
+        if self._paged:
+            # The cascade splits each row into shared-backbone-slot prefix +
+            # token-granular private tail for the fa3 cascade kernel; at
+            # page_size > 1 there ARE no shared backbone slots (each row owns
+            # private copies), so the dedup the cascade exists for is gone.
+            return None
         min_prefix = self._cascade_min_prefix_len
         lens = [state.committed_slots.numel() for state in states]
         if min_prefix <= 0 or min(lens) < min_prefix:
@@ -1305,6 +1612,278 @@ class EnumDraftEngine:
             )
             offset += new_len
         self.profiler.mark("commit_slots")
+
+    # ------------------------------------------------------------------ #
+    # Paged KV (page_size > 1): geometry, private-page COW
+    # ------------------------------------------------------------------ #
+
+    def _page_floor(self, num_tokens: int) -> int:
+        return num_tokens - num_tokens % self._page_size
+
+    def _page_roundup(self, num_tokens: int) -> int:
+        return -(-num_tokens // self._page_size) * self._page_size
+
+    def _page_flat_slots(self, pages: torch.Tensor) -> torch.Tensor:
+        """[rows, n] page ids -> [rows, n * P] flat slot ids. Column q holds
+        in-page offset q % P, so anchoring a row's private region at a page
+        floor makes slot offset == logical position offset -- the invariant
+        paged attention backends derive page tables from, and what lets
+        alloc_extend / alloc_decode continue a private page in place."""
+        offsets = torch.arange(self._page_size, dtype=torch.int64, device=pages.device)
+        return (pages.unsqueeze(-1) * self._page_size + offsets).reshape(
+            pages.shape[0], -1
+        )
+
+    def _resolve_cow_kv_pool(self, *, model_runner: ModelRunner) -> MHATokenToKVPool:
+        """Full-attention K/V pool for the boundary/branch-head COW copies.
+
+        Hybrid (GDN) models only have KV for their full-attn layers, wrapped
+        behind ``HybridLinearKVPool.full_kv_pool`` (linear-layer state is
+        forked through the mamba arena instead); MLA pools have no (k, v)
+        slot rows to move, so a paged MLA drafter fails here at launch rather
+        than as mid-round corruption. ``move_kv_cache`` is the layout-aware
+        copy primitive (HND / page-major / native / fused-tiled); its plain
+        NHD tiled path needs a copy config the configurator only arms for
+        colocated spec (the drafter role clears speculative_algorithm), so
+        arm it here exactly when that base implementation is the active one.
+        """
+        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(kvcache, HybridLinearKVPool):
+            kvcache = kvcache.full_kv_pool
+        if not isinstance(kvcache, MHATokenToKVPool):
+            raise RuntimeError(
+                "the decoupled drafter at page_size > 1 copies boundary-tail "
+                "K/V between pages and requires an MHA-family KV pool; got "
+                f"{type(kvcache).__name__}"
+            )
+        uses_tiled_copy = (
+            type(kvcache)._move_kv_cache_impl is MHATokenToKVPool._move_kv_cache_impl
+            and not kvcache.use_hnd
+            and not kvcache.use_native_move_kv_cache
+        )
+        if uses_tiled_copy and kvcache._kv_copy_config is None:
+            kvcache._init_kv_copy_and_warmup()
+        return kvcache
+
+    def _cow_kv(
+        self,
+        *,
+        src_pieces: list[torch.Tensor],
+        dst_pieces: list[torch.Tensor],
+        tag: str,
+    ) -> None:
+        """Batched private-head K/V copy (COW) over the full-attn layers: ONE
+        (src, dst) index list per call, executed by the pool's layout-aware
+        ``move_kv_cache``. Volume is rows x O(page tail) tokens per round --
+        trivial next to a forward."""
+        if not src_pieces:
+            return
+        self._cow_kv_pool.move_kv_cache(
+            tgt_loc=torch.cat(dst_pieces), src_loc=torch.cat(src_pieces)
+        )
+        self.profiler.mark(f"{tag}_cow")
+
+    def _cow_carrier_glue_heads(
+        self,
+        *,
+        states: list[_DraftReqState],
+        carriers: list[_SeatCarrier],
+        base_lens: list[int],
+    ) -> None:
+        """Seed every glue row's private head before the forward that reads
+        it. Fused mode copies only the boundary tail [anchor, base) -- the
+        delta's KV is written by the glue rows themselves inside the fused
+        extend. Non-fused mode copies [anchor, new_len): the advance already
+        materialized the delta's KV in the seat's pages and the glue extend
+        carries only chain tokens. Either way a glue row's head ends the
+        forward holding boundary tail + delta + its chain prefix, which is
+        what lets branch heads source from glue rows uniformly."""
+        src_pieces: list[torch.Tensor] = []
+        dst_pieces: list[torch.Tensor] = []
+        for i, (state, carrier) in enumerate(zip(states, carriers)):
+            anchor = self._page_floor(base_lens[i])
+            head_end = (
+                base_lens[i]
+                if self._enable_fused_extend
+                else state.committed_slots.numel()
+            )
+            span = head_end - anchor
+            if span == 0:
+                continue
+            src_pieces.append(
+                state.committed_slots[anchor:head_end].repeat(self.num_steps)
+            )
+            dst_pieces.append(carrier.glue_private_slots[:, :span].reshape(-1))
+        self._cow_kv(src_pieces=src_pieces, dst_pieces=dst_pieces, tag="glue_head")
+
+    def _cow_carrier_branch_heads(
+        self,
+        *,
+        states: list[_DraftReqState],
+        carriers: list[_SeatCarrier],
+        base_lens: list[int],
+        variant: _FanoutVariant,
+    ) -> None:
+        """Copy each selected branch row's prefix head -- boundary tail +
+        delta + c_1..c_case -- into its own private pages, after the fused /
+        glue forward wrote the chain KV. Case 0 sources from the seat (its
+        pages hold tail + delta once the advance KV landed); case a >= 1
+        sources from glue row a - 1, whose private head holds exactly
+        tail + delta + c_1..c_a. Unselected (dead-fanout) rows keep stale KV:
+        they are never forwarded, and their page-table entries are rewritten
+        before any later round reads them."""
+        src_pieces: list[torch.Tensor] = []
+        dst_pieces: list[torch.Tensor] = []
+        for i, (state, carrier) in enumerate(zip(states, carriers)):
+            anchor = self._page_floor(base_lens[i])
+            head = state.committed_slots.numel() - anchor  # tail + delta
+            seat_src = state.committed_slots[anchor:]
+            for row, case in zip(variant.sel_rows_pool, variant.case_of_row):
+                span = head + case
+                if span == 0:
+                    continue
+                src_pieces.append(
+                    seat_src
+                    if case == 0
+                    else carrier.glue_private_slots[case - 1, :span]
+                )
+                dst_pieces.append(carrier.branch_private_slots[row, :span])
+        self._cow_kv(src_pieces=src_pieces, dst_pieces=dst_pieces, tag="branch_head")
+
+    def _case0_sync_paged(
+        self,
+        *,
+        states: list[_DraftReqState],
+        carriers: list[_SeatCarrier],
+        f_live: int,
+    ) -> None:
+        """Case-0 carrier sync at page_size > 1. The advance materialized the
+        delta's KV before this runs and the seat writes nothing else this
+        round, so the shareable region extends to the page floor of the NEW
+        committed length; only the boundary tail is private, COW'd into the
+        live case-0 rows (the chain decodes then grow their pages via
+        alloc_decode). The private rebind still covers ALL rows so no row
+        retains a stale mapping."""
+        pool = self.model_runner.req_to_token_pool
+        src_pieces: list[torch.Tensor] = []
+        dst_pieces: list[torch.Tensor] = []
+        for state, carrier in zip(states, carriers):
+            new_len = state.committed_slots.numel()
+            anchor = self._page_floor(new_len)
+            synced = min(carrier.synced_len, anchor)
+            pool.req_to_token[carrier.all_rows, synced:anchor] = state.committed_slots[
+                synced:anchor
+            ].to(torch.int32)
+            carrier.synced_len = anchor
+            tail = new_len - anchor
+            if tail == 0:
+                continue
+            pool.req_to_token[carrier.all_rows, anchor:new_len] = (
+                carrier.all_private_slots[:, :tail].to(torch.int32)
+            )
+            src_pieces.append(state.committed_slots[anchor:].repeat(f_live))
+            dst_pieces.append(carrier.branch_private_slots[:f_live, :tail].reshape(-1))
+        self._cow_kv(src_pieces=src_pieces, dst_pieces=dst_pieces, tag="case0_head")
+
+    def _take_slow_round_pages(
+        self, *, bs: int, scratch_kv_pages: list[torch.Tensor]
+    ) -> _SlowRoundPages:
+        """Stage a slow subround's private pages up front (the mamba-slot
+        staging idiom): transient backbone pages ride ``scratch_kv_pages``
+        back to the arena at round end; the glue/branch pages are
+        carrier-destined and removed from the list on donation."""
+        ppr = self._pages_per_carrier_row
+        rows_per_seat = (self.num_steps + 1) * self.fanout
+        backbone_pages = self._kv_page_arena.take(bs).view(bs, 1)
+        glue_pages = self._kv_page_arena.take(bs * self.num_steps * ppr).view(
+            bs * self.num_steps, ppr
+        )
+        branch_pages = self._kv_page_arena.take(bs * rows_per_seat * ppr).view(
+            bs * rows_per_seat, ppr
+        )
+        scratch_kv_pages += [backbone_pages, glue_pages, branch_pages]
+        return _SlowRoundPages(
+            backbone_pages=backbone_pages,
+            backbone_flats=self._page_flat_slots(backbone_pages),
+            glue_pages=glue_pages,
+            glue_flats=self._page_flat_slots(glue_pages),
+            branch_pages=branch_pages,
+            branch_flats=self._page_flat_slots(branch_pages),
+        )
+
+    def _paged_backbone_prefixes(
+        self,
+        *,
+        states: list[_DraftReqState],
+        backbone_flats: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Per-seat backbone-row prefix at page_size > 1: the seat's full
+        pages + a private COW of the boundary tail. The backbone extend then
+        continues the private page in place (alloc_extend resumes at the last
+        prefix slot + 1) and later crossings take throwaway allocator pages,
+        both freed correctly by the round's page-aware scratch free. Copies
+        the tail K/V before returning."""
+        prefixes: list[torch.Tensor] = []
+        src_pieces: list[torch.Tensor] = []
+        dst_pieces: list[torch.Tensor] = []
+        for i, state in enumerate(states):
+            new_len = state.committed_slots.numel()
+            anchor = self._page_floor(new_len)
+            tail = new_len - anchor
+            if tail == 0:
+                prefixes.append(state.committed_slots)
+                continue
+            head = backbone_flats[i, :tail]
+            prefixes.append(torch.cat([state.committed_slots[:anchor], head]))
+            src_pieces.append(state.committed_slots[anchor:])
+            dst_pieces.append(head)
+        self._cow_kv(src_pieces=src_pieces, dst_pieces=dst_pieces, tag="backbone_head")
+        return prefixes
+
+    def _paged_branch_prefixes(
+        self,
+        *,
+        states: list[_DraftReqState],
+        backbone_slots_dev: torch.Tensor,
+        branch_flats: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Slow-round branch prefixes at page_size > 1, in the batch's
+        case-major full-F row order: shared full pages + a private COW head
+        of boundary tail + c_1..c_case (the case backbone lives in the
+        backbone row's pages -- copied, never shared, since those pages are
+        transient scratch). The guess extend then continues each private page
+        in place. The heads land in the rows' carrier-lifetime pages, so the
+        donated carrier starts with valid private mappings."""
+        num_cases, fanout = self.num_steps + 1, self.fanout
+        prefixes: list[torch.Tensor] = []
+        src_pieces: list[torch.Tensor] = []
+        dst_pieces: list[torch.Tensor] = []
+        row = 0
+        for i, state in enumerate(states):
+            new_len = state.committed_slots.numel()
+            anchor = self._page_floor(new_len)
+            tail = new_len - anchor
+            shared = state.committed_slots[:anchor]
+            for case in range(num_cases):
+                span = tail + case
+                src = (
+                    torch.cat(
+                        [state.committed_slots[anchor:], backbone_slots_dev[i, :case]]
+                    )
+                    if span > 0
+                    else None
+                )
+                for _ in range(fanout):
+                    if span == 0:
+                        prefixes.append(shared)
+                    else:
+                        head = branch_flats[row, :span]
+                        prefixes.append(torch.cat([shared, head]))
+                        src_pieces.append(src)
+                        dst_pieces.append(head)
+                    row += 1
+        self._cow_kv(src_pieces=src_pieces, dst_pieces=dst_pieces, tag="branch_head")
+        return prefixes
 
     def _case0_round(
         self,
@@ -1354,13 +1933,16 @@ class EnumDraftEngine:
         self._absorb_advance_slots(states, advance_slots)
 
         # -- Carrier rows only need the committed delta (no backbone) --------
-        for i, (state, carrier) in enumerate(zip(states, carriers)):
-            new_len = state.committed_slots.numel()
-            synced = min(carrier.synced_len, base_lens[i])
-            pool.req_to_token[carrier.all_rows, synced:new_len] = state.committed_slots[
-                synced:new_len
-            ].to(torch.int32)
-            carrier.synced_len = new_len
+        if self._paged:
+            self._case0_sync_paged(states=states, carriers=carriers, f_live=f_live)
+        else:
+            for i, (state, carrier) in enumerate(zip(states, carriers)):
+                new_len = state.committed_slots.numel()
+                synced = min(carrier.synced_len, base_lens[i])
+                pool.req_to_token[carrier.all_rows, synced:new_len] = (
+                    state.committed_slots[synced:new_len].to(torch.int32)
+                )
+                carrier.synced_len = new_len
         self.profiler.mark("case0_sync")
 
         # -- Case-0 chains: per seat, the first f_live carrier rows (case 0's
@@ -1423,6 +2005,7 @@ class EnumDraftEngine:
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
         scratch_mamba_slots: list[torch.Tensor],
+        scratch_kv_pages: list[torch.Tensor],
     ) -> dict:
         num_steps, fanout = self.num_steps, self.fanout
         num_cases = num_steps + 1
@@ -1431,6 +2014,14 @@ class EnumDraftEngine:
         # them up front bounds the subround's peak pool-row usage.
         for key in keys:
             self._evict_seat(key)
+
+        # page_size > 1: stage the subround's private pages (see the struct's
+        # docstring); None at page 1, where nested prefixes share raw slots.
+        slow_pages = (
+            self._take_slow_round_pages(bs=bs, scratch_kv_pages=scratch_kv_pages)
+            if self._paged
+            else None
+        )
 
         # Hybrid: stage the subround's state slots up front. The backbone
         # advances ONE slot per seat in place; the node checkpoints it passes
@@ -1472,12 +2063,19 @@ class EnumDraftEngine:
         backbone_tokens: list[torch.Tensor] = [guesses[0][:, 0]]
         backbone_slot_steps: list[torch.Tensor] = []
         if num_steps >= 1:
+            backbone_prefixes = (
+                self._paged_backbone_prefixes(
+                    states=states, backbone_flats=slow_pages.backbone_flats
+                )
+                if self._paged
+                else [state.committed_slots for state in states]
+            )
             backbone_batch, first_slots = self._extend_batch(
                 token_lists=[
                     state.committed_tokens + [int(backbone_tokens[0][i])]
                     for i, state in enumerate(states)
                 ],
-                prefix_slots=[state.committed_slots for state in states],
+                prefix_slots=backbone_prefixes,
                 tag="backbone",
                 mamba_slots=backbone_mamba_slots,
             )
@@ -1534,7 +2132,6 @@ class EnumDraftEngine:
             else torch.empty((bs, 0), dtype=torch.int64, device=self.device)
         )  # [bs, K]
         branch_token_lists: list[list[int]] = []
-        branch_prefix_slots: list[torch.Tensor] = []
         for i, state in enumerate(states):
             for case in range(num_cases):
                 for f in range(fanout):
@@ -1543,9 +2140,19 @@ class EnumDraftEngine:
                         + backbone_cpu[i][:case]
                         + [guesses_cpu[i][case][f]]
                     )
-                    branch_prefix_slots.append(
-                        torch.cat([state.committed_slots, backbone_slots_dev[i, :case]])
-                    )
+        if self._paged:
+            branch_prefix_slots = self._paged_branch_prefixes(
+                states=states,
+                backbone_slots_dev=backbone_slots_dev,
+                branch_flats=slow_pages.branch_flats,
+            )
+        else:
+            branch_prefix_slots = [
+                torch.cat([state.committed_slots, backbone_slots_dev[i, :case]])
+                for i, state in enumerate(states)
+                for case in range(num_cases)
+                for _ in range(fanout)
+            ]
         self.profiler.mark("branch_lists")
         branch_batch, branch_first_slots = self._extend_batch(
             token_lists=branch_token_lists,
@@ -1597,10 +2204,12 @@ class EnumDraftEngine:
             scratch_batches=scratch_batches,
             scratch_slots=scratch_slots,
             scratch_mamba_slots=scratch_mamba_slots,
+            scratch_kv_pages=scratch_kv_pages,
             backbone_cpu=backbone_cpu,
             backbone_slots_dev=backbone_slots_dev,
             glue_mamba_flat=glue_mamba_flat,
             branch_mamba_flat=branch_mamba_flat,
+            slow_pages=slow_pages,
         )
         return packed
 
@@ -1695,10 +2304,12 @@ class EnumDraftEngine:
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
         scratch_mamba_slots: list[torch.Tensor],
+        scratch_kv_pages: list[torch.Tensor],
         backbone_cpu: list[list[int]],
         backbone_slots_dev: torch.Tensor,
         glue_mamba_flat: Optional[torch.Tensor],
         branch_mamba_flat: Optional[torch.Tensor],
+        slow_pages: Optional[_SlowRoundPages],
     ) -> None:
         """Donate this slow subround's branch rows + a freshly built glue
         batch to per-seat carriers (pool rows persist until the seat closes;
@@ -1711,7 +2322,8 @@ class EnumDraftEngine:
         # rows' mamba slots survive WITH the rows (the fixed row->slot binding
         # is what keeps the mapping written at alloc valid), so they move from
         # the scratch list to carrier ownership here -- identity-filtered, not
-        # list.remove, which would trip tensor __eq__.
+        # list.remove, which would trip tensor __eq__. The paged private pages
+        # (glue + branch rows' carrier-lifetime pages) move the same way.
         scratch_batches.remove(branch_batch)
         if glue_mamba_flat is not None:
             scratch_mamba_slots[:] = [
@@ -1719,17 +2331,37 @@ class EnumDraftEngine:
                 for slots in scratch_mamba_slots
                 if slots is not glue_mamba_flat and slots is not branch_mamba_flat
             ]
+        if slow_pages is not None:
+            scratch_kv_pages[:] = [
+                pages
+                for pages in scratch_kv_pages
+                if pages is not slow_pages.glue_pages
+                and pages is not slow_pages.branch_pages
+            ]
+        if self._paged:
+            # Placeholder rows (no forward ever runs on this batch): a
+            # page-aligned prefix keeps the throwaway alloc from continuing
+            # the seat's partial page -- the round-end free releases whole
+            # pages, so continuation slots there would drag the seat's live
+            # page into the free.
+            glue_build_prefixes = [
+                state.committed_slots[: self._page_floor(state.committed_slots.numel())]
+                for state in states
+                for _ in range(self.num_steps)
+            ]
+        else:
+            glue_build_prefixes = [
+                torch.cat([state.committed_slots, backbone_slots_dev[i, :g]])
+                for i, state in enumerate(states)
+                for g in range(self.num_steps)
+            ]
         glue_batch, glue_slots = self._extend_batch(
             token_lists=[
                 state.committed_tokens + backbone_cpu[i][: g + 1]
                 for i, state in enumerate(states)
                 for g in range(self.num_steps)
             ],
-            prefix_slots=[
-                torch.cat([state.committed_slots, backbone_slots_dev[i, :g]])
-                for i, state in enumerate(states)
-                for g in range(self.num_steps)
-            ],
+            prefix_slots=glue_build_prefixes,
             tag="glue_build",
             mamba_slots=glue_mamba_flat,
         )
@@ -1749,6 +2381,14 @@ class EnumDraftEngine:
             if branch_mamba_flat is not None
             else None
         )
+        glue_flats_all = glue_pages_all = None
+        branch_flats_all = branch_pages_all = None
+        if slow_pages is not None:
+            ppr = self._pages_per_carrier_row
+            glue_flats_all = slow_pages.glue_flats.view(bs, num_steps, -1)
+            branch_flats_all = slow_pages.branch_flats.view(bs, rows_per_seat, -1)
+            glue_pages_all = slow_pages.glue_pages.view(bs, num_steps, ppr)
+            branch_pages_all = slow_pages.branch_pages.view(bs, rows_per_seat, ppr)
         for i, (key, state) in enumerate(zip(keys, states)):
             self._seat_carriers[key] = _SeatCarrier(
                 glue_rows=glue_rows_all[i],
@@ -1757,12 +2397,32 @@ class EnumDraftEngine:
                 branch_reqs=branch_batch.reqs[
                     i * rows_per_seat : (i + 1) * rows_per_seat
                 ],
-                synced_len=state.committed_slots.numel(),
+                # Paged: page-aligned, so the fast-round shared sync starts at
+                # a boundary the seat can never free or rewrite; the row
+                # entries between the floor and the built length are private
+                # already (branch heads) or placeholder (glue rows, never
+                # forwarded at build) and every later round rewrites them.
+                synced_len=(
+                    self._page_floor(state.committed_slots.numel())
+                    if self._paged
+                    else state.committed_slots.numel()
+                ),
                 glue_mamba_slots=(
                     glue_mamba_all[i] if glue_mamba_all is not None else None
                 ),
                 branch_mamba_slots=(
                     branch_mamba_all[i] if branch_mamba_all is not None else None
+                ),
+                glue_private_slots=(
+                    glue_flats_all[i] if glue_flats_all is not None else None
+                ),
+                branch_private_slots=(
+                    branch_flats_all[i] if branch_flats_all is not None else None
+                ),
+                private_kv_pages=(
+                    torch.cat([glue_pages_all[i], branch_pages_all[i]])
+                    if glue_pages_all is not None
+                    else None
                 ),
             )
         self._glue_template = glue_batch
@@ -1783,6 +2443,8 @@ class EnumDraftEngine:
         if carrier.glue_mamba_slots is not None:
             self._mamba_arena.give_back(carrier.glue_mamba_slots)
             self._mamba_arena.give_back(carrier.branch_mamba_slots)
+        if carrier.private_kv_pages is not None:
+            self._kv_page_arena.give_back(carrier.private_kv_pages)
 
     # ------------------------------------------------------------------ #
     # Batch plumbing (bench_one_batch harness pattern)
@@ -1918,10 +2580,31 @@ class EnumDraftEngine:
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
         scratch_mamba_slots: list[torch.Tensor],
+        scratch_kv_pages: list[torch.Tensor],
     ) -> None:
-        for slots in scratch_slots:
-            if slots is not None and slots.numel() > 0:
-                self.model_runner.token_to_kv_pool_allocator.free(slots)
+        if self._paged:
+            # Page-granular free with arena exclusion. The allocator frees the
+            # WHOLE page containing any freed slot, and scratch out_cache_loc
+            # mixes (a) throwaway allocator pages with (b) extend/decode
+            # continuation slots INSIDE engine-arena pages (carrier private
+            # pages, slow-round transients); freeing (b) raw would hand arena
+            # pages back to the global pool while the arena keeps recycling
+            # them. Seat (committed) pages never appear here: every scratch
+            # row's tail head is private by the sharing rule, so continuation
+            # never lands in a seat page.
+            live = [s for s in scratch_slots if s is not None and s.numel() > 0]
+            if live:
+                pages = torch.unique(
+                    torch.cat([s.reshape(-1) for s in live]) // self._page_size
+                )
+                foreign = pages[~torch.isin(pages, self._kv_page_arena.owned_pages)]
+                self.model_runner.token_to_kv_pool_allocator.free(
+                    foreign * self._page_size
+                )
+        else:
+            for slots in scratch_slots:
+                if slots is not None and slots.numel() > 0:
+                    self.model_runner.token_to_kv_pool_allocator.free(slots)
         for batch in scratch_batches:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:
@@ -1932,3 +2615,5 @@ class EnumDraftEngine:
                     self.model_runner.req_to_token_pool.free(req)
         for slots in scratch_mamba_slots:
             self._mamba_arena.give_back(slots)
+        for pages in scratch_kv_pages:
+            self._kv_page_arena.give_back(pages)

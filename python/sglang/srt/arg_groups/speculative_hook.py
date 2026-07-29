@@ -214,20 +214,18 @@ def _handle_decoupled_spec(server_args: ServerArgs) -> None:
     if int(server_args.decoupled_spec_rank) < 0:
         raise ValueError("--decoupled-spec-rank must be non-negative.")
 
-    # page_size == 1 is a DRAFTER-only contract: on each commit the drafter
-    # truncates its mirror request back to the committed prefix at token
-    # granularity and shares nested branch prefixes by raw slot id; both
-    # break at page granularity (partial-page write conflicts at every fork
-    # point) and page-aligned COW isn't implemented. The VERIFIER has no such
-    # dependency -- its verify path is the colocated one (paged-capable), the
-    # enum landing buffer is seat-indexed (no KV), and the wire carries token
-    # ids only -- so a paged backend (e.g. trtllm_mha's page 64 on sm100) is
-    # fine there, and the two engines' page sizes are independent.
-    if is_drafter and server_args.page_size is not None and server_args.page_size > 1:
-        raise ValueError(
-            "the decoupled DRAFTER requires page_size == 1 (token-granular "
-            f"truncation and slot-id prefix sharing), got {server_args.page_size}."
-        )
+    # Page geometry is unconstrained on BOTH roles. The DRAFTER's enumeration
+    # engine is page-aware: carrier rows share only the seat's FULL pages
+    # (read-only by construction), everything past the round's page-floor
+    # anchor lives in per-row PRIVATE pages from an engine page arena seeded
+    # by a batched boundary-tail K/V copy (COW), and commit truncation /
+    # scratch freeing is page-granular (see decoupled_draft_engine's module
+    # docstring). page_size == 1 degenerates to full slot-id sharing with
+    # zero copies. The VERIFIER never had a page dependency -- its verify
+    # path is the colocated one (paged-capable), the enum landing buffer is
+    # seat-indexed (no KV), and the wire carries token ids only -- and the
+    # two engines' page sizes stay independent, so a paged backend (e.g.
+    # trtllm_mha's page 64 on sm100) works on either side.
 
     # The verifier runs many concurrent user requests, so default its running
     # cap higher than the per-algo 48. The drafter needs far more req_to_token
