@@ -282,7 +282,10 @@ class VerifyWorker(BaseVerifyWorker):
         if (
             envs.SGLANG_ENABLE_DECOUPLED_SELECT_GRAPH.get()
             and self._verify_prep_ahead
-            and self._tp_size == 1
+            # The select is rank-0's job under TP (only rank 0 holds landed
+            # blocks); ranks > 0 keep the empty-buffer + broadcast path and
+            # never build a runner.
+            and self._tp_rank == 0
         ):
             from sglang.srt.speculative.decoupled_select_graph import (
                 SelectGraphRunner,
@@ -317,9 +320,7 @@ class VerifyWorker(BaseVerifyWorker):
             select_input = batch.spec_info
             verify_input, prepared_verify = self._prepare_verify_prelude(batch)
             self.select_gate(batch)
-            selected = self._select_units_graph(batch, select_input)
-            if selected is None:
-                selected = self._select_units_tp_safe(batch, select_input)
+            selected = self._select_units_tp_safe(batch, select_input)
             verify_input.draft_token.copy_(selected.view(-1))
             batch.spec_info = verify_input
         else:
@@ -454,13 +455,21 @@ class VerifyWorker(BaseVerifyWorker):
         manager's accounting, lives there).
         """
         if self._tp_size == 1:
+            selected = self._select_units_graph(batch, select_input)
+            if selected is not None:
+                return selected
             with profile_range("verifier.select_units"):
                 selected, hits = self._select_enum_units(batch, select_input)
             self.select_hits_queue.append(hits)
             return selected
         if self._tp_rank == 0:
-            selected, hits = self._select_enum_units(batch, select_input)
-            self.select_hits_queue.append(hits)
+            # The graph replaces only rank 0's COMPUTE; the broadcast below
+            # stays -- ranks > 0 are parked at the collective, so an early
+            # return here would hang them.
+            selected = self._select_units_graph(batch, select_input)
+            if selected is None:
+                selected, hits = self._select_enum_units(batch, select_input)
+                self.select_hits_queue.append(hits)
         else:
             selected = torch.empty(
                 (len(batch.reqs), self.speculative_num_draft_tokens),

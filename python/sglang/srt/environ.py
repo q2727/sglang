@@ -445,9 +445,10 @@ class Envs:
     # Decoupled spec: capture the verifier's post-gate enum select (buffer
     # gather + generation match + unit pick + fallback blend) as one CUDA
     # graph per (bs, read-slot) bucket, shrinking the post-gate host work to
-    # static-buffer fills + one replay. Requires verify prep-ahead; TP == 1
-    # only (the TP path keeps the eager select + broadcast). Capture failure
-    # falls back to the eager select permanently. Default off until gated.
+    # static-buffer fills + one replay. Requires verify prep-ahead. Under
+    # TP > 1 the graph serves rank 0's compute and the broadcast to other
+    # ranks stays as is. Capture failure falls back to the eager select
+    # permanently. Default off until gated.
     SGLANG_ENABLE_DECOUPLED_SELECT_GRAPH = EnvBool(False)
     # Decoupled spec debug: per-round in-process graph-vs-eager compare of the
     # select (it is a pure function, so the eager re-run is side-effect-free);
