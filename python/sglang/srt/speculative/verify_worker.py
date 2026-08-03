@@ -248,6 +248,10 @@ class VerifyWorker(BaseVerifyWorker):
         # per-bs placeholder unit buffers; the select overwrites them in place.
         self._verify_prep_ahead = envs.SGLANG_ENABLE_DECOUPLED_VERIFY_PREP_AHEAD.get()
         self._placeholder_units: dict[int, torch.Tensor] = {}
+        # Post-gate select as one captured graph (TP1 + prep-ahead only);
+        # built in alloc_memory_pool once the enum buffer exists. None = the
+        # eager select path.
+        self._select_graph = None
         self.select_hits_queue: deque[torch.Tensor] = deque()
         # C6 launch gate, injected by DecoupledVerifyManager: called with the
         # batch at decode-launch, before the select gather, to (boundedly)
@@ -275,6 +279,22 @@ class VerifyWorker(BaseVerifyWorker):
             verifier_rank=self.server_args.decoupled_spec_rank,
             enable_overlap=False,
         )
+        if (
+            envs.SGLANG_ENABLE_DECOUPLED_SELECT_GRAPH.get()
+            and self._verify_prep_ahead
+            and self._tp_size == 1
+        ):
+            from sglang.srt.speculative.decoupled_select_graph import (
+                SelectGraphRunner,
+            )
+
+            self._select_graph = SelectGraphRunner(
+                enum_buffer=self.enum_buffer,
+                num_cases=self.speculative_num_steps + 1,
+                fanout=self.speculative_fanout,
+                unit_width=self.speculative_num_draft_tokens,
+                device=self.device,
+            )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
@@ -297,7 +317,9 @@ class VerifyWorker(BaseVerifyWorker):
             select_input = batch.spec_info
             verify_input, prepared_verify = self._prepare_verify_prelude(batch)
             self.select_gate(batch)
-            selected = self._select_units_tp_safe(batch, select_input)
+            selected = self._select_units_graph(batch, select_input)
+            if selected is None:
+                selected = self._select_units_tp_safe(batch, select_input)
             verify_input.draft_token.copy_(selected.view(-1))
             batch.spec_info = verify_input
         else:
@@ -379,6 +401,29 @@ class VerifyWorker(BaseVerifyWorker):
             fanout=self.speculative_fanout,
             unit_width=self.speculative_num_draft_tokens,
         )
+
+    def _select_units_graph(
+        self, batch: ScheduleBatch, select_input: EnumSelectInput
+    ) -> Optional[torch.Tensor]:
+        """One captured-graph select round (TP1 fast path), or None to fall
+        back to the eager select (runner off, or this bucket's capture
+        failed)."""
+        if self._select_graph is None:
+            return None
+        with profile_range("verifier.select_graph"):
+            got = self._select_graph.run(
+                req_pool_indices=batch.req_pool_indices,
+                bonus_tokens=select_input.bonus_tokens,
+                prev_accept_lens=select_input.prev_accept_lens,
+                base_committed_lens=select_input.base_committed_lens,
+            )
+        if got is None:
+            return None
+        selected, hits = got
+        # The graph's hits output is a static buffer the next replay
+        # overwrites; the accounting hook consumes deferred, so queue a copy.
+        self.select_hits_queue.append(hits.clone())
+        return selected
 
     def _select_units_tp_safe(
         self, batch: ScheduleBatch, select_input: EnumSelectInput

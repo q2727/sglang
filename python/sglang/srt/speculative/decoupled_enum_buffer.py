@@ -139,10 +139,16 @@ class DecoupledEnumBuffer:
         ]
 
     @property
-    def _read_slot(self) -> int:
+    def read_slot(self) -> int:
         # Single buffer: daemon and forward share one slot (SYNC). Double buffer:
-        # the forward reads the slot the daemon is not writing.
+        # the forward reads the slot the daemon is not writing. Public because
+        # the select graph keys its capture buckets on it (a record-time
+        # Python value; each slot needs its own recorded graph).
         return self._write_slot if self.buf_count == 1 else 1 - self._write_slot
+
+    @property
+    def _read_slot(self) -> int:
+        return self.read_slot
 
     def land(self, block: DraftEnumerationBufferBatch) -> None:
         """Scatter a block's rows + stamps into the seats its pool_indices name.

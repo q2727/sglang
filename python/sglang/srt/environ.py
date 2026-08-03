@@ -442,6 +442,13 @@ class Envs:
     # topk == 1 the tree mask/positions never depend on token values; the
     # selected units land via draft_token.copy_. False restores prep-after-gate.
     SGLANG_ENABLE_DECOUPLED_VERIFY_PREP_AHEAD = EnvBool(True)
+    # Decoupled spec: capture the verifier's post-gate enum select (buffer
+    # gather + generation match + unit pick + fallback blend) as one CUDA
+    # graph per (bs, read-slot) bucket, shrinking the post-gate host work to
+    # static-buffer fills + one replay. Requires verify prep-ahead; TP == 1
+    # only (the TP path keeps the eager select + broadcast). Capture failure
+    # falls back to the eager select permanently. Default off until gated.
+    SGLANG_ENABLE_DECOUPLED_SELECT_GRAPH = EnvBool(False)
     # Decoupled spec: spend the drafter's enumeration columns per accept case
     # instead of uniformly. Case a < K is only reached by verify REJECTING
     # backbone token c_{a+1}, so its bonus is a rank-2+ candidate, while case
