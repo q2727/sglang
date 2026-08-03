@@ -1222,6 +1222,12 @@ def general_mm_embed_routine(
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
+            # A draft-extend window holds generated tokens only, never
+            # multimodal placeholders, so there is nothing to embed -- and it
+            # carries no per-request CPU length mirror to place them by. Same
+            # exclusion the MTP heads already make (see Qwen3_5ForCausalLMMTP);
+            # it applies here once a draft model runs the full VLM routine.
+            and not forward_batch.forward_mode.is_draft_extend_v2()
             and forward_batch.contains_mm_inputs()
         ):
             mm_inputs_list = [

@@ -33,11 +33,18 @@ before their extend, branch rows take boundary tail + delta + case backbone
 from the seat / their glue row after it -- rows x O(P) tokens, two batched
 copies per fast round, trivially cheap next to a forward. Frees are
 page-granular: committed truncation (prerun rollback, close) releases only
-pages fully past the cut, and the round-end scratch free excludes arena
-pages (the allocator frees whole pages, and extend/decode continuation slots
-land inside pages the arena still owns). At P == 1 the page floor equals the
-committed length, boundary tails are always empty, and every path
-degenerates to the original full slot-id sharing with zero copies.
+pages fully past the cut, and the round-end scratch free hands back only the
+round's THROWAWAY pages -- the allocator frees whole pages, and extend/decode
+continuation slots land inside pages the engine's arena still owns. Which
+pages those are is bookkept on the HOST as the round allocates (a page comes
+off the global free list exactly when the position being filled starts one;
+see ``_track_scratch_slots``), never recomputed from the slot ids at the
+round tail: reading device-resident slot ids there (unique / boolean mask)
+drains the whole round's GPU chain before the CPU may start the next round.
+A steady-state paged round hands back nothing at all. At P == 1 the page
+floor equals the committed length, boundary tails are always empty, and
+every path degenerates to the original full slot-id sharing with zero
+copies.
 
 All scratch state (rows + KV slots written for backbone / branch tokens) is
 freed at the end of the round: a wrong branch is never selected, and the next
@@ -94,9 +101,11 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.decoupled_fused_ops import fused_guess_topk
 from sglang.srt.speculative.decoupled_spec_io import DraftReqKey
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.nvtx_utils import profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
@@ -124,12 +133,62 @@ class _ScratchTreeCache(SimpleNamespace):
         pass
 
 
+class _ExtendCaseStaging(msgspec.Struct):
+    """One accept case's device staging for the fused-extend graph replay,
+    prebuilt in the idle window (everything here depends only on
+    (base_lens, delta_len, carrier layout) -- never on token values)."""
+
+    gather: torch.Tensor  # [rows * W] int64 source-gather indices
+    out_cache_loc: torch.Tensor  # [rows * W] int64 write slots
+    true_lens: torch.Tensor  # [rows] int32 device (GDN plane's true lengths)
+    true_lens_host: list[int]
+    node_gather: torch.Tensor  # [rows] int64 node-logit offsets
+    node_offsets: list[int]
+
+
+class _PrebuiltFastRound(msgspec.Struct):
+    """A fast round's allocation + batch skeleton, built in the idle window.
+
+    The delta is hypothesized at its K+1 maximum: allocation counts and the
+    page-table writes are position-stable, so any actual case a consumes the
+    per-seat prefix of ``slots`` and returns the leftover page HEADS to
+    scratch (a page shared with absorbed prefix slots has its head before the
+    leftover range and is never freed -- the ``_track_scratch_slots`` rule).
+    Token values are filled post-commit via pinned staging; the placeholder
+    input_ids in ``batch`` are never read on the graph path.
+    """
+
+    keys: tuple
+    base_lens: list[int]
+    batch: ScheduleBatch
+    slots: torch.Tensor  # [bs * (K+1)] seat-major
+    slot_positions: list[int]  # logical positions, aligned with ``slots``
+    graph_round: _ExtendGraphRound
+    scratch_batches: list
+    scratch_slots: list
+    scratch_kv_pages: list
+    # Glue-head COW + glue mamba fork already ran at idle time: both are
+    # case-independent (tail span = [page_floor(base), base); fork source =
+    # the seat's post-absorb state, stable until the next round).
+    glue_seeded: bool = False
+    # bs == 1 only: per-case fused-extend staging, indexed by delta_len - 1.
+    case_staging: Optional[list] = None
+
+
 class _RoundProfiler:
     """Per-phase host-time accumulator for the enumeration round.
 
     Syncs the device at every mark so each phase's wall time is attributed
     exactly -- which also serializes host and GPU work. Numbers are for
     relative breakdown, not absolute round latency (debug only).
+
+    Independently of that (and without any sync), ``stage()`` opens a
+    ``profile_range`` so a trace shows named ``drafter.<stage>`` bands over the
+    round's kernels, alongside the ``step[...]`` spans the model runner emits.
+    ``profile_range`` is the engine-wide annotation entry point: it returns a
+    shared no-op unless a torch profiler is active (or nvtx is enabled), so the
+    round stays annotated unconditionally and pays one flag check when it isn't
+    being profiled.
     """
 
     def __init__(self, *, enabled: bool) -> None:
@@ -137,6 +196,11 @@ class _RoundProfiler:
         self.round_ct = 0
         self.phase_ms: dict[str, float] = {}
         self._t_last = 0.0
+
+    @staticmethod
+    def stage(name: str):
+        """Name a round stage for the trace (no device sync)."""
+        return profile_range(f"drafter.{name.replace('-', '_')}")
 
     def start_round(self) -> None:
         if not self.enabled:
@@ -166,6 +230,69 @@ class _RoundProfiler:
         ]
         total = sum(self.phase_ms.values()) / self.round_ct
         return f"rounds={self.round_ct} total_ms={total:.2f} | " + " ".join(parts)
+
+
+class _PinnedH2D:
+    """Async host-to-device staging for the small index/length tensors a round builds.
+
+    ``torch.tensor(values, device=cuda)`` -- and ``torch.tensor(values).to(cuda,
+    non_blocking=True)``, whose ``non_blocking`` is a no-op on unpinned memory --
+    both issue a SYNCHRONOUS pageable copy. Such a copy does not merely wait for
+    its own bytes: it blocks the host until everything already queued on the
+    stream has drained, so each one is a full pipeline barrier. Profiles put them
+    at ~500us apiece, 4-5 per round, inside stages that are otherwise a single
+    graph replay.
+
+    Staging through pinned memory keeps the copy asynchronous. Buffers rotate so
+    one is never rewritten while its copy may still be in flight, and the event
+    recorded per slot makes that safe rather than merely likely -- a slot only
+    comes back around after ``_RING`` further calls, by which point the wait is a
+    no-op in steady state.
+    """
+
+    # A round stages ~12 of these (gather, seq_lens x K, true_lens, node_gather,
+    # prefix_lens, scratch heads), so a ring of 64 puts a slot's reuse five
+    # rounds out and the guard wait stays a no-op (32 still showed ~2 waits of
+    # ~80us per round in traces).
+    _RING = 64
+
+    def __init__(self, *, device: str) -> None:
+        self.device = device
+        self.enabled = envs.SGLANG_ENABLE_DECOUPLED_PINNED_H2D.get()
+        self._buffers: list[dict[torch.dtype, torch.Tensor]] = [
+            {} for _ in range(self._RING)
+        ]
+        self._events = [torch.cuda.Event() for _ in range(self._RING)]
+        self._in_flight = [False] * self._RING
+        self._next = 0
+
+    def to_device(self, values, *, dtype: torch.dtype) -> torch.Tensor:
+        """Copy a host list (or CPU tensor) to the device without a barrier."""
+        host_src = values if isinstance(values, torch.Tensor) else None
+        n = host_src.numel() if host_src is not None else len(values)
+        if n == 0:
+            return torch.empty(0, dtype=dtype, device=self.device)
+        if not self.enabled:
+            return torch.as_tensor(values, dtype=dtype).to(self.device)
+
+        slot = self._next
+        self._next = (slot + 1) % self._RING
+        if self._in_flight[slot]:
+            self._events[slot].synchronize()
+
+        staging = self._buffers[slot].get(dtype)
+        if staging is None or staging.numel() < n:
+            staging = torch.empty(max(n, 64), dtype=dtype, pin_memory=True)
+            self._buffers[slot][dtype] = staging
+
+        view = staging[:n]
+        if host_src is None:
+            host_src = torch.as_tensor(values, dtype=dtype)
+        view.copy_(host_src)  # host-to-host, no device involvement
+        out = view.to(self.device, non_blocking=True)
+        self._events[slot].record()
+        self._in_flight[slot] = True
+        return out
 
 
 class _DraftReqState:
@@ -420,15 +547,14 @@ class _KVPageArena:
     """Engine-owned KV page free-list in front of the paged allocator
     (page_size > 1 only) -- the mamba arena's twin for physical KV pages.
 
-    Carrier rows need PRIVATE pages whose slots the engine binds manually
-    (fast-path page tables and out_cache_loc are engine-built), and the
-    round-end scratch free is page-granular: ``PagedTokenToKVPoolAllocator
-    .free`` releases the WHOLE page containing any freed slot, while extend /
-    decode continuation slots land INSIDE pages this arena still owns.
-    ``owned_pages`` (grow-only, tiny) is the membership set the scratch free
-    filters against so an arena page is never handed back to the global pool
-    behind the arena's back. Ids are physical page ids (slot // page_size);
-    take/give_back never sync.
+    Every page the engine binds by hand goes through here: carrier rows need
+    PRIVATE pages whose slots the engine writes into page tables and
+    out_cache_loc itself, and a graph round's seat pad tail needs throwaway
+    junk pages with the same in-page-offset geometry. Recycling them inside
+    the engine (rather than allocating and freeing per round) is also what
+    keeps the round tail free of device reads: ``PagedTokenToKVPoolAllocator
+    .free`` uniques its input on the device, which synchronizes. Ids are
+    physical page ids (slot // page_size); take/give_back never sync.
     """
 
     def __init__(self, *, allocator, page_size: int, sizing_hint: str) -> None:
@@ -436,9 +562,20 @@ class _KVPageArena:
         self._page_size = page_size
         self._sizing_hint = sizing_hint
         self._free_pages: Optional[torch.Tensor] = None
-        self.owned_pages = torch.empty((0,), dtype=torch.int64, device=allocator.device)
 
     def take(self, num_pages: int) -> torch.Tensor:
+        pages = self.take_optional(num_pages)
+        if pages is None:
+            raise RuntimeError(
+                "drafter KV page arena exhausted "
+                f"(want {num_pages} pages, "
+                f"{self._allocator.available_size()} tokens free in the "
+                f"pool allocator); {self._sizing_hint}"
+            )
+        return pages
+
+    def take_optional(self, num_pages: int) -> Optional[torch.Tensor]:
+        """``take`` for callers with a fallback path (None on exhaustion)."""
         free = self._free_pages
         num_free = 0 if free is None else free.numel()
         if num_pages == 0:
@@ -449,15 +586,9 @@ class _KVPageArena:
             grow = num_pages - num_free
             slots = self._allocator.alloc(grow * self._page_size)
             if slots is None:
-                raise RuntimeError(
-                    "drafter KV page arena exhausted "
-                    f"(want {grow} more pages, "
-                    f"{self._allocator.available_size()} tokens free in the "
-                    f"pool allocator); {self._sizing_hint}"
-                )
+                return None
             # alloc is page-aligned: row k of the [grow, P] view is one page.
             grown = slots.view(grow, self._page_size)[:, 0] // self._page_size
-            self.owned_pages = torch.cat([self.owned_pages, grown])
             free = grown if free is None else torch.cat([free, grown])
         taken = free[:num_pages]
         self._free_pages = free[num_pages:]
@@ -550,10 +681,10 @@ class _ExtendGraphRound(msgspec.Struct):
 
     page_size > 1: glue rows already own private arena pages wide enough for
     W (span_max = P - 1 + W by construction); only the seat row's pad tail
-    needs ``seat_pad_flats`` [bs, pad_span] -- page-aligned throwaway
-    allocator pages expanded to flat slots (column q holds in-page offset
-    q % P, preserving the offset == logical-position invariant paged tables
-    are derived from).
+    needs ``seat_pad_flats`` [bs, pad_span] -- whole junk pages borrowed from
+    the engine's page arena for the round, expanded to flat slots (column q
+    holds in-page offset q % P, preserving the offset == logical-position
+    invariant paged tables are derived from).
     """
 
     w_slots: Optional[torch.Tensor]
@@ -640,8 +771,12 @@ class EnumDraftEngine:
             self._pages_per_carrier_row = (
                 span_max + self._page_size - 1
             ) // self._page_size
+            # Carrier rows + the slow round's backbone transient + a graph
+            # round's per-seat pad tail, which spans a boundary tail plus the
+            # static W = 2K + 1 -- the same worst case, so the same page count
+            # (see _extend_graph_pad_span).
             pages_per_seat = (
-                self.num_steps + (self.num_steps + 1) * self.fanout
+                self.num_steps + (self.num_steps + 1) * self.fanout + 1
             ) * self._pages_per_carrier_row + 1
             self._kv_page_arena = _KVPageArena(
                 allocator=model_runner.token_to_kv_pool_allocator,
@@ -731,6 +866,7 @@ class EnumDraftEngine:
             if self._paged
             else 0
         )
+        self._extend_graph_pad_pages = self._extend_graph_pad_span // self._page_size
         self._extend_graph_disable_padding = bool(
             model_runner.server_args.disable_cuda_graph_padding
         )
@@ -772,6 +908,21 @@ class EnumDraftEngine:
         self.profiler = _RoundProfiler(
             enabled=envs.SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE.get()
         )
+        self._h2d = _PinnedH2D(device=self.device)
+        self._pending_scratch_frees: list[torch.Tensor] = []
+        self._fused_topk = envs.SGLANG_ENABLE_DECOUPLED_FUSED_TOPK.get()
+        self._prep_ahead = envs.SGLANG_ENABLE_DECOUPLED_PREP_AHEAD.get()
+        self._chain_plan = envs.SGLANG_ENABLE_DECOUPLED_CHAIN_PLAN.get()
+        self._chain_graph = None
+        if self._chain_plan and envs.SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH.get():
+            from sglang.srt.speculative.decoupled_chain_graph import (
+                ChainGraphRunner,
+            )
+
+            self._chain_graph = ChainGraphRunner(
+                model_runner=self.model_runner, num_steps=self.num_steps
+            )
+        self._prebuilt_fast: Optional[_PrebuiltFastRound] = None
 
     # ------------------------------------------------------------------ #
     # Fused-extend CUDA graph: construction (init-time)
@@ -1129,6 +1280,7 @@ class EnumDraftEngine:
             raise
 
     def close(self, key: DraftReqKey) -> None:
+        self.drop_prebuilt_for(key)
         self._evict_seat(key)
         state = self._states.pop(key, None)
         if state is None:
@@ -1209,6 +1361,15 @@ class EnumDraftEngine:
                     slow_keys.append(key)
                     slow_states.append(state)
             f_live = max(1, min(int(self.effective_fanout), self.fanout))
+            if self._prebuilt_fast is not None and not hit_states:
+                # A miss/bootstrap round for these seats invalidates the
+                # hypothesized skeleton (committed lengths move); fold it in
+                # for the round-tail free.
+                pre = self._prebuilt_fast
+                self._prebuilt_fast = None
+                self._scrap_prebuilt_into(
+                    pre, scratch_batches, scratch_slots, scratch_kv_pages
+                )
             parts: list[dict] = []
             if hit_states:
                 self.hit_ct += 1
@@ -1219,6 +1380,7 @@ class EnumDraftEngine:
                         selections,
                         scratch_batches,
                         scratch_slots,
+                        scratch_kv_pages,
                         f_live=f_live,
                     )
                 )
@@ -1231,6 +1393,7 @@ class EnumDraftEngine:
                         case0_states,
                         scratch_batches,
                         scratch_slots,
+                        scratch_kv_pages,
                         f_live=f_live,
                     )
                 )
@@ -1259,9 +1422,13 @@ class EnumDraftEngine:
                 "units_device": torch.cat([part["units_device"] for part in parts]),
             }
         finally:
-            self._free_scratch(
-                scratch_batches, scratch_slots, scratch_mamba_slots, scratch_kv_pages
-            )
+            with self.profiler.stage("free-scratch"):
+                self._free_scratch(
+                    scratch_batches,
+                    scratch_slots,
+                    scratch_mamba_slots,
+                    scratch_kv_pages,
+                )
             self.profiler.mark("free")
 
     def _match_seat(
@@ -1379,6 +1546,7 @@ class EnumDraftEngine:
         selections: list[tuple[int, int]],
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
+        scratch_kv_pages: list[torch.Tensor],
         *,
         f_live: int,
     ) -> dict:
@@ -1419,19 +1587,61 @@ class EnumDraftEngine:
         # Graph-vs-eager is decided HERE, before any carrier state is
         # written: the two paths bind different page tables / write slots and
         # must never mix within a round.
-        graph_round = self._stage_extend_graph_round(
-            bs=bs,
-            delta_lens=delta_lens,
-            scratch_slots=scratch_slots,
-            rows_per_seat=self.num_steps + 1,
-        )
-        advance_batch, advance_slots = self._extend_batch(
-            token_lists=[state.committed_tokens for state in states],
-            prefix_slots=[state.committed_slots for state in states],
-            tag="advance",
-            mamba_slots=self._seat_mamba_slots(states),
-        )
+        seat_input_ids: Optional[torch.Tensor] = None
+        glue_preseeded = False
+        prestaged_case: Optional[_ExtendCaseStaging] = None
+        with self.profiler.stage("alloc-seat"):
+            prebuilt = self._prebuilt_fast
+            if (
+                prebuilt is not None
+                and prebuilt.keys == tuple(keys)
+                and prebuilt.base_lens == base_lens
+                and self._enable_fused_extend
+            ):
+                # Idle-window skeleton: allocation + page-table writes already
+                # happened; fill the actual delta tokens and go.
+                self._prebuilt_fast = None
+                glue_preseeded = prebuilt.glue_seeded
+                graph_round = prebuilt.graph_round
+                advance_batch = prebuilt.batch
+                scratch_batches.extend(prebuilt.scratch_batches)
+                scratch_slots.extend(prebuilt.scratch_slots)
+                scratch_kv_pages.extend(prebuilt.scratch_kv_pages)
+                advance_slots, seat_input_ids = self._consume_prebuilt(
+                    prebuilt,
+                    states=states,
+                    base_lens=base_lens,
+                    delta_lens=delta_lens,
+                    scratch_slots=scratch_slots,
+                )
+                if (
+                    prebuilt.case_staging is not None
+                    and bs == 1
+                    and 1 <= delta_lens[0] <= len(prebuilt.case_staging)
+                ):
+                    prestaged_case = prebuilt.case_staging[delta_lens[0] - 1]
+            else:
+                if prebuilt is not None:
+                    self._prebuilt_fast = None
+                    self._scrap_prebuilt_into(
+                        prebuilt, scratch_batches, scratch_slots, scratch_kv_pages
+                    )
+                graph_round = self._stage_extend_graph_round(
+                    bs=bs,
+                    delta_lens=delta_lens,
+                    scratch_slots=scratch_slots,
+                    scratch_kv_pages=scratch_kv_pages,
+                    rows_per_seat=self.num_steps + 1,
+                )
+                advance_batch, advance_slots = self._extend_batch(
+                    token_lists=[state.committed_tokens for state in states],
+                    prefix_slots=[state.committed_slots for state in states],
+                    tag="advance",
+                    mamba_slots=self._seat_mamba_slots(states),
+                )
         scratch_batches.append(advance_batch)
+        if seat_input_ids is None:
+            seat_input_ids = advance_batch.input_ids
         if not self._enable_fused_extend:
             node0_logits = self._forward(advance_batch, tag="advance")
             # Graph-runner logits live in a static output buffer that the NEXT
@@ -1449,22 +1659,24 @@ class EnumDraftEngine:
         # this round's backbone slots into the glue triangle + branch cases.
         # (page_size > 1 dispatches to the private-page rebind instead and
         # returns None -- backbone KV then lives per row, never shared.)
-        backbone_slots = self._sync_carrier_rows(
-            states=states,
-            carriers=carriers,
-            base_lens=base_lens,
-            variant=variant,
-            f_live=f_live,
-            scratch_slots=scratch_slots,
-            graph_round=graph_round,
-        )
-        if self._paged:
-            # Seed the glue rows' private heads before the forward reads them.
-            self._cow_carrier_glue_heads(
-                states=states, carriers=carriers, base_lens=base_lens
+        with self.profiler.stage("page-table-sync"):
+            backbone_slots = self._sync_carrier_rows(
+                states=states,
+                carriers=carriers,
+                base_lens=base_lens,
+                variant=variant,
+                f_live=f_live,
+                scratch_slots=scratch_slots,
+                graph_round=graph_round,
             )
+        if self._paged and not glue_preseeded:
+            # Seed the glue rows' private heads before the forward reads them.
+            with self.profiler.stage("cow-glue-heads"):
+                self._cow_carrier_glue_heads(
+                    states=states, carriers=carriers, base_lens=base_lens
+                )
 
-        if self._hybrid:
+        if self._hybrid and not glue_preseeded:
             # All K glue rows fork their state from the SEAT slot before the
             # forward that runs them; what the copy HOLDS differs by mode.
             # Fused: the seat slot still carries the PRE-advance state
@@ -1475,12 +1687,15 @@ class EnumDraftEngine:
             # re-scans only c_1..c_{g+1} (see _glue_forward). Either way glue
             # row g's slot ends its forward holding node-(g+1) state, so the
             # branch fork below is mode-blind.
-            self._fork_mamba_states(
-                src_slots=torch.cat(
-                    [state.mamba_slot.repeat(num_steps) for state in states]
-                ),
-                dst_slots=torch.cat([carrier.glue_mamba_slots for carrier in carriers]),
-            )
+            with self.profiler.stage("gdn-fork-glue"):
+                self._fork_mamba_states(
+                    src_slots=torch.cat(
+                        [state.mamba_slot.repeat(num_steps) for state in states]
+                    ),
+                    dst_slots=torch.cat(
+                        [carrier.glue_mamba_slots for carrier in carriers]
+                    ),
+                )
             if envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
                 self._log_mamba_state_nan(
                     tag="post-fork",
@@ -1493,18 +1708,22 @@ class EnumDraftEngine:
             # tokens are the matched commit's winning unit -- KNOWN values,
             # never derived from the advance's logits -- so the two phases
             # have no data dependency; per-seat row r yields node-r logits.
-            fused_logits = self._fused_extend_forward(
-                carriers=carriers,
-                chains=chains,
-                backbone_slots=backbone_slots,
-                seat_reqs=advance_batch.reqs,
-                seat_rows=advance_batch.req_pool_indices,
-                seat_input_ids=advance_batch.input_ids,
-                seat_delta_slots=advance_slots,
-                base_lens=base_lens,
-                delta_lens=delta_lens,
-                graph_round=graph_round,
-            )
+            with self.profiler.stage(
+                "extend-graph" if graph_round is not None else "extend-eager"
+            ):
+                fused_logits = self._fused_extend_forward(
+                    carriers=carriers,
+                    chains=chains,
+                    backbone_slots=backbone_slots,
+                    seat_reqs=advance_batch.reqs,
+                    seat_rows=advance_batch.req_pool_indices,
+                    seat_input_ids=seat_input_ids,
+                    seat_delta_slots=advance_slots,
+                    base_lens=base_lens,
+                    delta_lens=delta_lens,
+                    graph_round=graph_round,
+                    prestaged=prestaged_case,
+                )
             if self._hybrid and envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
                 self._log_mamba_state_nan(
                     tag="post-fused",
@@ -1512,16 +1731,25 @@ class EnumDraftEngine:
                         [states[0].mamba_slot, carriers[0].glue_mamba_slots]
                     ),
                 )
-            fused_view = fused_logits.view(bs, num_steps + 1, -1)
-            # Consume the static logits buffer (mask + topk) before the first
-            # branch replay overwrites it. Node a's dead token is c_{a+1}, so
-            # rows 0..K-1 mask c_1..c_K; node K keeps its full top-F (a full
-            # accept's bonus is unconstrained).
-            if chains_mat is not None:
-                fused_view[:, :num_steps].scatter_(
-                    -1, chains_mat.unsqueeze(-1), float("-inf")
-                )
-            guesses_stack = torch.topk(fused_view, guess_width, dim=-1).indices
+            with self.profiler.stage("guess-topk"):
+                # Consume the static logits buffer (mask + topk) before the
+                # first branch replay overwrites it. Node a's dead token is
+                # c_{a+1}, so rows 0..K-1 mask c_1..c_K; node K keeps its full
+                # top-F (a full accept's bonus is unconstrained).
+                if self._fused_topk:
+                    guesses_stack = fused_guess_topk(
+                        fused_logits,
+                        chains_mat,
+                        nodes=num_steps + 1,
+                        width=guess_width,
+                    ).view(bs, num_steps + 1, guess_width)
+                else:
+                    fused_view = fused_logits.view(bs, num_steps + 1, -1)
+                    if chains_mat is not None:
+                        fused_view[:, :num_steps].scatter_(
+                            -1, chains_mat.unsqueeze(-1), float("-inf")
+                        )
+                    guesses_stack = torch.topk(fused_view, guess_width, dim=-1).indices
         else:
             # -- Glue extend: all K backbone tokens in one forward = node 1..K
             # logits; their KV lands in this round's backbone slots (page 1)
@@ -1558,9 +1786,13 @@ class EnumDraftEngine:
             # exist only in the seat's partial page and the glue rows'
             # private pages -- copy each selected row's head into its own
             # pages before the chain decodes read them.
-            self._cow_carrier_branch_heads(
-                states=states, carriers=carriers, base_lens=base_lens, variant=variant
-            )
+            with self.profiler.stage("cow-branch-heads"):
+                self._cow_carrier_branch_heads(
+                    states=states,
+                    carriers=carriers,
+                    base_lens=base_lens,
+                    variant=variant,
+                )
 
         # -- Branch chains: K decode replays on the assembled carrier rows.
         if self._hybrid:
@@ -1568,39 +1800,42 @@ class EnumDraftEngine:
             # a == 0, glue row (a-1)'s slot otherwise (its re-scan ended
             # exactly at node a). One batched fork for all selected rows; the
             # chain decode steps then advance the branch slots in place.
-            self._fork_mamba_states(
-                src_slots=torch.cat(
-                    [
-                        torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
-                            variant.case_of_row_dev
+            with self.profiler.stage("gdn-fork-branch"):
+                self._fork_mamba_states(
+                    src_slots=torch.cat(
+                        [
+                            torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
+                                variant.case_of_row_dev
+                            ]
+                            for state, carrier in zip(states, carriers)
                         ]
-                        for state, carrier in zip(states, carriers)
-                    ]
-                ),
-                dst_slots=torch.cat(
-                    [
-                        carrier.branch_mamba_slots[variant.sel_rows_dev]
-                        for carrier in carriers
-                    ]
+                    ),
+                    dst_slots=torch.cat(
+                        [
+                            carrier.branch_mamba_slots[variant.sel_rows_dev]
+                            for carrier in carriers
+                        ]
+                    ),
+                )
+        with self.profiler.stage("branch-chain"):
+            chain_steps = self._branch_decode_chain(
+                carriers=carriers,
+                states=states,
+                branch_guesses=branch_guesses,
+                backbone_slots=backbone_slots,
+                scratch_slots=scratch_slots,
+                variant=variant,
+            )
+        with self.profiler.stage("pack-block"):
+            return self._pack_and_mirror(
+                states=states,
+                guesses_stack=guesses_stack,
+                chain_steps=chain_steps,
+                new_backbones=new_backbones,
+                sel_rows_dev=(
+                    None if variant.guess_dead_mask is None else variant.sel_rows_dev
                 ),
             )
-        chain_steps = self._branch_decode_chain(
-            carriers=carriers,
-            states=states,
-            branch_guesses=branch_guesses,
-            backbone_slots=backbone_slots,
-            scratch_slots=scratch_slots,
-            variant=variant,
-        )
-        return self._pack_and_mirror(
-            states=states,
-            guesses_stack=guesses_stack,
-            chain_steps=chain_steps,
-            new_backbones=new_backbones,
-            sel_rows_dev=(
-                None if variant.guess_dead_mask is None else variant.sel_rows_dev
-            ),
-        )
 
     def _sync_carrier_rows(
         self,
@@ -1649,6 +1884,8 @@ class EnumDraftEngine:
         )
         if backbone_slots is None:
             raise RuntimeError("drafter KV pool exhausted (glue backbone)")
+        # P == 1 only (the paged / graph rounds returned above), so a plain
+        # slot-list free is the round-end contract here.
         scratch_slots.append(backbone_slots)
         backbone_slots = backbone_slots.view(bs, num_steps)
         for i, (state, carrier) in enumerate(zip(states, carriers)):
@@ -1800,6 +2037,7 @@ class EnumDraftEngine:
         base_lens: list[int],
         delta_lens: list[int],
         graph_round: Optional[_ExtendGraphRound],
+        prestaged: Optional[_ExtendCaseStaging] = None,
     ) -> torch.Tensor:
         """Advance + glue as ONE batched extend (the fast round's fusion).
 
@@ -1835,6 +2073,7 @@ class EnumDraftEngine:
                 base_lens=base_lens,
                 delta_lens=delta_lens,
                 graph_round=graph_round,
+                prestaged=prestaged,
             )
             if not envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_DIFF.get():
                 return graph_logits
@@ -1906,7 +2145,7 @@ class EnumDraftEngine:
             )
             src_offset += delta_len + num_steps
             delta_offset += delta_len
-        gather = torch.tensor(gather_rows, dtype=torch.int64, device=self.device)
+        gather = self._h2d.to_device(gather_rows, dtype=torch.int64)
         fused.input_ids = torch.cat(src_id_pieces)[gather]
         if self._paged:
             fused.out_cache_loc = self._fused_out_cache_loc_paged(
@@ -1919,7 +2158,7 @@ class EnumDraftEngine:
             fused.out_cache_loc = torch.cat(src_slot_pieces)[gather]
         fused.extend_num_tokens = len(gather_rows)
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
-        fused.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        fused.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
         fused.seq_lens_cpu = seq_cpu
         fused.seq_lens_sum = sum(seq_host)
         fused.orig_seq_lens = fused.seq_lens.to(torch.int32)
@@ -1995,6 +2234,7 @@ class EnumDraftEngine:
         bs: int,
         delta_lens: list[int],
         scratch_slots: list[torch.Tensor],
+        scratch_kv_pages: list[torch.Tensor],
         rows_per_seat: int,
     ) -> Optional[_ExtendGraphRound]:
         """Decide graph vs eager for this round and stage the pad slots.
@@ -2007,7 +2247,7 @@ class EnumDraftEngine:
         or construction failure), a delta outside the padded window
         (defensive; catch-up merges miss the glue fast path anyway, and an
         empty delta has no last real token to pad with), a row count over the
-        captured buckets, or KV-pool exhaustion on the pad staging (the eager
+        captured buckets, or page exhaustion on the pad staging (the eager
         path needs fewer slots).
         """
         if self._extend_graph_runner is None:
@@ -2025,21 +2265,28 @@ class EnumDraftEngine:
         ):
             return None
         if self._paged:
-            pad_slots = self.model_runner.token_to_kv_pool_allocator.alloc(
-                bs * self._extend_graph_pad_span
+            # Arena pages, not a fresh allocator alloc: the pad tail is pure
+            # per-round scratch, and recycling it through the arena is what
+            # leaves a steady-state paged round with nothing to hand back to
+            # the allocator (and so no device read) at the round tail.
+            pad_pages = self._kv_page_arena.take_optional(
+                bs * self._extend_graph_pad_pages
             )
-            if pad_slots is None:
+            if pad_pages is None:
                 return None
-            scratch_slots.append(pad_slots)
+            scratch_kv_pages.append(pad_pages)
             return _ExtendGraphRound(
                 w_slots=None,
-                seat_pad_flats=pad_slots.view(bs, self._extend_graph_pad_span),
+                seat_pad_flats=self._page_flat_slots(
+                    pad_pages.view(bs, self._extend_graph_pad_pages)
+                ),
             )
         w_slots = self.model_runner.token_to_kv_pool_allocator.alloc(
             rows * self._extend_graph_width
         )
         if w_slots is None:
             return None
+        # P == 1 only (the paged branch returned above): plain slot-list free.
         scratch_slots.append(w_slots)
         return _ExtendGraphRound(
             w_slots=w_slots.view(bs, rows_per_seat, self._extend_graph_width),
@@ -2182,6 +2429,7 @@ class EnumDraftEngine:
         base_lens: list[int],
         delta_lens: list[int],
         graph_round: _ExtendGraphRound,
+        prestaged: Optional[_ExtendCaseStaging] = None,
     ) -> tuple[ScheduleBatch, list[int], list[int]]:
         """Bind the fused shell for a graph round (uniform W-token rows) and
         return (shell, per-row true lengths, per-node flat logit offsets).
@@ -2220,40 +2468,47 @@ class EnumDraftEngine:
         ]
         # Row contents: one padded gather over the [delta | chain] source per
         # seat; the true row lengths (GDN plane) and the node-logit end
-        # offsets ride the same loop.
-        src_id_pieces: list[torch.Tensor] = []
-        gather_rows: list[int] = []
-        true_lens_host: list[int] = []
-        node_offsets: list[int] = []
-        src_offset = 0
-        delta_offset = 0
-        for i in range(bs):
-            delta_len = delta_lens[i]
-            src_id_pieces.append(
-                seat_input_ids[delta_offset : delta_offset + delta_len]
+        # offsets ride the same loop. Idle-prebuilt case staging (bs == 1)
+        # short-circuits the whole build: only token VALUES flow in here.
+        if prestaged is not None:
+            fused.input_ids = torch.cat([seat_input_ids, chains[0]])[prestaged.gather]
+            fused.out_cache_loc = prestaged.out_cache_loc
+            true_lens_host = prestaged.true_lens_host
+            node_offsets = prestaged.node_offsets
+        else:
+            src_id_pieces: list[torch.Tensor] = []
+            gather_rows: list[int] = []
+            true_lens_host = []
+            node_offsets = []
+            src_offset = 0
+            delta_offset = 0
+            for i in range(bs):
+                delta_len = delta_lens[i]
+                src_id_pieces.append(
+                    seat_input_ids[delta_offset : delta_offset + delta_len]
+                )
+                src_id_pieces.append(chains[i])
+                gather_rows.extend(
+                    src_offset + entry
+                    for entry in self._extend_graph_gather_pattern(delta_len)
+                )
+                row_base = i * rows_per_seat
+                true_lens_host.append(delta_len)
+                node_offsets.append(row_base * width + delta_len - 1)
+                for g in range(num_steps):
+                    true_lens_host.append(delta_len + g + 1)
+                    node_offsets.append((row_base + 1 + g) * width + delta_len + g)
+                src_offset += delta_len + num_steps
+                delta_offset += delta_len
+            gather = self._h2d.to_device(gather_rows, dtype=torch.int64)
+            fused.input_ids = torch.cat(src_id_pieces)[gather]
+            fused.out_cache_loc = self._extend_graph_out_cache_loc(
+                carriers=carriers,
+                seat_delta_slots=seat_delta_slots,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
+                graph_round=graph_round,
             )
-            src_id_pieces.append(chains[i])
-            gather_rows.extend(
-                src_offset + entry
-                for entry in self._extend_graph_gather_pattern(delta_len)
-            )
-            row_base = i * rows_per_seat
-            true_lens_host.append(delta_len)
-            node_offsets.append(row_base * width + delta_len - 1)
-            for g in range(num_steps):
-                true_lens_host.append(delta_len + g + 1)
-                node_offsets.append((row_base + 1 + g) * width + delta_len + g)
-            src_offset += delta_len + num_steps
-            delta_offset += delta_len
-        gather = torch.tensor(gather_rows, dtype=torch.int64, device=self.device)
-        fused.input_ids = torch.cat(src_id_pieces)[gather]
-        fused.out_cache_loc = self._extend_graph_out_cache_loc(
-            carriers=carriers,
-            seat_delta_slots=seat_delta_slots,
-            base_lens=base_lens,
-            delta_lens=delta_lens,
-            graph_round=graph_round,
-        )
         fused.extend_num_tokens = bs * rows_per_seat * width
         self._extend_graph_bind_seat_pads(
             seat_rows=seat_rows,
@@ -2264,7 +2519,7 @@ class EnumDraftEngine:
         # DRAFT_EXTEND_V2 prepare contract: the ScheduleBatch view carries the
         # PRE-write lengths; orig stays post-write like the eager shell.
         seq_cpu = torch.tensor(fused.prefix_lens, dtype=torch.int64)
-        fused.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        fused.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
         fused.seq_lens_cpu = seq_cpu
         fused.seq_lens_sum = sum(fused.prefix_lens)
         fused.orig_seq_lens = (fused.seq_lens + width).to(torch.int32)
@@ -2282,6 +2537,7 @@ class EnumDraftEngine:
         base_lens: list[int],
         delta_lens: list[int],
         graph_round: _ExtendGraphRound,
+        prestaged: Optional[_ExtendCaseStaging] = None,
     ) -> torch.Tensor:
         """The fused extend as ONE captured DRAFT_EXTEND_V2 graph replay.
 
@@ -2319,6 +2575,7 @@ class EnumDraftEngine:
             base_lens=base_lens,
             delta_lens=delta_lens,
             graph_round=graph_round,
+            prestaged=prestaged,
         )
         return self._extend_graph_replay(
             fused=fused,
@@ -2328,6 +2585,7 @@ class EnumDraftEngine:
             base_lens=base_lens,
             delta_lens=delta_lens,
             tag="fused_graph",
+            prestaged=prestaged,
         )
 
     def _extend_graph_replay(
@@ -2340,6 +2598,7 @@ class EnumDraftEngine:
         base_lens: list[int],
         delta_lens: list[int],
         tag: str,
+        prestaged: Optional[_ExtendCaseStaging] = None,
     ) -> torch.Tensor:
         """Replay one assembled DRAFT_EXTEND_V2 shell (fused rows or the
         advance-only degenerate shape) and gather the node logits.
@@ -2371,9 +2630,15 @@ class EnumDraftEngine:
             # full W window on the GDN plane. States and guesses go WRONG
             # (pads fold into row-end states); only for localizing NaN.
             true_lens_host = [width] * rows
-        spec_info.gdn_true_extend_lens_tensor = torch.tensor(
-            true_lens_host, dtype=torch.int32
-        ).to(self.device, non_blocking=True)
+        if (
+            prestaged is not None
+            and not envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_FULLSCAN.get()
+        ):
+            spec_info.gdn_true_extend_lens_tensor = prestaged.true_lens
+        else:
+            spec_info.gdn_true_extend_lens_tensor = self._h2d.to_device(
+                true_lens_host, dtype=torch.int32
+            )
         self.profiler.mark(f"{tag}_mut")
         try:
             fused.forward_mode = ForwardMode.DRAFT_EXTEND_V2
@@ -2424,7 +2689,11 @@ class EnumDraftEngine:
                 ["".join("N" if p else "." for p in row) for row in nan_mask],
             )
             self._log_extend_graph_attn_metadata(rows=rows)
-        node_gather = torch.tensor(node_offsets, dtype=torch.int64, device=self.device)
+        node_gather = (
+            prestaged.node_gather
+            if prestaged is not None
+            else self._h2d.to_device(node_offsets, dtype=torch.int64)
+        )
         # The gather copies out of the runner's private static logits buffer
         # before any later replay could overwrite it.
         return logits_output.next_token_logits[node_gather]
@@ -2486,7 +2755,7 @@ class EnumDraftEngine:
                 )
             )
             delta_offset += delta_len
-        gather = torch.tensor(gather_rows, dtype=torch.int64, device=self.device)
+        gather = self._h2d.to_device(gather_rows, dtype=torch.int64)
         fused.input_ids = seat_input_ids[gather]
         fused.out_cache_loc = torch.cat(slot_pieces)
         fused.extend_num_tokens = bs * width
@@ -2499,7 +2768,7 @@ class EnumDraftEngine:
         # DRAFT_EXTEND_V2 prepare contract: the ScheduleBatch view carries the
         # PRE-write lengths; orig stays post-write like the eager shell.
         seq_cpu = torch.tensor(base_lens, dtype=torch.int64)
-        fused.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        fused.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
         fused.seq_lens_cpu = seq_cpu
         fused.seq_lens_sum = sum(base_lens)
         fused.orig_seq_lens = (fused.seq_lens + width).to(torch.int32)
@@ -2512,6 +2781,7 @@ class EnumDraftEngine:
         base_lens: list[int],
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
+        scratch_kv_pages: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Advance the seats' committed delta on its own (the miss round's
         first phase; a fast round folds the same work into the fused extend).
@@ -2530,6 +2800,7 @@ class EnumDraftEngine:
             bs=len(states),
             delta_lens=delta_lens,
             scratch_slots=scratch_slots,
+            scratch_kv_pages=scratch_kv_pages,
             rows_per_seat=1,
         )
         advance_batch, advance_slots = self._extend_batch(
@@ -2657,7 +2928,7 @@ class EnumDraftEngine:
             glue.input_ids = torch.cat(chains) if bs > 1 else chains[0]
             glue.out_cache_loc = backbone_slots.view(-1)
             glue.prefix_lens = [s - 1 for s in seq_host]
-        glue.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        glue.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
         glue.seq_lens_cpu = seq_cpu
         glue.seq_lens_sum = sum(seq_host)
         glue.orig_seq_lens = glue.seq_lens.to(torch.int32)
@@ -2698,7 +2969,7 @@ class EnumDraftEngine:
             base_len + case for base_len in lens for case in variant.case_of_row
         ]
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
-        branch.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        branch.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
         branch.seq_lens_cpu = seq_cpu
         branch.seq_lens_sum = None
         branch.orig_seq_lens = branch.seq_lens.to(torch.int32)
@@ -2709,18 +2980,86 @@ class EnumDraftEngine:
             variant=variant,
         )
         self.profiler.mark("branch_mut")
+        if self._chain_plan and cascade is None:
+            # Whole-chain staging: allocation, seq-lens family and the K
+            # ForwardBatches are built in one prep pass; the step loop only
+            # rebinds the input tokens and replays. (The fa3 cascade path
+            # keeps the per-step loop: its tail state advances in place.)
+            with self.profiler.stage("branch-plan"):
+                plan_steps = self._prepare_chain_steps(
+                    branch, first_tokens=branch_guesses.reshape(-1)
+                )
+            for step, (_, step_slots) in enumerate(plan_steps):
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=step_slots,
+                    positions=[seq + step for seq in seq_host],
+                )
+            first_tokens = branch_guesses.reshape(-1)
+            rows = int(first_tokens.numel())
+            if self._chain_graph is not None:
+                with self.profiler.stage("branch-chain-graph"):
+                    if self._chain_graph.can_replay(rows):
+                        return self._chain_graph.replay(
+                            rows=rows,
+                            plan_steps=plan_steps,
+                            first_tokens=first_tokens,
+                        )
+                    captured = self._chain_graph.try_capture_and_run(
+                        rows=rows,
+                        plan_steps=plan_steps,
+                        first_tokens=first_tokens,
+                    )
+                    if captured is not None:
+                        return captured
+            tokens = first_tokens
+            chain_steps: list[torch.Tensor] = []
+            for step, (fb, _) in enumerate(plan_steps):
+                with self.profiler.stage("branch-step-fwd"):
+                    fb.input_ids = tokens
+                    logits = self.model_runner.forward(fb).logits_output
+                tokens = logits.next_token_logits.argmax(dim=-1)
+                chain_steps.append(tokens)
+            return chain_steps
         logits, step_slots = self._decode_step(
             branch, branch_guesses.reshape(-1), tag="branch", cascade=cascade
         )
-        scratch_slots.append(step_slots)
-        chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
-        for _ in range(num_steps - 1):
+        # Decode step s fills each row's position seq_host[row] + s.
+        self._track_scratch_slots(scratch_slots, slots=step_slots, positions=seq_host)
+        chain_steps = [logits.argmax(dim=-1)]
+        for step in range(1, num_steps):
             logits, step_slots = self._decode_step(
                 branch, chain_steps[-1], tag="branch", cascade=cascade
             )
-            scratch_slots.append(step_slots)
+            self._track_scratch_slots(
+                scratch_slots,
+                slots=step_slots,
+                positions=[seq + step for seq in seq_host],
+            )
             chain_steps.append(logits.argmax(dim=-1))
         return chain_steps
+
+    def _prepare_chain_steps(
+        self, branch: ScheduleBatch, *, first_tokens: torch.Tensor
+    ) -> list[tuple[ForwardBatch, torch.Tensor]]:
+        """Stage every chain decode step up front.
+
+        Each iteration runs exactly today's per-step mutation
+        (``prepare_for_decode``: allocation + table write + seq-lens family)
+        and snapshots it into a ForwardBatch -- so the allocator sequence and
+        page continuation are byte-identical to the step-by-step loop, just
+        hoisted out of the replay gaps. Later steps' page-table entries being
+        written early is fine: attention reads at most seq_len positions.
+        """
+        steps: list[tuple[ForwardBatch, torch.Tensor]] = []
+        branch.input_ids = first_tokens.to(torch.int64)
+        for _ in range(self.num_steps):
+            branch.prepare_for_decode()
+            fb = ForwardBatch.init_new(
+                branch, self.model_runner, return_hidden_states_before_norm=False
+            )
+            steps.append((fb, branch.out_cache_loc))
+        return steps
 
     def _build_branch_cascade(
         self,
@@ -2767,13 +3106,202 @@ class EnumDraftEngine:
         )
         return _CascadeMetadata(
             prefix_page_table=prefix_page_table,
-            prefix_lens=torch.tensor(lens, dtype=torch.int32, device=self.device),
+            prefix_lens=self._h2d.to_device(lens, dtype=torch.int32),
             tail_page_table=tail_page_table,
             tail_lens=tail_lens,
             row_indices=torch.arange(
                 seats * rows_per_seat, dtype=torch.int64, device=self.device
             ),
         )
+
+    def prebuild_fast_round(self, keys: list[DraftReqKey]) -> None:
+        """Idle-window build of the next fast round's allocation + batch
+        skeleton (see _PrebuiltFastRound). No-op when one is already staged,
+        when the fused-extend graph path is unavailable, or when any key has
+        no carrier yet (those seats bootstrap, not fast-round)."""
+        if (
+            not self._prep_ahead
+            or self._prebuilt_fast is not None
+            or not self._enable_fused_extend
+            or self._extend_graph_runner is None
+        ):
+            return
+        keys = [k for k in keys if k in self._states and k in self._seat_carriers]
+        if not keys:
+            return
+        states = [self._states[k] for k in keys]
+        bs = len(states)
+        width = self.num_steps + 1
+        base_lens = [state.committed_slots.numel() for state in states]
+        pre_batches: list = []
+        pre_slots: list = []
+        pre_pages: list = []
+        try:
+            graph_round = self._stage_extend_graph_round(
+                bs=bs,
+                delta_lens=[width] * bs,
+                scratch_slots=pre_slots,
+                scratch_kv_pages=pre_pages,
+                rows_per_seat=width,
+            )
+            if graph_round is None:
+                self._scrap_lists(pre_batches, pre_slots, pre_pages)
+                return
+            batch, slots = self._extend_batch(
+                token_lists=[
+                    list(state.committed_tokens) + [0] * width for state in states
+                ],
+                prefix_slots=[state.committed_slots for state in states],
+                tag="preadvance",
+                mamba_slots=self._seat_mamba_slots(states),
+            )
+        except Exception:
+            logger.exception("decoupled prep-ahead build failed; falling back inline")
+            self._scrap_lists(pre_batches, pre_slots, pre_pages)
+            return
+        carriers = [self._seat_carriers[k] for k in keys]
+        if self._paged:
+            self._cow_carrier_glue_heads(
+                states=states, carriers=carriers, base_lens=base_lens
+            )
+        if self._hybrid:
+            self._fork_mamba_states(
+                src_slots=torch.cat(
+                    [state.mamba_slot.repeat(self.num_steps) for state in states]
+                ),
+                dst_slots=torch.cat([carrier.glue_mamba_slots for carrier in carriers]),
+            )
+        case_staging = None
+        if bs == 1:
+            # Idle window, stream drained (the manager gates on query()), so
+            # the direct device tensor constructions below are barrier-free
+            # in effect and must NOT go through the rotating pinned ring
+            # (these persist until consume; ring slots would be reclaimed).
+            case_staging = []
+            chunk = slots.view(width)
+            num_steps = self.num_steps
+            for delta_len in range(1, width + 1):
+                pattern = self._extend_graph_gather_pattern(delta_len)
+                true_host = [delta_len] + [delta_len + g + 1 for g in range(num_steps)]
+                w = self._extend_graph_width
+                node_off = [delta_len - 1] + [
+                    (1 + g) * w + delta_len + g for g in range(num_steps)
+                ]
+                case_staging.append(
+                    _ExtendCaseStaging(
+                        gather=torch.tensor(
+                            pattern, dtype=torch.int64, device=self.device
+                        ),
+                        out_cache_loc=self._extend_graph_out_cache_loc(
+                            carriers=carriers,
+                            seat_delta_slots=chunk[:delta_len],
+                            base_lens=base_lens,
+                            delta_lens=[delta_len],
+                            graph_round=graph_round,
+                        ),
+                        true_lens=torch.tensor(
+                            true_host, dtype=torch.int32, device=self.device
+                        ),
+                        true_lens_host=true_host,
+                        node_gather=torch.tensor(
+                            node_off, dtype=torch.int64, device=self.device
+                        ),
+                        node_offsets=node_off,
+                    )
+                )
+        positions: list[int] = []
+        for base in base_lens:
+            positions.extend(range(base, base + width))
+        self._prebuilt_fast = _PrebuiltFastRound(
+            keys=tuple(keys),
+            base_lens=base_lens,
+            batch=batch,
+            slots=slots,
+            slot_positions=positions,
+            graph_round=graph_round,
+            scratch_batches=pre_batches,
+            scratch_slots=pre_slots,
+            scratch_kv_pages=pre_pages,
+            glue_seeded=True,
+            case_staging=case_staging,
+        )
+
+    def _scrap_lists(self, batches: list, slots_list: list, kv_pages: list) -> None:
+        """Immediate (outside-a-round) release of prebuilt resources. Slot
+        tensors must already be page-head filtered (_track_scratch_slots)."""
+        for batch in batches:
+            for req in batch.reqs:
+                if req.req_pool_idx is not None:
+                    req.mamba_pool_idx = None
+                    self.model_runner.req_to_token_pool.free(req)
+        self._pending_scratch_frees.extend(
+            s for s in slots_list if s is not None and s.numel() > 0
+        )
+        for pages in kv_pages:
+            self._kv_page_arena.give_back(pages)
+
+    def _scrap_prebuilt_into(
+        self,
+        pre: _PrebuiltFastRound,
+        scratch_batches: list,
+        scratch_slots: list,
+        scratch_kv_pages: list,
+    ) -> None:
+        """Fold an unusable prebuilt round into the CURRENT round's scratch
+        lists (freed at its tail, page-head rule preserved)."""
+        scratch_batches.append(pre.batch)
+        scratch_batches.extend(pre.scratch_batches)
+        scratch_slots.extend(pre.scratch_slots)
+        scratch_kv_pages.extend(pre.scratch_kv_pages)
+        self._track_scratch_slots(
+            scratch_slots, slots=pre.slots, positions=pre.slot_positions
+        )
+
+    def drop_prebuilt_for(self, key: DraftReqKey) -> None:
+        """Seat close/reopen invalidation: release the prebuilt round now."""
+        pre = self._prebuilt_fast
+        if pre is None or key not in pre.keys:
+            return
+        self._prebuilt_fast = None
+        tracked: list = []
+        self._track_scratch_slots(
+            tracked, slots=pre.slots, positions=pre.slot_positions
+        )
+        self._scrap_lists(
+            [pre.batch] + pre.scratch_batches,
+            pre.scratch_slots + tracked,
+            pre.scratch_kv_pages,
+        )
+
+    def _consume_prebuilt(
+        self,
+        pre: _PrebuiltFastRound,
+        *,
+        states: list[_DraftReqState],
+        base_lens: list[int],
+        delta_lens: list[int],
+        scratch_slots: list,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compact the hypothesized-max allocation to the actual deltas and
+        stage the real token values. Returns (advance_slots, seat_input_ids)."""
+        width = self.num_steps + 1
+        chunks = pre.slots.view(len(states), width)
+        pieces: list[torch.Tensor] = []
+        delta_tokens: list[int] = []
+        for i, (state, delta_len) in enumerate(zip(states, delta_lens)):
+            pieces.append(chunks[i, :delta_len])
+            if delta_len < width:
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=chunks[i, delta_len:],
+                    positions=list(
+                        range(base_lens[i] + delta_len, base_lens[i] + width)
+                    ),
+                )
+            delta_tokens.extend(state.committed_tokens[-delta_len:])
+        advance_slots = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+        seat_input_ids = self._h2d.to_device(delta_tokens, dtype=torch.int64)
+        return advance_slots, seat_input_ids
 
     def _absorb_advance_slots(
         self, states: list[_DraftReqState], advance_slots: torch.Tensor
@@ -3066,6 +3594,7 @@ class EnumDraftEngine:
         states: list[_DraftReqState],
         scratch_batches: list[ScheduleBatch],
         scratch_slots: list[torch.Tensor],
+        scratch_kv_pages: list[torch.Tensor],
         *,
         f_live: int,
     ) -> dict:
@@ -3099,6 +3628,7 @@ class EnumDraftEngine:
             base_lens=base_lens,
             scratch_batches=scratch_batches,
             scratch_slots=scratch_slots,
+            scratch_kv_pages=scratch_kv_pages,
         )
         # Consume the graph runner's static logits buffer before the next
         # forward overwrites it.
@@ -3135,7 +3665,7 @@ class EnumDraftEngine:
             state.committed_slots.numel() for state in states for _ in range(f_live)
         ]
         seq_cpu = torch.tensor(seq_host, dtype=torch.int64)
-        branch.seq_lens = seq_cpu.to(self.device, non_blocking=True)
+        branch.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
         branch.seq_lens_cpu = seq_cpu
         branch.seq_lens_sum = None
         branch.orig_seq_lens = branch.seq_lens.to(torch.int32)
@@ -3151,15 +3681,43 @@ class EnumDraftEngine:
                 ),
             )
         self.profiler.mark("case0_mut")
-        logits, step_slots = self._decode_step(
-            branch, node0_guesses.reshape(-1), tag="case0"
-        )
-        scratch_slots.append(step_slots)
-        chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
-        for _ in range(num_steps - 1):
-            logits, step_slots = self._decode_step(branch, chain_steps[-1], tag="case0")
-            scratch_slots.append(step_slots)
-            chain_steps.append(logits.argmax(dim=-1))
+        if self._chain_plan:
+            with self.profiler.stage("case0-plan"):
+                plan_steps = self._prepare_chain_steps(
+                    branch, first_tokens=node0_guesses.reshape(-1)
+                )
+            tokens = node0_guesses.reshape(-1)
+            chain_steps: list[torch.Tensor] = []
+            for step, (fb, step_slots) in enumerate(plan_steps):
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=step_slots,
+                    positions=[seq + step for seq in seq_host],
+                )
+                with self.profiler.stage("case0-step-fwd"):
+                    fb.input_ids = tokens
+                    logits = self.model_runner.forward(fb).logits_output
+                tokens = logits.next_token_logits.argmax(dim=-1)
+                chain_steps.append(tokens)
+        else:
+            logits, step_slots = self._decode_step(
+                branch, node0_guesses.reshape(-1), tag="case0"
+            )
+            # Decode step s fills each row's position seq_host[row] + s.
+            self._track_scratch_slots(
+                scratch_slots, slots=step_slots, positions=seq_host
+            )
+            chain_steps = [logits.argmax(dim=-1)]
+            for step in range(1, num_steps):
+                logits, step_slots = self._decode_step(
+                    branch, chain_steps[-1], tag="case0"
+                )
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=step_slots,
+                    positions=[seq + step for seq in seq_host],
+                )
+                chain_steps.append(logits.argmax(dim=-1))
 
         # No backbone this round: only a case-0 match can hit next round, and
         # a case-0 hit reads its chain from the units mirror, not the backbone.
@@ -3229,6 +3787,9 @@ class EnumDraftEngine:
         logits = self._forward(advance_batch, tag="advance")
         node_logits.append(logits)
         self._absorb_advance_slots(states, advance_slots)
+        # Committed length per seat after the absorb == the position every
+        # phase below starts writing at (see _track_scratch_slots).
+        new_lens = [state.committed_slots.numel() for state in states]
 
         # -- Phase 2: backbone c_1..c_K + per-node top-F guesses ------------
         # guesses[a]: [bs, F] int64; backbone_tokens[j]: [bs] (c_{j+1}).
@@ -3253,7 +3814,10 @@ class EnumDraftEngine:
                 mamba_slots=backbone_mamba_slots,
             )
             scratch_batches.append(backbone_batch)
-            scratch_slots.append(first_slots)
+            # One extend token per seat: c_1, at the committed length.
+            self._track_scratch_slots(
+                scratch_slots, slots=first_slots, positions=new_lens
+            )
             backbone_slot_steps.append(first_slots)
             if self._hybrid:
                 # The backbone decodes over node-0 state without touching the
@@ -3277,7 +3841,11 @@ class EnumDraftEngine:
                 logits, step_slots = self._decode_step(
                     backbone_batch, next_tokens, tag="backbone"
                 )
-                scratch_slots.append(step_slots)
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=step_slots,
+                    positions=[new_len + 1 + step_idx for new_len in new_lens],
+                )
                 backbone_slot_steps.append(step_slots)
                 node_logits.append(logits)
                 guesses.append(torch.topk(logits, fanout, dim=-1).indices)
@@ -3334,7 +3902,17 @@ class EnumDraftEngine:
             mamba_slots=branch_mamba_flat,
         )
         scratch_batches.append(branch_batch)
-        scratch_slots.append(branch_first_slots)
+        # One extend token per branch row (its guess), in the batch's
+        # case-major full-F row order: position = committed length + case.
+        branch_row_positions = [
+            new_len + case
+            for new_len in new_lens
+            for case in range(num_cases)
+            for _ in range(fanout)
+        ]
+        self._track_scratch_slots(
+            scratch_slots, slots=branch_first_slots, positions=branch_row_positions
+        )
         if self._hybrid:
             # Fork node states into every branch row before its extend reads
             # them: case 0 <- seat slot, cases 1..K-1 <- the checkpoints,
@@ -3357,11 +3935,15 @@ class EnumDraftEngine:
             )
         logits = self._forward(branch_batch, tag="branch")
         chain_steps: list[torch.Tensor] = [logits.argmax(dim=-1)]
-        for _ in range(num_steps - 1):
+        for step in range(num_steps - 1):
             logits, step_slots = self._decode_step(
                 branch_batch, chain_steps[-1], tag="branch"
             )
-            scratch_slots.append(step_slots)
+            self._track_scratch_slots(
+                scratch_slots,
+                slots=step_slots,
+                positions=[pos + 1 + step for pos in branch_row_positions],
+            )
             chain_steps.append(logits.argmax(dim=-1))
 
         packed = self._pack_and_mirror(
@@ -3554,12 +4136,23 @@ class EnumDraftEngine:
                 for state in states
                 for _ in range(self.num_steps)
             ]
+            # Row (i, g) re-extends [page floor, committed + g + 1).
+            glue_out_positions = [
+                pos
+                for state in states
+                for g in range(self.num_steps)
+                for pos in range(
+                    self._page_floor(state.committed_slots.numel()),
+                    state.committed_slots.numel() + g + 1,
+                )
+            ]
         else:
             glue_build_prefixes = [
                 torch.cat([state.committed_slots, backbone_slots_dev[i, :g]])
                 for i, state in enumerate(states)
                 for g in range(self.num_steps)
             ]
+            glue_out_positions = []
         glue_batch, glue_slots = self._extend_batch(
             token_lists=[
                 state.committed_tokens + backbone_cpu[i][: g + 1]
@@ -3572,7 +4165,9 @@ class EnumDraftEngine:
         )
         # Build-time extend slots are placeholders (no forward ran); the fast
         # path re-points out_cache_loc at each round's backbone slots.
-        scratch_slots.append(glue_slots)
+        self._track_scratch_slots(
+            scratch_slots, slots=glue_slots, positions=glue_out_positions
+        )
         bs = len(keys)
         num_steps = self.num_steps
         rows_per_seat = (num_steps + 1) * self.fanout
@@ -3801,24 +4396,87 @@ class EnumDraftEngine:
         tag: str,
         cascade: Optional[_CascadeMetadata] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch.input_ids = input_tokens.to(torch.int64)
-        batch.prepare_for_decode()
-        if cascade is not None:
-            # Append this step's KV slot to each row's private tail, then
-            # advance the tail lengths so the kernel covers the new token.
-            cascade.tail_page_table[cascade.row_indices, cascade.tail_lens.long()] = (
-                batch.out_cache_loc.to(torch.int32)
+        with self.profiler.stage(f"{tag}-step-prep"):
+            batch.input_ids = input_tokens.to(torch.int64)
+            batch.prepare_for_decode()
+            if cascade is not None:
+                # Append this step's KV slot to each row's private tail, then
+                # advance the tail lengths so the kernel covers the new token.
+                cascade.tail_page_table[
+                    cascade.row_indices, cascade.tail_lens.long()
+                ] = batch.out_cache_loc.to(torch.int32)
+                cascade.tail_lens.add_(1)
+            self.profiler.mark(f"{tag}_step_prep")
+            forward_batch = ForwardBatch.init_new(
+                batch, self.model_runner, return_hidden_states_before_norm=False
             )
-            cascade.tail_lens.add_(1)
-        self.profiler.mark(f"{tag}_step_prep")
-        forward_batch = ForwardBatch.init_new(
-            batch, self.model_runner, return_hidden_states_before_norm=False
-        )
-        forward_batch.decoupled_cascade = cascade
-        self.profiler.mark(f"{tag}_step_fb")
-        logits_output = self.model_runner.forward(forward_batch).logits_output
-        self.profiler.mark(f"{tag}_step_fwd")
+            forward_batch.decoupled_cascade = cascade
+            self.profiler.mark(f"{tag}_step_fb")
+        with self.profiler.stage(f"{tag}-step-fwd"):
+            logits_output = self.model_runner.forward(forward_batch).logits_output
+            self.profiler.mark(f"{tag}_step_fwd")
         return logits_output.next_token_logits, batch.out_cache_loc
+
+    def _track_scratch_slots(
+        self,
+        scratch_slots: list[torch.Tensor],
+        *,
+        slots: torch.Tensor,
+        positions: list[int],
+    ) -> None:
+        """Record one ``alloc_extend`` / ``alloc_decode`` output for the
+        round-end free, page-granular at P > 1 -- WITHOUT reading the device.
+
+        ``positions[j]`` is the logical sequence position ``slots[j]`` was
+        allocated for (host-known: it is what the engine asked for).
+
+        The page rule, from ``alloc_extend`` / ``alloc_decode``: a page comes
+        off the global free list exactly when the position being filled STARTS
+        a page; every other position continues the previous slot's page
+        (``last_loc + 1``). So ``slots[j]`` heads a freshly allocated page iff
+        ``positions[j] % P == 0``, and those heads are the round's complete
+        throwaway-page set: any other slot lives in a page the engine already
+        owns -- a carrier arena page, the seat's committed page, or a fresh
+        page whose own head is in this list. Freeing just the heads therefore
+        frees exactly the throwaway pages, which is what the old round-tail
+        device set difference (unique + isin over every scratch slot) computed
+        at the cost of two synchronizing device reads.
+
+        At P == 1 every position starts a page, so the whole tensor is
+        recorded -- the original behavior, without building an index.
+        """
+        if not self._paged:
+            scratch_slots.append(slots)
+            return
+        # A positions/slots misalignment would free the WRONG pages silently,
+        # so pin the one thing that makes the mapping meaningful (host-only).
+        assert len(positions) == slots.numel(), (
+            f"scratch slot bookkeeping expects one position per slot; got "
+            f"{len(positions)} positions for {slots.numel()} slots"
+        )
+        page_size = self._page_size
+        heads = [j for j, pos in enumerate(positions) if pos % page_size == 0]
+        if not heads:
+            return
+        # Only reached on a page crossing (~1 row-step in P), where the free
+        # below synchronizes inside the allocator anyway.
+        scratch_slots.append(slots[self._h2d.to_device(heads, dtype=torch.int64)])
+
+    def flush_scratch_frees(self) -> None:
+        """Release the queued rare scratch slots back to the allocator.
+
+        ``allocator.free()`` hides a device sync (``torch.unique`` of the page
+        ids), so ``_free_scratch`` only queues these rare tensors; the manager
+        calls this at idle time -- while waiting for commits the GPU is
+        drained, so the sync costs nothing.
+        """
+        pending = self._pending_scratch_frees
+        if not pending:
+            return
+        self._pending_scratch_frees = []
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        for slots in pending:
+            allocator.free(slots)
 
     def _free_scratch(
         self,
@@ -3828,28 +4486,23 @@ class EnumDraftEngine:
         scratch_kv_pages: list[torch.Tensor],
     ) -> None:
         if self._paged:
-            # Page-granular free with arena exclusion. The allocator frees the
-            # WHOLE page containing any freed slot, and scratch out_cache_loc
-            # mixes (a) throwaway allocator pages with (b) extend/decode
-            # continuation slots INSIDE engine-arena pages (carrier private
-            # pages, slow-round transients); freeing (b) raw would hand arena
-            # pages back to the global pool while the arena keeps recycling
-            # them. Seat (committed) pages never appear here: every scratch
-            # row's tail head is private by the sharing rule, so continuation
-            # never lands in a seat page.
+            # Page-granular free of exactly the round's throwaway pages, as
+            # their head slots (see _track_scratch_slots for why the heads are
+            # the complete set). A steady-state round records NONE of them --
+            # every scratch write lands in an arena page or continues one --
+            # so the paged round tail issues no device op at all and the CPU
+            # runs straight into the next round while the GPU chain drains.
             live = [s for s in scratch_slots if s is not None and s.numel() > 0]
             if live:
-                pages = torch.unique(
-                    torch.cat([s.reshape(-1) for s in live]) // self._page_size
-                )
-                foreign = pages[~torch.isin(pages, self._kv_page_arena.owned_pages)]
-                self.model_runner.token_to_kv_pool_allocator.free(
-                    foreign * self._page_size
-                )
+                self._pending_scratch_frees.append(torch.cat(live))
         else:
             for slots in scratch_slots:
                 if slots is not None and slots.numel() > 0:
-                    self.model_runner.token_to_kv_pool_allocator.free(slots)
+                    self._pending_scratch_frees.append(slots)
+        if len(self._pending_scratch_frees) > 32:
+            # Cap the hoard: accept one rare in-round sync over unbounded
+            # withholding of allocator pages.
+            self.flush_scratch_frees()
         for batch in scratch_batches:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:

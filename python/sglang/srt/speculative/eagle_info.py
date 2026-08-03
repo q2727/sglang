@@ -349,6 +349,15 @@ class EagleDraftExtendInput(SpecInput):
     # rebuilding plain metadata from seq_lens when this is None.
     kv_indptr: torch.Tensor = None
 
+    # DRAFT_EXTEND_V2 dual-plane length contract: the full-attention plane sees
+    # the uniform padded window width everywhere, the RECURRENT plane the TRUE
+    # per-row scan lengths from here. A recurrent state is a running summary,
+    # so folding a padding position into it corrupts the row permanently --
+    # unlike a causal-attention pad, whose poison stays in its own suffix.
+    # Set by whoever drives a recurrent draft model's extend; None when the
+    # draft has no recurrent plane.
+    gdn_true_extend_lens_tensor: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
 

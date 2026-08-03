@@ -59,6 +59,23 @@ class MambaAttnBackendBase(AttentionBackend):
         state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
         return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
 
+    def serves_draft_extend_v2(self) -> bool:
+        """Whether this sidecar runs its recurrent plane on DRAFT_EXTEND_V2
+        forwards. Only a draft model with linear-attention layers of its own
+        (a hybrid STANDALONE draft) needs it; MTP / NextN heads run that mode
+        with full-attention layers only."""
+        return False
+
+    def _draft_extend_v2_eager_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardMetadata:
+        """Per-forward DRAFT_EXTEND_V2 metadata for the EAGER path. Only
+        reached when :meth:`serves_draft_extend_v2` is on."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the DRAFT_EXTEND_V2 "
+            "recurrent plane"
+        )
+
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
@@ -151,8 +168,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     write_pos_buf[uniq_slots] = new_vals
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model;
-                # skip mamba metadata.
+                if self.serves_draft_extend_v2():
+                    return self._draft_extend_v2_eager_metadata(forward_batch)
+                # An MTP / NextN draft head has no linear-attention layer, so
+                # DRAFT_EXTEND_V2 runs only full-attn layers there; skip mamba
+                # metadata (it would need a query_start_loc this mode has no
+                # ragged layout for).
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
@@ -867,9 +888,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             attn_backend.on_after_cuda_graph_warmup()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_draft_extend_v2():
-            # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip
-            # linear/mamba metadata (it requires query_start_loc).
+        if (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and not self.linear_attn_backend.serves_draft_extend_v2()
+        ):
+            # An MTP / NextN draft head runs DRAFT_EXTEND_V2 with full-attn
+            # layers only; skip linear/mamba metadata (it requires a
+            # query_start_loc this mode has no ragged layout for).
             self.full_attn_backend.init_forward_metadata(forward_batch)
             return
         for attn_backend in self.attn_backend_list:

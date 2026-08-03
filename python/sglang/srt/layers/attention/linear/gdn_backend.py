@@ -363,6 +363,121 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # every pad segment a genuine finite scan instead. Set by the
         # decoupled engine before graph capture.
         self.draft_extend_v2_pad_state_slot: Optional[int] = None
+        # DRAFT_EXTEND_V2 per-node recurrent-state capture. All None / 0 (and
+        # the forward byte-identical to a plain fused extend) until a caller
+        # opts in via alloc_draft_extend_v2_node_states -- see that method for
+        # the buffer shapes and the tail-aligned node convention.
+        self.draft_extend_v2_num_nodes = 0
+        self.draft_extend_v2_node_ssm_states: Optional[torch.Tensor] = None
+        self.draft_extend_v2_node_conv_windows: Optional[torch.Tensor] = None
+        self.draft_extend_v2_node_conv_strips: Optional[torch.Tensor] = None
+        self.draft_extend_v2_node_conv_offsets: Optional[torch.Tensor] = None
+        self.draft_extend_v2_node_rows: Optional[torch.Tensor] = None
+        self.draft_extend_v2_node_row_template: Optional[torch.Tensor] = None
+
+    def alloc_draft_extend_v2_node_states(
+        self, *, max_rows: int, num_nodes: int
+    ) -> None:
+        """Turn per-node recurrent-state capture on for DRAFT_EXTEND_V2.
+
+        Without it a fixed-width extend row yields only the per-node LOGITS
+        (causality gives those for free) -- the row's recurrent state lands in
+        its slot for the row END only, which is why materializing node states
+        otherwise costs one extra extend row per node ("glue triangle"), each
+        forking a full state copy. With it, ONE row of true length ``L``
+        reports the state after each of its last ``num_nodes`` tokens.
+
+        Buffers, allocated once, zero-filled, address-stable (a CUDA graph
+        binds them by pointer):
+
+        ``draft_extend_v2_node_ssm_states``
+            ``[num_mamba_layers, max_rows, num_nodes, *ssm_block_shape]``, the
+            same per-slot element layout as the pool's ``temporal``, so
+            ``temporal[dst] = node_ssm_states[layer, row, j]`` is the whole
+            hand-off.
+        ``draft_extend_v2_node_conv_windows``
+            ``[num_mamba_layers, max_rows, num_nodes, conv_dim, state_len]``,
+            same per-slot layout as the pool's ``conv[0]``. A strided VIEW of
+            ``draft_extend_v2_node_conv_strips``: neighbouring nodes' windows
+            overlap in ``state_len - 1`` positions, so the physical strip
+            stores each position once (the deduplication trick
+            ``MambaPool._allocate_deduplicated_conv_window`` already uses for
+            the target-verify windows).
+
+        INVARIANT -- the tail-aligned node convention: for a row whose TRUE
+        scan length is ``L``, node slot ``j in [0, num_nodes)`` holds the state
+        after that row's first ``L - num_nodes + 1 + j`` tokens. The last slot
+        is always the row end. A drafter row ``[delta | c_1..c_K]`` with
+        ``num_nodes == K + 1`` therefore lands "state after ``delta + j``
+        tokens" in slot ``j`` for every ``j`` AND every ``delta``, with no
+        per-row index arithmetic on the reader side. Requires
+        ``L >= num_nodes - 1``; shorter rows only fill the high slots.
+
+        INVARIANT -- determinism of unwritten positions: only the batch's REAL
+        rows are written (pad half-rows carry ``-1``, bucket-padding rows have
+        an empty real half), and only their ``num_nodes`` tail slots. Every
+        other element keeps its previous value, so a reader that stays inside
+        the current batch's real rows can never observe uninitialized memory:
+        the buffers are zero-filled at allocation and never re-created.
+        (Rows outside the real ones are junk-but-finite on the conv plane and
+        stale on the ssm plane -- never read them.) The conv windows are
+        gathered from the extend INPUT rather than dumped by the conv kernel
+        for the same reason: every source element is a written value.
+        """
+        assert num_nodes >= 1, f"{num_nodes=} must be positive"
+        mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        conv = mamba_cache.conv[0]  # [layers, slots, conv_dim, state_len]
+        temporal = mamba_cache.temporal  # [layers, slots, *ssm_block_shape]
+        assert conv.ndim == 4, f"unexpected GDN conv state layout {tuple(conv.shape)}"
+        num_mamba_layers, _, conv_dim, state_len = conv.shape
+        strip_width = num_nodes + state_len - 1
+        strips = torch.zeros(
+            (num_mamba_layers, max_rows, conv_dim, strip_width),
+            dtype=conv.dtype,
+            device=self.device,
+        )
+        self.draft_extend_v2_node_conv_strips = strips
+        # Node axis strides by ONE position inside the shared strip; the
+        # window axis by one as well (a sliding window, like the pool's
+        # deduplicated verify windows).
+        self.draft_extend_v2_node_conv_windows = strips.as_strided(
+            (num_mamba_layers, max_rows, num_nodes, conv_dim, state_len),
+            (strips.stride(0), strips.stride(1), 1, strip_width, 1),
+        )
+        self.draft_extend_v2_node_ssm_states = torch.zeros(
+            (num_mamba_layers, max_rows, num_nodes, *temporal.shape[2:]),
+            dtype=temporal.dtype,
+            device=self.device,
+        )
+        self.draft_extend_v2_num_nodes = num_nodes
+        self.draft_extend_v2_node_conv_offsets = torch.arange(
+            strip_width, dtype=torch.int64, device=self.device
+        )
+        # Per-half-row cache-slot ids the recurrent kernel reads: real half of
+        # row r -> buffer row r, everything else -> -1 (store nothing).
+        # Refreshed in place per capture / replay prep (graph-static buffer).
+        self.draft_extend_v2_node_rows = torch.full(
+            (2 * max_rows,), -1, dtype=torch.int32, device=self.device
+        )
+        self.draft_extend_v2_node_row_template = torch.arange(
+            max_rows, dtype=torch.int32, device=self.device
+        )
+
+    def _refresh_draft_extend_v2_node_rows(
+        self, *, bs: int, num_real_rows: int
+    ) -> None:
+        """Point the real halves of the first ``num_real_rows`` rows at their
+        buffer row and every other half-row at -1. In place: the captured
+        recurrent kernel bound this tensor by pointer."""
+        node_rows = self.draft_extend_v2_node_rows
+        assert 2 * bs <= node_rows.shape[0], (
+            f"DRAFT_EXTEND_V2 node capture was allocated for "
+            f"{node_rows.shape[0] // 2} rows, got {bs}"
+        )
+        node_rows[: 2 * bs].fill_(-1)
+        node_rows[: 2 * num_real_rows : 2] = self.draft_extend_v2_node_row_template[
+            :num_real_rows
+        ]
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -464,6 +579,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if in_capture:
             state_indices.fill_(pad_state)
             cu_seqlens[1::2] = row_starts + self.draft_extend_v2_num_tokens_per_req
+            if self.draft_extend_v2_node_rows is not None:
+                self._refresh_draft_extend_v2_node_rows(bs=bs, num_real_rows=bs)
         else:
             true_lens = spec_info.gdn_true_extend_lens_tensor
             num_real_rows = min(true_lens.shape[0], bs)
@@ -479,9 +596,69 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cu_seqlens[1 : 2 * num_real_rows : 2] += true_lens[:num_real_rows].to(
                 torch.int32
             )
+            if self.draft_extend_v2_node_rows is not None:
+                self._refresh_draft_extend_v2_node_rows(
+                    bs=bs, num_real_rows=num_real_rows
+                )
         return ForwardMetadata(
             query_start_loc=cu_seqlens,
             mamba_cache_indices=state_indices,
+            has_initial_states=self.draft_extend_v2_has_initial_state_list[bs - 1],
+        )
+
+    def serves_draft_extend_v2(self) -> bool:
+        # The pad-state slot IS the opt-in: it is set only by a caller that
+        # wired this instance up to run the recurrent plane on DRAFT_EXTEND_V2
+        # (the decoupled fused-extend graph, or a colocated hybrid STANDALONE
+        # draft worker).
+        return self.draft_extend_v2_pad_state_slot is not None
+
+    def _draft_extend_v2_eager_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardMetadata:
+        """Doubled half-row DRAFT_EXTEND_V2 metadata, built per forward.
+
+        Same layout as the captured buffers in :meth:`_draft_extend_v2_metadata`
+        (see :meth:`_forward_draft_extend_v2` for why the split exists), minus
+        the address stability a graph needs: the eager path is free to allocate
+        fresh tensors, so the true scan lengths go straight into a new
+        ``cu_seqlens`` instead of an in-place refresh. Same length source as
+        the captured path, ``spec_info.gdn_true_extend_lens_tensor``.
+        """
+        width = self.draft_extend_v2_num_tokens_per_req
+        assert width > 0, (
+            "DRAFT_EXTEND_V2 requires draft_extend_v2_num_tokens_per_req (the "
+            "uniform per-request window width)"
+        )
+        bs = forward_batch.batch_size
+        pad_state = self.draft_extend_v2_pad_state_slot
+        row_starts = torch.arange(
+            0, (bs + 1) * width, width, dtype=torch.int32, device=self.device
+        )
+        true_lens = forward_batch.spec_info.gdn_true_extend_lens_tensor.to(torch.int32)
+        cu_seqlens = torch.empty((2 * bs + 1,), dtype=torch.int32, device=self.device)
+        cu_seqlens[0::2] = row_starts
+        cu_seqlens[1::2] = row_starts[:bs] + true_lens[:bs]
+        state_indices = torch.full(
+            (2 * bs,), pad_state, dtype=torch.int32, device=self.device
+        )
+        state_indices[0::2] = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices[:bs]
+            )
+        ).to(torch.int32)
+        has_initial_states = torch.zeros(
+            (2 * bs,), dtype=torch.bool, device=self.device
+        )
+        # A real half always continues the row's committed state (the request
+        # has been prefilled); a pad half scans the junk slot from cold.
+        has_initial_states[0::2] = True
+        if self.draft_extend_v2_node_rows is not None:
+            self._refresh_draft_extend_v2_node_rows(bs=bs, num_real_rows=bs)
+        return ForwardMetadata(
+            query_start_loc=cu_seqlens,
+            mamba_cache_indices=state_indices,
+            has_initial_states=has_initial_states,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -843,11 +1020,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cu_seqlens = metadata.query_start_loc  # [2 * rows + 1]
         cache_indices = metadata.mamba_cache_indices  # [2 * rows], odd poisoned
         num_half_rows = cu_seqlens.shape[0] - 1
-        has_initial_states = self.draft_extend_v2_has_initial_state_list[
-            num_half_rows // 2 - 1
-        ]
+        has_initial_states = metadata.has_initial_states
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         seq_len = mixed_qkv.shape[0]
+        capture_nodes = self.draft_extend_v2_node_ssm_states is not None
+        if capture_nodes:
+            layer_idx = self.req_to_token_pool.mamba_map[layer.layer_id]
+            # BEFORE the conv call: it overwrites each slot's incoming window
+            # with the row-end one, and it may consume `mixed_qkv` in place.
+            self._capture_draft_extend_v2_node_conv_windows(
+                layer_idx=layer_idx,
+                conv_states=layer_cache.conv[0],
+                conv_inputs=mixed_qkv,
+                cu_seqlens=cu_seqlens,
+                real_slots=cache_indices[0::2],
+            )
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
@@ -896,6 +1083,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             initial_state_indices=cache_indices,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=True,
+            # Per-node state capture (all None when off, which keeps the
+            # kernel's specialization -- and its generated code -- exactly the
+            # plain fused-extend one). Tail-aligned: the kernel dumps each
+            # real half-row's LAST num_nodes states, so slot j is node j for
+            # any true length; see alloc_draft_extend_v2_node_states.
+            intermediate_states_buffer=(
+                self.draft_extend_v2_node_ssm_states[layer_idx]
+                if capture_nodes
+                else None
+            ),
+            intermediate_state_indices=(
+                self.draft_extend_v2_node_rows if capture_nodes else None
+            ),
+            cache_tail_aligned=capture_nodes,
         )
         # Sanitize the pad positions to zeros. The kernels leave pad-half
         # outputs undefined (uninitialized transient memory, or NaN from the
@@ -914,6 +1115,66 @@ class GDNAttnBackend(MambaAttnBackendBase):
             core_out,
             torch.zeros((), dtype=core_out.dtype, device=core_out.device),
         )
+
+    def _capture_draft_extend_v2_node_conv_windows(
+        self,
+        *,
+        layer_idx: int,
+        conv_states: torch.Tensor,
+        conv_inputs: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        real_slots: torch.Tensor,
+    ) -> None:
+        """Write one layer's per-node conv windows for every row of the batch.
+
+        A conv state IS the raw pre-conv input history: after a row's position
+        ``p`` the window holds input positions ``p - state_len + 1 .. p``,
+        front-filled from the window the row started with. The node windows are
+        therefore a pure GATHER over ``[incoming window | this row's W inputs]``
+        -- no conv-kernel change needed, and every source element is a value
+        somebody wrote (never uninitialized graph memory, the failure mode that
+        NaN-poisons a whole row through pad K/V).
+
+        Graph-capture safe: shapes are constants (rows, W, num_nodes,
+        state_len) and the only variable input, the per-row true length, is
+        read from the DEVICE ``cu_seqlens`` -- the same mechanism that lets one
+        captured graph replay any true-length pattern.
+
+        Must run BEFORE ``causal_conv1d_fn``, which overwrites each slot's
+        incoming window with the row-end one.
+        """
+        num_nodes = self.draft_extend_v2_num_nodes
+        width = self.draft_extend_v2_num_tokens_per_req
+        strip = self.draft_extend_v2_node_conv_strips[layer_idx]
+        rows = cu_seqlens.shape[0] // 2
+        strip_width = strip.shape[-1]
+        conv_dim = conv_states.shape[-2]
+        assert conv_inputs.shape == (rows * width, conv_dim), (
+            f"DRAFT_EXTEND_V2 node capture expects {rows} uniform W={width} "
+            f"rows over conv_dim={conv_dim}, got {tuple(conv_inputs.shape)}"
+        )
+        history = torch.cat(
+            [
+                conv_states[real_slots.to(torch.int64)],
+                conv_inputs.reshape(rows, width, conv_dim).transpose(1, 2),
+            ],
+            dim=-1,
+        )  # [rows, conv_dim, state_len + W]
+        # Node j's window starts at history position true_len - num_nodes + 1 + j
+        # (tail-aligned node convention), so one contiguous strip of
+        # num_nodes + state_len - 1 positions carries all of them. The clamp is
+        # a bounds guard only: 0 <= start <= W - num_nodes + 1 holds for every
+        # 0 <= true_len <= W once true_len >= num_nodes - 1.
+        # `[:-1:2]` (not `[0::2]`): cu_seqlens is [2 * rows + 1] long, so the
+        # even stride would also pick up the final total.
+        true_lens = (cu_seqlens[1::2] - cu_seqlens[:-1:2]).to(torch.int64)
+        starts = (true_lens - (num_nodes - 1)).clamp_(min=0, max=width - num_nodes + 1)
+        gather_idx = (
+            (starts[:, None] + self.draft_extend_v2_node_conv_offsets[None, :])
+            .unsqueeze(1)
+            .expand(rows, conv_dim, strip_width)
+        )
+        strip[:rows] = history.gather(2, gather_idx)
 
     def _replayssm_target_verify(
         self,

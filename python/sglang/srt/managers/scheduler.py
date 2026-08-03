@@ -1755,10 +1755,16 @@ class Scheduler(
             self.external_corpus_manager.check_pending_load()
 
     def init_profiler(self) -> None:
+        if self.decoupled_draft_manager is not None:
+            # The decoupled drafter never runs a batch: its unit of work (and
+            # so its profiler step) is one enumeration round.
+            get_forward_ct = lambda: self.decoupled_draft_manager.round_ct
+        else:
+            get_forward_ct = lambda: self.forward_ct
         self.profiler_manager = SchedulerProfilerManager(
             ps=self.ps,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
-            get_forward_ct=lambda: self.forward_ct,
+            get_forward_ct=get_forward_ct,
         )
 
     def init_weight_updater(self) -> None:
@@ -4556,8 +4562,17 @@ def dispatch_event_loop(scheduler: Scheduler):
     server_args = scheduler.server_args
     if server_args.is_decoupled_drafter():
         # The decoupled drafter serves no user requests: its event loop is the
-        # enumeration service (controls in, blocks out).
-        scheduler.decoupled_draft_manager.run_loop()
+        # enumeration service (controls in, blocks out), with the scheduler's
+        # profiler control plane spliced into it (see DrafterControlPlane).
+        from sglang.srt.speculative.decoupled_draft_manager import DrafterControlPlane
+
+        scheduler.decoupled_draft_manager.run_loop(
+            control_plane=DrafterControlPlane(
+                request_receiver=scheduler.request_receiver,
+                send_to_tokenizer=scheduler.ipc_channels.send_to_tokenizer,
+                profiler_manager=scheduler.profiler_manager,
+            )
+        )
         return
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:

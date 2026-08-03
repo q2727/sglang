@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput
 from sglang.srt.speculative.decoupled_draft_engine import EnumDraftEngine
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
@@ -39,6 +40,13 @@ from sglang.srt.speculative.drafter_ipc_thread import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+    from sglang.srt.managers.scheduler_components.profiler_manager import (
+        SchedulerProfilerManager,
+    )
+    from sglang.srt.managers.scheduler_components.request_receiver import (
+        SchedulerRequestReceiver,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -54,6 +62,70 @@ _CATCH_UP_BACKLOG_ROUNDS = 2
 # CUDA IPC slot capacity in block rows; bounds the verifier batch size a
 # single push can carry (the verifier's default running cap is far below it).
 IPC_POOL_MAX_ROWS = 256
+
+
+class DrafterControlPlane:
+    """The drafter's slice of the scheduler control plane.
+
+    The decoupled drafter answers no user requests, so ``run_loop`` replaces
+    the scheduler's request loop wholesale -- and that loop is where the
+    profiler hooks live, which is why ``/start_profile`` never reached the
+    drafter. This is the missing half: a non-blocking drain of the SAME
+    tokenizer / rpc sockets the scheduler drains, serving the profiler
+    requests off it (anything else is logged and dropped -- the drafter has
+    no request machinery to run it on), plus the round-boundary step of the
+    SAME ``SchedulerProfilerManager`` every other engine uses. So the HTTP
+    endpoints, ``SGLANG_TORCH_PROFILER_DIR``, the trace file naming and the
+    merge all behave on the drafter exactly as they do on a normal server.
+
+    A plain collaborator rather than a ``msgspec.Struct``: it holds live
+    wires (sockets, a profiler) and exists for its behavior, like its
+    ``SchedulerRequestReceiver`` peer.
+    """
+
+    def __init__(
+        self,
+        *,
+        request_receiver: SchedulerRequestReceiver,
+        send_to_tokenizer: SenderWrapper,
+        profiler_manager: SchedulerProfilerManager,
+    ) -> None:
+        self.request_receiver = request_receiver
+        self.send_to_tokenizer = send_to_tokenizer
+        self.profiler_manager = profiler_manager
+
+    def poll(self) -> None:
+        """Drain the control sockets (non-blocking) and answer profiler reqs."""
+        for recv_req in self.request_receiver.recv_requests():
+            if not isinstance(recv_req, ProfileReq):
+                logger.warning(
+                    "decoupled drafter dropped an unserved control request (%s): "
+                    "the drafter runs no user requests",
+                    type(recv_req).__name__,
+                )
+                continue
+            self.send_to_tokenizer.send_output(self._profile(recv_req), recv_req)
+
+    def step_profiler(self) -> None:
+        """Round-boundary profiler step (the drafter's round == a forward)."""
+        self.profiler_manager._profile_forward_ct_predicate()
+
+    def _profile(self, recv_req: ProfileReq) -> ProfileReqOutput:
+        """Serve one profiler request, reporting refusals to the HTTP caller
+        instead of killing the drafter loop with them."""
+        if recv_req.profile_by_stage:
+            return ProfileReqOutput(
+                success=False,
+                message=(
+                    "profile_by_stage is not supported on the decoupled drafter: "
+                    "its unit of work is one enumeration round, which has no "
+                    "prefill / decode stage split to separate traces by."
+                ),
+            )
+        output = self.profiler_manager._profile(recv_req)
+        if output is None:
+            return ProfileReqOutput(success=True, message="Succeeded")
+        return output
 
 
 class DecoupledDraftManager:
@@ -106,6 +178,14 @@ class DecoupledDraftManager:
         # Seats eligible for an idle-window bet (filled after each answered
         # commit, consumed by _run_preruns).
         self._prerun_keys: dict[DraftReqKey, None] = {}
+        # Prep-ahead (idle-window fast-round skeleton). Mutually exclusive
+        # with the prerun bet: both want the idle window, and the bet already
+        # subsumes the skeleton when it hits.
+        self._prep_ahead = (
+            envs.SGLANG_ENABLE_DECOUPLED_PREP_AHEAD.get()
+            and not envs.SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN.get()
+        )
+        self._prep_keys: dict[DraftReqKey, None] = {}
         # Adaptive fanout: keep the round time inside the verifier's enum-wait
         # budget by halving / restoring the engine's effective width. Only
         # meaningful under a positive wait gate (sync pacing).
@@ -143,7 +223,12 @@ class DecoupledDraftManager:
                 row_width=2 + unit_width * self.fanout * unit_width,
             )
 
-    def run_loop(self) -> None:
+    @property
+    def round_ct(self) -> int:
+        """Enumeration rounds run so far -- the drafter's forward counter."""
+        return self._round_ct
+
+    def run_loop(self, *, control_plane: DrafterControlPlane) -> None:
         """The drafter scheduler's event loop (never returns)."""
         logger.info(
             "Decoupled drafter loop started (rank=%d, K=%d, F=%d)",
@@ -152,6 +237,11 @@ class DecoupledDraftManager:
             self.fanout,
         )
         while True:
+            # Profiler control in / trace window step out. Both run on every
+            # iteration, not only on busy ones, so an armed window still
+            # closes (and exports) once the traffic that armed it stops.
+            control_plane.poll()
+            control_plane.step_profiler()
             ready = self.ipc_thread.collect_ready_draft_controls(
                 lambda inbox: inbox.extract_ready_controls_locked(
                     self._consumable_commit_len
@@ -161,11 +251,40 @@ class DecoupledDraftManager:
                 # Idle window = the verifier's in-flight round: the only time
                 # a top-1 prerun may run. Betting inline after a real round
                 # would delay draining the next commit and stall the pipeline.
-                if self._enable_top1_prerun and self._prerun_keys:
-                    self._run_preruns()
-                else:
-                    if self._open_seats > 0 and self._idle_since is None:
-                        self._idle_since = time.monotonic()
+                # Idle-window work must not be able to kill the drafter for
+                # every request (same contract as the round path below): a
+                # failed bet / flush / prebuild only costs its own benefit.
+                try:
+                    if self._enable_top1_prerun and self._prerun_keys:
+                        self._run_preruns()
+                    else:
+                        if self._open_seats > 0 and self._idle_since is None:
+                            self._idle_since = time.monotonic()
+                        # Idle window: only touch the device once the stream
+                        # actually drained. Right after a round's CPU returns
+                        # the GPU still has ~2ms of tail queued, and a sync
+                        # (allocator free's torch.unique, any pageable copy)
+                        # issued then blocks THIS LOOP on the full drain --
+                        # freezing commit processing. Deferring to the next
+                        # idle tick costs nothing: the wait sleep is 50us.
+                        if not torch.cuda.current_stream().query():
+                            time.sleep(_IDLE_WAIT_S)
+                            continue
+                        self.engine.flush_scratch_frees()
+                        if self._prep_ahead and self._prep_keys:
+                            by_verifier: dict[int, list[DraftReqKey]] = {}
+                            for draft_key in self._prep_keys:
+                                by_verifier.setdefault(
+                                    draft_key.src_verifier_rank, []
+                                ).append(draft_key)
+                            self._prep_keys.clear()
+                            for group in by_verifier.values():
+                                self.engine.prebuild_fast_round(group)
+                        time.sleep(_IDLE_WAIT_S)
+                except Exception:
+                    logger.exception(
+                        "decoupled drafter idle-window task failed; continuing"
+                    )
                     time.sleep(_IDLE_WAIT_S)
                 continue
             try:
@@ -203,31 +322,33 @@ class DecoupledDraftManager:
             idle_s = time.monotonic() - self._idle_since
             self._idle_since = None
             self._idle_time_s += idle_s
-        for draft_key in ready.close_keys:
-            self.engine.close(draft_key)
-            self._open_seats = max(0, self._open_seats - 1)
+        stage = self.engine.profiler.stage
         touched: dict[DraftReqKey, None] = {}
         confirmed: dict[DraftReqKey, None] = {}
-        for sync in ready.sync_messages:
-            self.engine.open(
-                sync.draft_key,
-                req_pool_idx=int(sync.req_pool_idx),
-                prompt_tokens=list(sync.prompt_token_ids),
-                committed_outputs=list(sync.committed_outputs),
-            )
-            touched[sync.draft_key] = None
-            self._open_seats += 1
-        for segment in ready.ready_commit_segments:
-            if not self.engine.has(segment.draft_key):
-                continue
-            if self.engine.apply_commit(
-                segment.draft_key, list(segment.committed_tokens)
-            ):
-                # A confirmed top-1 prerun: this seat's next block is already
-                # on the verifier; nothing to draft for this commit.
-                confirmed[segment.draft_key] = None
-            else:
-                touched[segment.draft_key] = None
+        with stage("apply-controls"):
+            for draft_key in ready.close_keys:
+                self.engine.close(draft_key)
+                self._open_seats = max(0, self._open_seats - 1)
+            for sync in ready.sync_messages:
+                self.engine.open(
+                    sync.draft_key,
+                    req_pool_idx=int(sync.req_pool_idx),
+                    prompt_tokens=list(sync.prompt_token_ids),
+                    committed_outputs=list(sync.committed_outputs),
+                )
+                touched[sync.draft_key] = None
+                self._open_seats += 1
+            for segment in ready.ready_commit_segments:
+                if not self.engine.has(segment.draft_key):
+                    continue
+                if self.engine.apply_commit(
+                    segment.draft_key, list(segment.committed_tokens)
+                ):
+                    # A confirmed top-1 prerun: this seat's next block is
+                    # already on the verifier; nothing to draft for this commit.
+                    confirmed[segment.draft_key] = None
+                else:
+                    touched[segment.draft_key] = None
         if not touched and not confirmed:
             return
         # One block per owning verifier (1:1 today: a single peer).
@@ -236,7 +357,8 @@ class DecoupledDraftManager:
             by_verifier.setdefault(draft_key.src_verifier_rank, []).append(draft_key)
         for verifier_rank, draft_keys in by_verifier.items():
             round_start = time.monotonic()
-            packed = self.engine.draft_round(draft_keys)
+            with stage(f"round[bs={len(draft_keys)}]"):
+                packed = self.engine.draft_round(draft_keys)
             round_s = time.monotonic() - round_start
             self._round_ct += 1
             self._round_time_s += round_s
@@ -268,10 +390,14 @@ class DecoupledDraftManager:
                         "decoupled drafter round breakdown: %s",
                         self.engine.profiler.summary(),
                     )
-            self._push_block(verifier_rank=verifier_rank, packed=packed)
+            with stage("push-block"):
+                self._push_block(verifier_rank=verifier_rank, packed=packed)
         if self._enable_top1_prerun:
             for draft_key in list(touched) + list(confirmed):
                 self._prerun_keys[draft_key] = None
+        if self._prep_ahead:
+            for draft_key in touched:
+                self._prep_keys[draft_key] = None
 
     def _maybe_adjust_fanout(self, *, round_ms: float) -> None:
         """Feedback controller for the engine's effective fanout.

@@ -840,9 +840,25 @@ class MambaPool:
 
     @cached_property
     def _conv_slot_desc(self):
-        from sglang.srt.mem_cache.mamba_slot_fused import build_conv_slot_descriptor
+        from sglang.srt.mem_cache.mamba_slot_fused import build_slot_descriptor
 
-        return build_conv_slot_descriptor(self.mamba_cache.conv)
+        return build_slot_descriptor(self.mamba_cache.conv)
+
+    @cached_property
+    def _temporal_fuse_ok(self) -> bool:
+        """Whether the temporal (SSM) state may use the fused slot kernel too.
+        The PyTorch reference ``temporal[:, dst] = temporal[:, src]`` is a
+        gather (materializing an intermediate) plus a scatter -- two kernels
+        and twice the bandwidth; the fused kernel copies rows in one pass."""
+        from sglang.srt.mem_cache.mamba_slot_fused import slot_fuse_supported
+
+        return not _is_npu and slot_fuse_supported(self.mamba_cache.temporal)
+
+    @cached_property
+    def _temporal_slot_desc(self):
+        from sglang.srt.mem_cache.mamba_slot_fused import build_slot_descriptor
+
+        return build_slot_descriptor([self.mamba_cache.temporal])
 
     def _should_fuse_slot_ops(self) -> bool:
         return self._conv_fuse_ok and not envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.get()
@@ -854,7 +870,11 @@ class MambaPool:
 
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
+            if self._temporal_fuse_ok:
+                from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_slots
+
+                fused_clear_slots(self._temporal_slot_desc, indices)
+            elif temporal.numel() > 0:
                 temporal[:, indices] = 0
             return
         if not _is_npu:
@@ -907,7 +927,11 @@ class MambaPool:
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
             temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
+            if self._temporal_fuse_ok:
+                from sglang.srt.mem_cache.mamba_slot_fused import fused_copy_slots
+
+                fused_copy_slots(self._temporal_slot_desc, src_indices, dst_indices)
+            elif temporal.numel() > 0:
                 temporal[:, dst_indices] = temporal[:, src_indices]
         else:
             for i in range(len(self.mamba_cache.conv)):
@@ -1135,6 +1159,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+        # Private state rows past the allocator's slot space; only a clone that
+        # asked for them has any (see clone_with_new_mamba).
+        self.mamba_scratch_slots: Optional[torch.Tensor] = None
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
@@ -1225,25 +1252,40 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: BaseLinearStateParams,
         device: str,
         enable_mamba_extra_buffer: bool,
-        draft_model_idx: int,
+        mamba_layer_ids: List[int],
+        num_scratch_slots: int = 0,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
     ) -> HybridReqToTokenPool:
         """Shallow copy that shares the req_to_token mapping but owns a fresh mamba
-        pool keyed on a single draft layer. Used by multi-layer EAGLE draft workers:
-        each draft head shares the target's request-to-token mapping but needs its
-        own sconv/mamba cache at layer_id=draft_model_idx.
+        pool keyed on the given layer ids. Used by draft workers, which share the
+        target's request-to-token mapping but need their own sconv/mamba cache:
+        a multi-layer EAGLE head owns one layer (``[draft_model_idx]``), a hybrid
+        STANDALONE draft model owns every linear-attention layer of its own trunk.
+
+        ``num_scratch_slots`` grows the clone's state pool past the shared slot
+        space by that many rows and publishes them as ``mamba_scratch_slots``.
+        They are the CLONE'S OWN scratch: the scheduler allocates request slots
+        from the target pool's allocator, which never reaches these ids, so
+        holding them forever stays invisible to the pool-leak invariant.
         """
         clone = copy.copy(self)
         clone._init_mamba_pool(
-            mamba_size=mamba_size,
+            mamba_size=mamba_size + num_scratch_slots,
             mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
-            mamba_layer_ids=[draft_model_idx],
+            mamba_layer_ids=mamba_layer_ids,
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+        )
+        clone.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+        clone.mamba_scratch_slots = torch.arange(
+            mamba_size,
+            mamba_size + num_scratch_slots,
+            dtype=torch.int32,
+            device=device,
         )
         clone.req_index_to_mamba_index_mapping = self.req_index_to_mamba_index_mapping
         if enable_mamba_extra_buffer:
@@ -2713,6 +2755,15 @@ class MHATokenToKVPool(KVCache):
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
         if self.use_hnd:
+            if self._hnd_move_desc is not None:
+                from sglang.kernels.ops.kvcache.cache_move import move_kv_cache_hnd
+
+                # One read-write pass across all layers' K/V in one launch; the
+                # indexing reference below is a gather (materializing an
+                # intermediate) plus a scatter per buffer -- twice the
+                # bandwidth and 4x the kernels per layer.
+                move_kv_cache_hnd(self._hnd_move_desc, tgt_loc, src_loc, self.page_size)
+                return
             pages_t, offs_t = tgt_loc // self.page_size, tgt_loc % self.page_size
             pages_s, offs_s = src_loc // self.page_size, src_loc % self.page_size
             for kb, vb in zip(self.k_buffer, self.v_buffer):
@@ -2721,6 +2772,19 @@ class MHATokenToKVPool(KVCache):
             return
 
         self._move_kv_cache_impl(tgt_loc, src_loc)
+
+    @cached_property
+    def _hnd_move_desc(self):
+        # Pool-stable (buffers don't move after allocation). None = unsupported
+        # layout, fall back to the indexing loop.
+        bufs = list(self.k_buffer) + list(self.v_buffer)
+        if not bufs or not all(
+            b.is_cuda and b.ndim == 4 and b.stride(-1) == 1 for b in bufs
+        ):
+            return None
+        from sglang.kernels.ops.kvcache.cache_move import build_hnd_move_descriptor
+
+        return build_hnd_move_descriptor(bufs)
 
     def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Physical move strategy. Override for layouts that change buffer identity

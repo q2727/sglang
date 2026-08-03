@@ -125,6 +125,126 @@ def copy_all_layer_kv_cache_func(
 
 
 # ---------------------------------------------------------------------------
+# move_kv_cache_hnd — single-launch token move inside HND-layout K/V buffers
+# ([num_pages, head_num, page_size, head_dim]). The PyTorch reference
+# `kb[pages_t, :, offs_t, :] = kb[pages_s, :, offs_s, :]` is a gather that
+# materializes an intermediate plus a scatter — per buffer, two kernels and
+# twice the bandwidth. A token's data is NOT one contiguous row in HND (heads
+# are strided apart), so copy_all_layer_kv_cache_tiled cannot address it; this
+# kernel walks (token, buffer, head) and copies each head's contiguous
+# head_dim block once, dtype-agnostic via byte addressing.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _move_kv_cache_hnd_kernel(
+    ptr_arr,
+    page_stride_arr,  # bytes
+    head_stride_arr,  # bytes
+    tok_stride_arr,  # bytes
+    row_bytes_arr,  # head_dim * itemsize
+    heads_arr,
+    pages_t_ptr,
+    offs_t_ptr,
+    pages_s_ptr,
+    offs_s_ptr,
+    MAX_ROW_BLOCKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    iid = tl.program_id(0)  # token
+    bid = tl.program_id(1)  # buffer (k/v x layer)
+    hid = tl.program_id(2)  # head
+    if hid >= tl.load(heads_arr + bid):
+        return
+    base = tl.cast(tl.load(ptr_arr + bid), tl.pointer_type(tl.uint8))
+    page_stride = tl.load(page_stride_arr + bid)
+    head_off = hid * tl.load(head_stride_arr + bid)
+    tok_stride = tl.load(tok_stride_arr + bid)
+    row_bytes = tl.load(row_bytes_arr + bid)
+    src = (
+        base
+        + tl.load(pages_s_ptr + iid) * page_stride
+        + head_off
+        + tl.load(offs_s_ptr + iid) * tok_stride
+    )
+    dst = (
+        base
+        + tl.load(pages_t_ptr + iid) * page_stride
+        + head_off
+        + tl.load(offs_t_ptr + iid) * tok_stride
+    )
+    for fb in tl.static_range(MAX_ROW_BLOCKS):
+        cols = fb * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < row_bytes
+        tl.store(dst + cols, tl.load(src + cols, mask=mask), mask=mask)
+
+
+_HND_BLOCK = 256
+
+
+def build_hnd_move_descriptor(buffers: list) -> dict:
+    """Pool-stable addressing arrays for `move_kv_cache_hnd`. Cache and reuse —
+    buffers don't move after allocation.
+
+    Each buffer is 4-D HND `[num_pages, head_num, page_size, head_dim]` with a
+    contiguous head_dim block (`stride(-1) == 1`); dtype is free (byte copy).
+    """
+    t0 = buffers[0]
+    device = t0.device
+    ptr, page_s, head_s, tok_s, row_b, heads = [], [], [], [], [], []
+    max_row = 0
+    for t in buffers:
+        assert t.ndim == 4 and t.stride(-1) == 1, "HND buffer with contiguous head_dim"
+        elt = t.element_size()
+        ptr.append(t.data_ptr())
+        page_s.append(t.stride(0) * elt)
+        head_s.append(t.stride(1) * elt)
+        tok_s.append(t.stride(2) * elt)
+        row_b.append(t.shape[3] * elt)
+        heads.append(t.shape[1])
+        max_row = max(max_row, t.shape[3] * elt)
+    to_i64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=device)
+    return dict(
+        ptr=to_i64(ptr),
+        page_stride=to_i64(page_s),
+        head_stride=to_i64(head_s),
+        tok_stride=to_i64(tok_s),
+        row_bytes=to_i64(row_b),
+        heads=to_i64(heads),
+        max_heads=max(heads),
+        max_row_blocks=triton.cdiv(max_row, _HND_BLOCK),
+        num_buffers=len(buffers),
+    )
+
+
+def move_kv_cache_hnd(
+    desc: dict, tgt_loc: torch.Tensor, src_loc: torch.Tensor, page_size: int
+) -> None:
+    """Move tokens `src_loc -> tgt_loc` (flat slot ids) across every HND buffer
+    in one launch, one read-write pass. src and tgt must be disjoint."""
+    n = tgt_loc.numel()
+    if n == 0 or desc["num_buffers"] == 0:
+        return
+    tgt = tgt_loc.to(torch.int64)
+    src = src_loc.to(torch.int64)
+    grid = (n, desc["num_buffers"], desc["max_heads"])
+    _move_kv_cache_hnd_kernel[grid](
+        desc["ptr"],
+        desc["page_stride"],
+        desc["head_stride"],
+        desc["tok_stride"],
+        desc["row_bytes"],
+        desc["heads"],
+        tgt // page_size,
+        tgt % page_size,
+        src // page_size,
+        src % page_size,
+        MAX_ROW_BLOCKS=desc["max_row_blocks"],
+        BLOCK=_HND_BLOCK,
+    )
+
+
+# ---------------------------------------------------------------------------
 # store_cache_4d — single-launch Triton write into the 4-D page-major envelope
 # K/V views. At `PAGE_SIZE = 1` the kernel constexpr-folds to byte-identical
 # addresses as the slot-major envelope view; at `PAGE_SIZE > 1` it uses the

@@ -60,7 +60,10 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    draft_worker_runs_complete_model,
+)
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -181,11 +184,22 @@ class KVCacheConfigurator:
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
+    is_mtp_head_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        # A draft worker whose model is a single grafted block (MTP / NextN /
+        # EAGLE head): one full-attention layer at id 0 and no recurrent plane.
+        # A STANDALONE draft runs a complete model instead and sizes its pools
+        # from its own layer layout, exactly like the target.
+        self.is_mtp_head_draft = self.is_draft_worker and not (
+            draft_worker_runs_complete_model(
+                is_draft_worker=self.is_draft_worker,
+                spec_algorithm=self.spec_algorithm,
+            )
+        )
         # Each multi-layer EAGLE MTP head owns one transformer block at
         # layer_id=draft_model_idx; heads at a banded 's' depth route that layer
         # into the SWA ring sub-pool (draft_swa_full_capacity) so the SWA
@@ -363,7 +377,41 @@ class KVCacheConfigurator:
                     cache_params=self.mambaish_config.mamba2_cache_params,
                     device=self.device,
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    draft_model_idx=self.draft_model_idx,
+                    mamba_layer_ids=[self.draft_model_idx],
+                    speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                )
+            elif (
+                not self.is_mtp_head_draft
+                and self.mambaish_config is not None
+                and isinstance(req_to_token_pool, HybridReqToTokenPool)
+            ):
+                # A hybrid STANDALONE draft model owns a per-request recurrent
+                # state per linear-attention layer, and it is a DIFFERENT state
+                # from the target's: sharing the target's mamba pool would map
+                # both models' layer i onto one slot row and have each clobber
+                # the other every forward. Clone the pool -- same request->slot
+                # mapping (the scheduler allocates slots on the target's pool
+                # only), own conv/ssm tensors shaped from the DRAFT's cache
+                # params. Sized to the target pool's slot count: one slot per
+                # live request either way. No extra buffer: the mamba radix
+                # checkpoints are target-side, and the draft never restores a
+                # tracked prefix state.
+                req_to_token_pool = req_to_token_pool.clone_with_new_mamba(
+                    mamba_size=req_to_token_pool.mamba_pool.size,
+                    mamba_spec_state_size=sizes.max_running_requests,
+                    cache_params=self.mambaish_config.mamba2_cache_params,
+                    device=self.device,
+                    enable_mamba_extra_buffer=False,
+                    mamba_layer_ids=[
+                        i
+                        for i in self.mambaish_config.mamba2_cache_params.layers
+                        if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                    ],
+                    # Private rows the draft worker's recurrent rollback needs:
+                    # one committed-state snapshot per concurrently running
+                    # request, plus one junk row the fixed-width draft-extend
+                    # window scans its padding through.
+                    num_scratch_slots=sizes.max_running_requests + 1,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                 )
 
@@ -1275,7 +1323,7 @@ class KVCacheConfigurator:
             }
         full_attention_layer_ids = (
             [0]
-            if self.is_draft_worker
+            if self.is_mtp_head_draft
             else [
                 i
                 for i in self.mambaish_config.full_attention_layer_ids

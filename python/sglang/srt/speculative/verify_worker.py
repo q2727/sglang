@@ -41,6 +41,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import ServerArgs
@@ -54,6 +55,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import get_plan_stream
+from sglang.srt.utils.nvtx_utils import profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -242,6 +244,10 @@ class VerifyWorker(BaseVerifyWorker):
         # consumes them for hit / fallback accounting. A queue (not a single
         # slot) because the overlap scheduler defers result processing by one
         # launch, so two rounds' outcomes can be pending at once.
+        # Verify prep-ahead (block-independent half before the C6 gate wait):
+        # per-bs placeholder unit buffers; the select overwrites them in place.
+        self._verify_prep_ahead = envs.SGLANG_ENABLE_DECOUPLED_VERIFY_PREP_AHEAD.get()
+        self._placeholder_units: dict[int, torch.Tensor] = {}
         self.select_hits_queue: deque[torch.Tensor] = deque()
         # C6 launch gate, injected by DecoupledVerifyManager: called with the
         # batch at decode-launch, before the select gather, to (boundedly)
@@ -279,12 +285,27 @@ class VerifyWorker(BaseVerifyWorker):
         # C6 gate: bounded host wait for the blocks this round's select reads.
         # Under the overlap scheduler this runs while the previous round is
         # still executing on the GPU, hiding the drafter latency behind it.
-        if self.select_gate is not None and not batch.forward_mode.is_idle():
+        prepared_verify = None
+        if (
+            self._verify_prep_ahead
+            and self.select_gate is not None
+            and not batch.forward_mode.is_idle()
+        ):
+            # Block-independent half BEFORE the gate: at topk == 1 the tree
+            # mask/positions never depend on token values, so the wait only
+            # has to cover select + one in-place copy + launch.
+            select_input = batch.spec_info
+            verify_input, prepared_verify = self._prepare_verify_prelude(batch)
             self.select_gate(batch)
-
-        verify_input = self._build_verify_input(batch)
-        batch.spec_info = verify_input
-        batch_output = self._verify(batch)
+            selected = self._select_units_tp_safe(batch, select_input)
+            verify_input.draft_token.copy_(selected.view(-1))
+            batch.spec_info = verify_input
+        else:
+            if self.select_gate is not None and not batch.forward_mode.is_idle():
+                self.select_gate(batch)
+            verify_input = self._build_verify_input(batch)
+            batch.spec_info = verify_input
+        batch_output = self._verify(batch, prepared_verify=prepared_verify)
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
         if self.commit_relay is not None and not batch.forward_mode.is_idle():
@@ -372,7 +393,8 @@ class VerifyWorker(BaseVerifyWorker):
         manager's accounting, lives there).
         """
         if self._tp_size == 1:
-            selected, hits = self._select_enum_units(batch, select_input)
+            with profile_range("verifier.select_units"):
+                selected, hits = self._select_enum_units(batch, select_input)
             self.select_hits_queue.append(hits)
             return selected
         if self._tp_rank == 0:
@@ -386,7 +408,57 @@ class VerifyWorker(BaseVerifyWorker):
             )
         return get_tp_group().broadcast(selected, src=0)
 
-    def _verify(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def _prepare_verify_prelude(self, batch: ScheduleBatch):
+        """Pre-gate half of the verify round: build the verify input on a
+        placeholder unit buffer (zeros are valid token ids; the select
+        overwrites the whole row in place) and run eagle_prepare_for_verify.
+        Returns (verify_input, (verify_forward_batch, can_run_cuda_graph))."""
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_verify
+
+        bs = len(batch.reqs)
+        width = self.speculative_num_draft_tokens
+        placeholder = self._placeholder_units.get(bs)
+        if placeholder is None:
+            placeholder = torch.zeros(
+                (bs, width), dtype=torch.int64, device=self.device
+            )
+            self._placeholder_units[bs] = placeholder
+        draft_input = EagleDraftInput(
+            bonus_tokens=placeholder[:, 0].to(torch.int32).contiguous()
+        )
+        verify_input = build_eagle_verify_input(
+            batch,
+            draft_input,
+            self._chain_parents[:bs],
+            self._chain_score_indices[:bs],
+            placeholder[:, 1:].contiguous(),
+            None,
+            target_worker=self.target_worker,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=width,
+            tree_mask_mode=self.tree_mask_mode,
+            device=self.device,
+        )
+        batch.spec_info = verify_input
+        with self.plan_stream_ctx:
+            prepared = eagle_prepare_for_verify(
+                verify_input,
+                self.req_to_token_pool,
+                batch,
+                self.target_worker,
+            )
+        return verify_input, prepared
+
+    def _verify(
+        self, batch: ScheduleBatch, *, prepared_verify=None
+    ) -> GenerationBatchResult:
+        with profile_range("verifier.verify_forward"):
+            return self._verify_inner(batch, prepared_verify=prepared_verify)
+
+    def _verify_inner(
+        self, batch: ScheduleBatch, *, prepared_verify=None
+    ) -> GenerationBatchResult:
         batch_output = run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -400,6 +472,7 @@ class VerifyWorker(BaseVerifyWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,  # identity at topk == 1
+            prepared_verify=prepared_verify,
         )
         # Next round's select keys, all GPU-resident (no host sync):
         # - the new bonus is the next root;

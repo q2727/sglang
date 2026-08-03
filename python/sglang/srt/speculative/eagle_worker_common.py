@@ -467,6 +467,7 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
+    prepared_verify: Optional[tuple] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -487,14 +488,20 @@ def run_eagle_verify(
     bs = len(batch.seq_lens)
 
     # Batch 1: Target verify
-    # Prepare for target verify in a separate stream
-    with plan_stream_ctx:
-        verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
-            verify_input,
-            req_to_token_pool,
-            batch,
-            target_worker,
-        )
+    # Prepare for target verify in a separate stream. A caller that already
+    # ran the prepare (the decoupled verifier hoists it before its C6 gate
+    # wait; only the token VALUES arrive later, via draft_token.copy_) hands
+    # the result in instead.
+    if prepared_verify is not None:
+        verify_forward_batch, can_run_cuda_graph = prepared_verify
+    else:
+        with plan_stream_ctx:
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                verify_input,
+                req_to_token_pool,
+                batch,
+                target_worker,
+            )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)

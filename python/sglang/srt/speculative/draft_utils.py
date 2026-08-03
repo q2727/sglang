@@ -1,3 +1,8 @@
+from typing import Optional
+
+import torch
+
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -396,3 +401,143 @@ class DraftBackendFactory:
         )
 
         return DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False)
+
+
+class HybridMultiStepDraftBackend:
+    """Multi-step draft-decode backend for a draft model that owns
+    linear-attention layers (a hybrid STANDALONE draft).
+
+    ``EagleDraftWorker.draft_forward`` runs draft step ``i`` under a
+    ForwardContext carrying ``attn_backends[i]``, and a hybrid model resolves
+    EVERY layer -- recurrent ones included -- through that one context
+    backend. So each per-step entry must be a complete
+    :class:`HybridLinearAttnBackend`, not the pure-attention step backend.
+
+    This composite leaves the pure-attention multi-step backend untouched
+    (several backend families index into their own ``attn_backends`` list for
+    kv-split / metadata internals, so its entries must stay pure) and exposes
+    a parallel list of per-step wrappers. All steps share ONE recurrent
+    sidecar: a chain step is a single-token decode that advances the row's
+    state in place, so the recurrent metadata (per-row state slots) is
+    step-invariant.
+    """
+
+    def __init__(
+        self,
+        *,
+        full_multi_step_backend,
+        linear_attn_backend,
+        full_attn_layers: list[int],
+    ):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        self.full_multi_step_backend = full_multi_step_backend
+        self.linear_attn_backend = linear_attn_backend
+        self.attn_backends = [
+            HybridLinearAttnBackend(step_backend, linear_attn_backend, full_attn_layers)
+            for step_backend in full_multi_step_backend.attn_backends
+        ]
+        self.needs_cpu_seq_lens = (
+            full_multi_step_backend.needs_cpu_seq_lens
+            or linear_attn_backend.needs_cpu_seq_lens
+        )
+        self.max_context_len = full_multi_step_backend.max_context_len
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        self.full_multi_step_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+        self.linear_attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self.full_multi_step_backend.init_forward_metadata(forward_batch)
+        self.linear_attn_backend.init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        self.full_multi_step_backend.init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+        self.linear_attn_backend.init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        self.full_multi_step_backend.init_forward_metadata_in_graph(forward_batch)
+        self.linear_attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    # No on_after_cuda_graph_warmup: the multi-step draft backends don't define
+    # one (the draft graph runner probes for it), and the recurrent sidecar
+    # inherits the base no-op -- it keeps no warmup-dirtied state to undo.
+
+
+def resolve_hybrid_draft_full_attn_layers(draft_model_runner) -> Optional[list[int]]:
+    """Full-attention layer ids of a draft model that ALSO has recurrent
+    (linear-attention) layers; ``None`` when the draft has no recurrent plane.
+
+    ``None`` is the historical case and every historical path stays on its old
+    code: pure-attention draft models, and MTP / NextN heads. The head case
+    needs BOTH tests -- a head grafted onto a hybrid trunk still gets a hybrid
+    wrapper from the backend registry, but with the single grafted block
+    declared full-attention, so its recurrent plane is never reached.
+    """
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.speculative.spec_info import draft_worker_runs_complete_model
+
+    if not draft_worker_runs_complete_model(
+        is_draft_worker=draft_model_runner.is_draft_worker,
+        spec_algorithm=draft_model_runner.spec_algorithm,
+    ):
+        return None
+    main_backend = draft_model_runner.attn_backend
+    if not isinstance(main_backend, HybridLinearAttnBackend):
+        return None
+    return main_backend.full_attn_layers
+
+
+def build_hybrid_draft_decode_backend(
+    *,
+    full_multi_step_backend,
+    draft_model_runner,
+    full_attn_layers: list[int],
+):
+    """Wrap the pure-attention multi-step draft-decode backend for a hybrid draft."""
+    from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+    return HybridMultiStepDraftBackend(
+        full_multi_step_backend=full_multi_step_backend,
+        # A fresh sidecar: the draft-extend plane sizes its own metadata for
+        # the W-token verify window, this one for single-token chain steps.
+        linear_attn_backend=GDNAttnBackend(draft_model_runner),
+        full_attn_layers=full_attn_layers,
+    )
+
+
+def build_hybrid_draft_extend_backend(
+    *,
+    full_attn_backend,
+    draft_model_runner,
+    full_attn_layers: list[int],
+    num_draft_tokens: int,
+    pad_state_slot: torch.Tensor,
+):
+    """Wrap the pure-attention draft-extend backend for a hybrid draft.
+
+    ``pad_state_slot`` is a PHYSICAL state slot the sidecar scans every pad
+    segment of the fixed-width extend window through; see
+    ``GDNAttnBackend.draft_extend_v2_pad_state_slot``. Setting it is also what
+    turns the recurrent plane on for DRAFT_EXTEND_V2 forwards
+    (``serves_draft_extend_v2``).
+    """
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+    gdn_sidecar = GDNAttnBackend(draft_model_runner)
+    gdn_sidecar.draft_extend_v2_num_tokens_per_req = num_draft_tokens
+    gdn_sidecar.draft_extend_v2_pad_state_slot = int(pad_state_slot.item())
+    return HybridLinearAttnBackend(full_attn_backend, gdn_sidecar, full_attn_layers)

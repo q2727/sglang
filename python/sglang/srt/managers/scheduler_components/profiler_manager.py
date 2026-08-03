@@ -409,17 +409,26 @@ class SchedulerProfilerManager:
             else:
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
-            # Check profiler
-            if (
-                self.profiler_target_forward_ct
-                and self.profiler_target_forward_ct <= self.get_forward_ct()
-            ):
-                self._stop_profile()
-            if (
-                self.profiler_start_forward_ct
-                and self.profiler_start_forward_ct == self.get_forward_ct()
-            ):
-                self._start_profile()
+            self._profile_forward_ct_predicate()
+
+    def _profile_forward_ct_predicate(self):
+        """Start / stop against the forward-count window.
+
+        The non-by-stage arm of ``_profile_batch_predicate``, and the whole
+        predicate for event loops that have a forward counter but no
+        ``ScheduleBatch`` to read a stage off (the decoupled drafter's
+        enumeration-round loop).
+        """
+        if (
+            self.profiler_target_forward_ct
+            and self.profiler_target_forward_ct <= self.get_forward_ct()
+        ):
+            self._stop_profile()
+        if (
+            self.profiler_start_forward_ct
+            and self.profiler_start_forward_ct == self.get_forward_ct()
+        ):
+            self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
         if recv_req.req_type == ProfileReqType.START_PROFILE:

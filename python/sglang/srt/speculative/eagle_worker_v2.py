@@ -50,7 +50,12 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_utils import (
+    DraftBackendFactory,
+    build_hybrid_draft_decode_backend,
+    build_hybrid_draft_extend_backend,
+    resolve_hybrid_draft_full_attn_layers,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -366,10 +371,117 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_backend_factory.create_draft_extend_backend()
         )
 
+        self._init_recurrent_draft_planes()
+
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = default_tree_mask_mode()
+
+    def _init_recurrent_draft_planes(self) -> None:
+        """Give a hybrid (linear-attention) draft model a recurrent plane on
+        both draft phases, plus the scratch slots its rollback needs.
+
+        The backends the factory returns above are pure-attention ones, but a
+        hybrid draft model dispatches EVERY layer -- recurrent included --
+        through whatever backend the ForwardContext carries, so both the
+        per-step chain backends and the draft-extend backend have to be full
+        wrappers. Historical drafts (pure-attention models, MTP / NextN heads)
+        have no recurrent plane and keep the factory's output untouched.
+        """
+        # Two separate facts: whether the draft model HAS a recurrent plane
+        # (drives the per-phase wrappers and the draft-extend length contract),
+        # and whether its state is rolled back (the A/B knob).
+        self._draft_has_recurrent_plane = False
+        self._recurrent_state_scratch: Optional[torch.Tensor] = None
+        full_attn_layers = resolve_hybrid_draft_full_attn_layers(self.draft_runner)
+        if full_attn_layers is None:
+            return
+        self._draft_has_recurrent_plane = True
+        if self.topk != 1:
+            raise NotImplementedError(
+                "A hybrid (linear-attention) draft model supports chain drafting "
+                f"only (--speculative-eagle-topk 1), got {self.topk}: one "
+                "recurrent state per request cannot fork across tree branches."
+            )
+        draft_pool = self.draft_runner.req_to_token_pool
+        if draft_pool.mamba_pool.replayssm_write_pos is not None:
+            raise NotImplementedError(
+                "A hybrid draft model rolls its recurrent state back with "
+                "MambaPool.copy_from, which requires a fully flushed checkpoint "
+                "as the source, but the draft state pool carries a ReplaySSM "
+                "ring whose pending entries copy_from drops; launch without "
+                "--enable-linear-replayssm."
+            )
+        # Private state rows the pool set aside for exactly this (one snapshot
+        # per running request + one pad row). They live past the slot space the
+        # scheduler's allocator hands out, so nothing can alias them and the
+        # pool-leak invariant never sees them held.
+        reserved = draft_pool.mamba_scratch_slots
+        num_scratch = draft_pool.size
+        assert reserved is not None and reserved.shape[0] == num_scratch + 1, (
+            "a hybrid draft state pool must carry num_scratch_slots == "
+            f"max_running_requests + 1 ({num_scratch + 1}), got "
+            f"{None if reserved is None else reserved.shape[0]}"
+        )
+        if envs.SGLANG_ENABLE_DRAFT_RECURRENT_STATE_ROLLBACK.get():
+            self._recurrent_state_scratch = reserved[:num_scratch]
+        # Junk state row every pad segment of the fixed-width draft-extend
+        # window scans through; zeroed once here because the gating kernel
+        # loads its initial state unconditionally and a fresh pool row is
+        # uninitialized memory.
+        pad_state_slot = reserved[num_scratch:]
+        draft_pool.mamba_pool.clear_slots(pad_state_slot)
+        if self.draft_attn_backend is not None:
+            self.draft_attn_backend = build_hybrid_draft_decode_backend(
+                full_multi_step_backend=self.draft_attn_backend,
+                draft_model_runner=self.draft_runner,
+                full_attn_layers=full_attn_layers,
+            )
+        self.draft_extend_attn_backend = build_hybrid_draft_extend_backend(
+            full_attn_backend=self.draft_extend_attn_backend,
+            draft_model_runner=self.draft_runner,
+            full_attn_layers=full_attn_layers,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            pad_state_slot=pad_state_slot,
+        )
+        log_info_on_rank0(
+            logger,
+            "Hybrid draft model: recurrent plane wired into draft decode + "
+            f"draft extend (full-attn layers={full_attn_layers}), "
+            f"state rollback={self._recurrent_state_scratch is not None}",
+        )
+
+    def _live_recurrent_slots(self, batch: ScheduleBatch) -> torch.Tensor:
+        pool = self.draft_runner.req_to_token_pool
+        return pool.translate_mamba_indices(
+            pool.get_mamba_indices(batch.req_pool_indices)
+        )
+
+    def save_recurrent_state(self, batch: ScheduleBatch) -> None:
+        """Snapshot the draft model's committed recurrent state for this batch.
+
+        Paired with :meth:`restore_recurrent_state`. A no-op unless the draft
+        model has a recurrent plane and the rollback is enabled.
+        """
+        if self._recurrent_state_scratch is None or batch.forward_mode.is_idle():
+            return
+        live = self._live_recurrent_slots(batch)
+        self.draft_runner.req_to_token_pool.mamba_pool.copy_from(
+            src_indices=live,
+            dst_indices=self._recurrent_state_scratch[: live.shape[0]],
+        )
+
+    def restore_recurrent_state(self, batch: ScheduleBatch) -> None:
+        """Undo the draft steps' recurrent advance, back to the committed state
+        snapshotted by :meth:`save_recurrent_state` earlier this iteration."""
+        if self._recurrent_state_scratch is None or batch.forward_mode.is_idle():
+            return
+        live = self._live_recurrent_slots(batch)
+        self.draft_runner.req_to_token_pool.mamba_pool.copy_from(
+            src_indices=self._recurrent_state_scratch[: live.shape[0]],
+            dst_indices=live,
+        )
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -879,6 +991,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            # A recurrent draft model must scan exactly the accepted tokens of
+            # this window, not its padded width: the restore above put its
+            # state back at the committed prefix, and this extend is what
+            # re-advances it. None for pure-attention / MTP-head drafts, which
+            # have no recurrent plane to length-limit.
+            gdn_true_extend_lens_tensor=(
+                batch_result.accept_lens if self._draft_has_recurrent_plane else None
+            ),
         )
         select_index = (
             torch.arange(
@@ -1189,6 +1309,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
+                    # A recurrent (linear-attention) draft model carries a
+                    # running state summary, not a rewritable cache: the draft
+                    # steps below advance it over tokens the target may reject,
+                    # and unlike draft KV that cannot be overwritten after the
+                    # fact. Snapshot the committed state here; the restore
+                    # before draft_extend re-advances it over exactly the
+                    # accepted tokens instead of compounding the rejected ones.
+                    self.draft_worker.save_recurrent_state(batch)
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
@@ -1210,6 +1338,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
+                    if self.speculative_num_steps > 0:
+                        self.draft_worker.restore_recurrent_state(batch)
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output

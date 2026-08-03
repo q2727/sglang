@@ -412,7 +412,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "If this is a custom hybrid model, use register_linear_attn_model() "
                     "from sglang.srt.configs.linear_attn_model_registry."
                 )
-        if runner.is_draft_worker:
+        from sglang.srt.speculative.spec_info import draft_worker_runs_complete_model
+
+        if runner.is_draft_worker and not draft_worker_runs_complete_model(
+            is_draft_worker=True, spec_algorithm=runner.spec_algorithm
+        ):
             # FIXME: we assume that MTP/NEXTN always use full-attention.
             full_attn_layers = [0]
         else:

@@ -292,6 +292,23 @@ class SpeculativeAlgorithm(Enum):
         raise ValueError("Unreachable code path in create_worker.")
 
 
+def draft_worker_runs_complete_model(
+    *, is_draft_worker: bool, spec_algorithm: SpeculativeAlgorithm
+) -> bool:
+    """True when this draft worker runs a COMPLETE model of its own.
+
+    Every other draft flavor (MTP / NextN / EAGLE heads) is a single
+    transformer block grafted onto the target's trunk, which is why the
+    draft-worker branches of the pool and attention-backend builders may
+    assume "one full-attention layer at id 0, no recurrent plane". A
+    STANDALONE draft keeps its own architecture and every one of its layers,
+    so on a hybrid (linear-attention) draft model those branches would size
+    one full-attention KV layer for six and route the linear layers into the
+    full-attention plane. Callers pick the target-side branch instead.
+    """
+    return is_draft_worker and spec_algorithm.is_standalone()
+
+
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it

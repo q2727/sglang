@@ -409,6 +409,39 @@ class Envs:
     # deltas, capture-bucket overflow) or entirely (construction failure,
     # this switch off).
     SGLANG_ENABLE_DECOUPLED_EXTEND_GRAPH = EnvBool(True)
+    # Decoupled spec: stage the drafter round's small index/length tensors
+    # through pinned memory so their host-to-device copies stay asynchronous.
+    # The unstaged form issues a synchronous pageable copy, which blocks the
+    # host until the stream drains -- a full pipeline barrier per call. False
+    # restores the direct (barriering) copies.
+    SGLANG_ENABLE_DECOUPLED_PINNED_H2D = EnvBool(True)
+    # Decoupled spec: run the drafter's guess-topk as one fused kernel
+    # (in-kernel dead-guess exclusion + top-F) instead of scatter + torch.topk
+    # (~12 launches). False restores the aten pair.
+    SGLANG_ENABLE_DECOUPLED_FUSED_TOPK = EnvBool(True)
+    # Decoupled spec: prebuild the next fast round's allocation + batch
+    # skeleton (delta hypothesized at its K+1 maximum) in the drafter's idle
+    # window, so the post-commit path only fills the actual delta tokens and
+    # launches. False restores the fully inline build.
+    SGLANG_ENABLE_DECOUPLED_PREP_AHEAD = EnvBool(True)
+    # Decoupled spec: stage the whole branch chain's K decode steps up front
+    # (allocation, seq-lens family, ForwardBatch construction); the step loop
+    # then only rebinds input tokens and replays. False restores the
+    # step-by-step prepare_for_decode loop. (The fa3 cascade path keeps the
+    # per-step loop either way.)
+    SGLANG_ENABLE_DECOUPLED_CHAIN_PLAN = EnvBool(True)
+    # Decoupled spec: capture the whole K-step branch chain (forward + argmax
+    # + feed-next + seq advance) as ONE CUDA graph per row-count bucket,
+    # replacing K decode-graph replays plus their eager glue. Capture happens
+    # on first use and executes that round for real; failure falls back to
+    # the step-by-step chain permanently. Default off until gated.
+    SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH = EnvBool(False)
+    # Decoupled spec: build the verify round's block-INDEPENDENT half (tree
+    # buffers, cache-loc assignment, ForwardBatch) BEFORE the C6 gate wait, so
+    # the block's arrival only pays select + one device copy + launch. At
+    # topk == 1 the tree mask/positions never depend on token values; the
+    # selected units land via draft_token.copy_. False restores prep-after-gate.
+    SGLANG_ENABLE_DECOUPLED_VERIFY_PREP_AHEAD = EnvBool(True)
     # Decoupled spec: spend the drafter's enumeration columns per accept case
     # instead of uniformly. Case a < K is only reached by verify REJECTING
     # backbone token c_{a+1}, so its bonus is a rank-2+ candidate, while case
@@ -862,6 +895,14 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # A/B knob for the recurrent-state rollback a hybrid (linear-attention)
+    # STANDALONE draft model needs: snapshot the draft's conv/ssm state before
+    # the draft steps and restore it before draft_extend, so the state advances
+    # over exactly the accepted tokens instead of accumulating the rejected
+    # ones. Off means the draft's recurrent state compounds junk every round
+    # (outputs stay correct -- the target verifies -- but acceptance collapses
+    # toward 1). No effect on pure-attention draft models.
+    SGLANG_ENABLE_DRAFT_RECURRENT_STATE_ROLLBACK = EnvBool(True)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

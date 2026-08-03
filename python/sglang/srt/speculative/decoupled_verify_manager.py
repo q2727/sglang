@@ -55,6 +55,7 @@ from sglang.srt.speculative.verifier_ipc_thread import (
     EventedVerifyCommits,
     VerifierIpcThread,
 )
+from sglang.srt.utils.nvtx_utils import profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -373,7 +374,11 @@ class DecoupledVerifyManager:
             expected[req.req_pool_idx] = stamp
         t_wait = time.monotonic() if self._profile else 0.0
         if expected and self.arrival_wait_s > 0:
-            arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
+            # Named for the chrome trace: this range IS the bubble on the
+            # verifier's compute stream (the CPU parks here while the GPU
+            # drains, waiting for the drafter's block to land).
+            with profile_range("verifier.c6_gate_wait"):
+                arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
             if not arrived:
                 self.sync_wait_timeout_ct += 1
                 with self.arrival_board._cond:

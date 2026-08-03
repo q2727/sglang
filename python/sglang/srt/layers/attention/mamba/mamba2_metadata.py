@@ -49,6 +49,10 @@ class ForwardMetadata:
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # DRAFT_EXTEND_V2 doubled half-rows: per-half-row "continue from this
+    # slot's state" flag, [2 * rows] bool (real halves True, pad halves False).
+    # A static graph buffer on the replay path, freshly built on the eager one.
+    has_initial_states: Optional[torch.Tensor] = None
     # For prefill radix cache
     track_conv_indices: Optional[torch.Tensor] = None
     track_ssm_h_src: Optional[torch.Tensor] = None

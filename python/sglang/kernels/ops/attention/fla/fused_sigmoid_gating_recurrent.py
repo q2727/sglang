@@ -50,6 +50,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    CACHE_TAIL_ALIGNED: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
 ):
     """
@@ -120,8 +121,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
+    cache_step_base = 0
     if CACHE_INTERMEDIATE_STATES:
         cache_idx = tl.load(intermediate_state_indices + i_n)
+        if CACHE_TAIL_ALIGNED:
+            # Dump the LAST `cache_steps` states instead of the first ones:
+            # cache slot `cache_steps - 1` always holds the state after this
+            # segment's final token and slot `cache_steps - 1 - j` the state
+            # `j` tokens earlier, whatever the segment length T is. Callers
+            # that only need a fixed-size tail window (the draft-extend node
+            # states) then index the buffer without any per-row arithmetic,
+            # and the buffer is sized by the window, not by max T.
+            # `T` is a device read, so a captured graph replays any T.
+            cache_step_base = T - cache_steps
 
     step_idx = 0
     for _ in range(0, T):
@@ -201,8 +213,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Cache intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
-            if cache_idx >= 0:
-                step_offset = step_idx * HV * K * V
+            cache_slot = step_idx - cache_step_base
+            store_state = cache_idx >= 0
+            if CACHE_TAIL_ALIGNED:
+                # Steps before the tail window fall outside the buffer.
+                # `cache_slot < cache_steps` needs no check: cache_step_base
+                # is T - cache_steps and step_idx < T.
+                store_state = store_state and cache_slot >= 0
+            if store_state:
+                step_offset = cache_slot * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer
                     + cache_idx * cache_steps * HV * K * V
@@ -261,6 +280,7 @@ def fused_sigmoid_gating_delta_rule_update(
     cache_steps: Optional[
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
+    cache_tail_aligned: bool = False,
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ):
     """
@@ -272,6 +292,15 @@ def fused_sigmoid_gating_delta_rule_update(
     - decode: standard single-step update with state write-back
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
+
+    ``intermediate_states_buffer`` is ``[num_cache_slots, cache_steps, ...]``
+    with the same per-slot element layout as ``initial_state_source``, and
+    ``intermediate_state_indices[i_n]`` picks the cache slot for segment
+    ``i_n`` (negative => that segment stores nothing). Step ``s`` of a segment
+    lands in cache step ``s`` by default; with ``cache_tail_aligned`` the
+    window is anchored at the segment END instead (cache step
+    ``cache_steps - 1`` = state after the segment's last token), so a caller
+    can capture a fixed-size TAIL of a variable-length segment.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
@@ -318,6 +347,15 @@ def fused_sigmoid_gating_delta_rule_update(
         if intermediate_states_buffer is not None
         else 0
     )
+    if cache_tail_aligned:
+        assert (
+            intermediate_states_buffer is not None
+        ), "cache_tail_aligned needs intermediate_states_buffer"
+        # The tree path re-reads the cache by ABSOLUTE step index
+        # (parent_step_idx), which a tail-anchored window does not carry.
+        assert (
+            retrieve_parent_token is None
+        ), "cache_tail_aligned is incompatible with tree-shaped drafts"
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -360,6 +398,7 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        CACHE_TAIL_ALIGNED=cache_tail_aligned,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,
