@@ -69,6 +69,10 @@ class ChainGraphRunner:
         self.model_runner = model_runner
         self.num_steps = num_steps
         self.device = model_runner.device
+        # Attention backends size their per-bs static metadata buffers to the
+        # decode graph's max bs; a chain with more rows would index past them
+        # (hybrid backend: state_indices_list[bs - 1] IndexError).
+        self.max_rows = model_runner.server_args.cuda_graph_config.decode.max_bs
         self._buckets: dict[int, _ChainBucket] = {}
         self._failed_rows: set[int] = set()
 
@@ -105,6 +109,15 @@ class ChainGraphRunner:
         back; the bucket is then permanently disabled)."""
         if rows in self._failed_rows:
             return None
+        if rows > self.max_rows:
+            logger.info(
+                "chain-graph: %d rows exceed the decode graph's max bs (%d); "
+                "this bucket runs the step-by-step chain",
+                rows,
+                self.max_rows,
+            )
+            self._failed_rows.add(rows)
+            return None
         bucket = self._buckets.get(rows)
         if bucket is None:
             bucket = _ChainBucket(
@@ -132,7 +145,12 @@ class ChainGraphRunner:
             with forward_context(
                 ForwardContext(attn_backend=attn_backend)
             ), torch.cuda.stream(stream):
-                with torch.cuda.graph(graph, stream=stream):
+                # thread_local: the drafter IPC thread lands/stages during
+                # lazy captures; global mode lets its CUDA calls invalidate
+                # the capture.
+                with torch.cuda.graph(
+                    graph, stream=stream, capture_error_mode="thread_local"
+                ):
                     # Python-level globals the model forward branches on are
                     # baked in AT RECORD TIME; the chain runs right after the
                     # round's extend, so both must be reset to decode

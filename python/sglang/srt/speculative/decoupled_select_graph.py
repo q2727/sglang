@@ -108,7 +108,13 @@ class SelectGraphRunner:
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                with torch.cuda.graph(graph, stream=stream):
+                # thread_local: the IPC landing thread keeps allocating and
+                # copying while this bucket captures (buckets appear lazily,
+                # mid-traffic); global mode lets ANY thread's CUDA call
+                # invalidate the capture (cudaErrorStreamCaptureInvalidated).
+                with torch.cuda.graph(
+                    graph, stream=stream, capture_error_mode="thread_local"
+                ):
                     rows, stamps = self.enum_buffer.gather(bucket.req_rows)
                     selected, hits = select_enum_units(
                         rows,
