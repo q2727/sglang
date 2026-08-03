@@ -173,6 +173,10 @@ class _PrebuiltFastRound(msgspec.Struct):
     glue_seeded: bool = False
     # bs == 1 only: per-case fused-extend staging, indexed by delta_len - 1.
     case_staging: Optional[list] = None
+    # Recorded on the prebuild stream after the skeleton's GPU work; the
+    # consuming round waits on it (record-then-wait) before touching any
+    # prebuilt tensor.
+    ready_event: Optional[torch.cuda.Event] = None
 
 
 class _RoundProfiler:
@@ -912,6 +916,14 @@ class EnumDraftEngine:
         self._pending_scratch_frees: list[torch.Tensor] = []
         self._fused_topk = envs.SGLANG_ENABLE_DECOUPLED_FUSED_TOPK.get()
         self._prep_ahead = envs.SGLANG_ENABLE_DECOUPLED_PREP_AHEAD.get()
+        # Round-invariant per-delta_len staging tensors (see
+        # prebuild_fast_round): built lazily once, reused by every restage.
+        self._case_staging_static: dict[int, tuple] = {}
+        # Restage isolation: the prebuild's pageable H2Ds and staging kernels
+        # ride a dedicated stream, so a ROUND-TAIL restage never barriers on
+        # the round's still-draining GPU tail (the reason the old idle-window
+        # prebuild almost never fired at tight cadence).
+        self._prebuild_stream = torch.cuda.Stream()
         self._chain_plan = envs.SGLANG_ENABLE_DECOUPLED_CHAIN_PLAN.get()
         self._chain_graph = None
         if self._chain_plan and envs.SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH.get():
@@ -1598,8 +1610,11 @@ class EnumDraftEngine:
                 and prebuilt.base_lens == base_lens
                 and self._enable_fused_extend
             ):
-                # Idle-window skeleton: allocation + page-table writes already
-                # happened; fill the actual delta tokens and go.
+                # Prebuilt skeleton: allocation + page-table writes already
+                # happened (on the prebuild stream); order this round's work
+                # after them, then fill the actual delta tokens and go.
+                if prebuilt.ready_event is not None:
+                    torch.cuda.current_stream().wait_event(prebuilt.ready_event)
                 self._prebuilt_fast = None
                 glue_preseeded = prebuilt.glue_seeded
                 graph_round = prebuilt.graph_round
@@ -3136,6 +3151,12 @@ class EnumDraftEngine:
         pre_batches: list = []
         pre_slots: list = []
         pre_pages: list = []
+        # The skeleton's GPU work (glue COW / mamba fork) READS state this
+        # round's main-stream kernels just wrote (seat post-absorb state,
+        # committed KV); order the prebuild stream after them first.
+        self._prebuild_stream.wait_stream(torch.cuda.current_stream())
+        stream_cm = torch.cuda.stream(self._prebuild_stream)
+        stream_cm.__enter__()
         try:
             graph_round = self._stage_extend_graph_round(
                 bs=bs,
@@ -3156,6 +3177,7 @@ class EnumDraftEngine:
                 mamba_slots=self._seat_mamba_slots(states),
             )
         except Exception:
+            stream_cm.__exit__(None, None, None)
             logger.exception("decoupled prep-ahead build failed; falling back inline")
             self._scrap_lists(pre_batches, pre_slots, pre_pages)
             return
@@ -3173,25 +3195,37 @@ class EnumDraftEngine:
             )
         case_staging = None
         if bs == 1:
-            # Idle window, stream drained (the manager gates on query()), so
-            # the direct device tensor constructions below are barrier-free
-            # in effect and must NOT go through the rotating pinned ring
-            # (these persist until consume; ring slots would be reclaimed).
+            # The gather / true-lens / node-gather tensors are ROUND-INVARIANT
+            # (pure functions of delta_len and the static graph shape): built
+            # once per delta_len and cached, so a restage does no H2D at all
+            # -- which is what lets it run at round tail with the stream
+            # still busy. Only out_cache_loc varies per round, and it is
+            # composed on-GPU (sync-free).
             case_staging = []
             chunk = slots.view(width)
-            num_steps = self.num_steps
             for delta_len in range(1, width + 1):
-                pattern = self._extend_graph_gather_pattern(delta_len)
-                true_host = [delta_len] + [delta_len + g + 1 for g in range(num_steps)]
-                w = self._extend_graph_width
-                node_off = [delta_len - 1] + [
-                    (1 + g) * w + delta_len + g for g in range(num_steps)
-                ]
+                static = self._case_staging_static.get(delta_len)
+                if static is None:
+                    pattern = self._extend_graph_gather_pattern(delta_len)
+                    true_host = [delta_len] + [
+                        delta_len + g + 1 for g in range(self.num_steps)
+                    ]
+                    w = self._extend_graph_width
+                    node_off = [delta_len - 1] + [
+                        (1 + g) * w + delta_len + g for g in range(self.num_steps)
+                    ]
+                    static = (
+                        torch.tensor(pattern, dtype=torch.int64, device=self.device),
+                        torch.tensor(true_host, dtype=torch.int32, device=self.device),
+                        true_host,
+                        torch.tensor(node_off, dtype=torch.int64, device=self.device),
+                        node_off,
+                    )
+                    self._case_staging_static[delta_len] = static
+                gather, true_lens, true_host, node_gather, node_off = static
                 case_staging.append(
                     _ExtendCaseStaging(
-                        gather=torch.tensor(
-                            pattern, dtype=torch.int64, device=self.device
-                        ),
+                        gather=gather,
                         out_cache_loc=self._extend_graph_out_cache_loc(
                             carriers=carriers,
                             seat_delta_slots=chunk[:delta_len],
@@ -3199,19 +3233,18 @@ class EnumDraftEngine:
                             delta_lens=[delta_len],
                             graph_round=graph_round,
                         ),
-                        true_lens=torch.tensor(
-                            true_host, dtype=torch.int32, device=self.device
-                        ),
+                        true_lens=true_lens,
                         true_lens_host=true_host,
-                        node_gather=torch.tensor(
-                            node_off, dtype=torch.int64, device=self.device
-                        ),
+                        node_gather=node_gather,
                         node_offsets=node_off,
                     )
                 )
         positions: list[int] = []
         for base in base_lens:
             positions.extend(range(base, base + width))
+        ready_event = torch.cuda.Event()
+        ready_event.record(self._prebuild_stream)
+        stream_cm.__exit__(None, None, None)
         self._prebuilt_fast = _PrebuiltFastRound(
             keys=tuple(keys),
             base_lens=base_lens,
@@ -3224,6 +3257,7 @@ class EnumDraftEngine:
             scratch_kv_pages=pre_pages,
             glue_seeded=True,
             case_staging=case_staging,
+            ready_event=ready_event,
         )
 
     def _scrap_lists(self, batches: list, slots_list: list, kv_pages: list) -> None:

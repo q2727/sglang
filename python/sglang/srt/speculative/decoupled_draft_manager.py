@@ -396,8 +396,27 @@ class DecoupledDraftManager:
             for draft_key in list(touched) + list(confirmed):
                 self._prerun_keys[draft_key] = None
         if self._prep_ahead:
+            # Round-tail restage, hit and miss alike: the skeleton anchors on
+            # the POST-round committed prefix, so it is valid for whatever the
+            # next commit brings; a miss no longer strands the next fast
+            # round without a prebuild. The build rides the engine's
+            # dedicated prebuild stream (no barrier on this round's GPU
+            # tail), so it does not need the idle window's drain gate -- the
+            # idle-window path below stays as a no-op fallback
+            # (_prebuilt_fast is already staged).
+            by_verifier_prep: dict[int, list[DraftReqKey]] = {}
             for draft_key in touched:
-                self._prep_keys[draft_key] = None
+                by_verifier_prep.setdefault(draft_key.src_verifier_rank, []).append(
+                    draft_key
+                )
+            for group in by_verifier_prep.values():
+                try:
+                    self.engine.prebuild_fast_round(group)
+                except Exception:
+                    logger.exception(
+                        "decoupled round-tail restage failed; next round "
+                        "builds inline"
+                    )
 
     def _maybe_adjust_fanout(self, *, round_ms: float) -> None:
         """Feedback controller for the engine's effective fanout.
