@@ -420,6 +420,22 @@ class VerifyWorker(BaseVerifyWorker):
         if got is None:
             return None
         selected, hits = got
+        if envs.SGLANG_DEBUG_DECOUPLED_SELECT_GRAPH_CHECK.get():
+            # The select is a pure function of (buffer, keys): re-running it
+            # eagerly on the same inputs is side-effect-free, so the graph
+            # can be checked in-process, per round.
+            ref_selected, ref_hits = self._select_enum_units(batch, select_input)
+            if not torch.equal(ref_selected, selected) or not torch.equal(
+                ref_hits, hits
+            ):
+                logger.warning(
+                    "select-graph mismatch: graph hits=%s eager hits=%s "
+                    "graph sel=%s eager sel=%s",
+                    hits.tolist(),
+                    ref_hits.tolist(),
+                    selected.tolist(),
+                    ref_selected.tolist(),
+                )
         # The graph's hits output is a static buffer the next replay
         # overwrites; the accounting hook consumes deferred, so queue a copy.
         self.select_hits_queue.append(hits.clone())

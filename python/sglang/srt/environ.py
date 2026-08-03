@@ -449,6 +449,10 @@ class Envs:
     # only (the TP path keeps the eager select + broadcast). Capture failure
     # falls back to the eager select permanently. Default off until gated.
     SGLANG_ENABLE_DECOUPLED_SELECT_GRAPH = EnvBool(False)
+    # Decoupled spec debug: per-round in-process graph-vs-eager compare of the
+    # select (it is a pure function, so the eager re-run is side-effect-free);
+    # mismatches are logged with both sides' outputs.
+    SGLANG_DEBUG_DECOUPLED_SELECT_GRAPH_CHECK = EnvBool(False)
     # Decoupled spec: device-side C6 gate (EXPERIMENTAL -- verified UNSAFE on
     # driver 580.126.09 and kept default-off). The verifier enqueues per-seat
     # cuStreamWaitValue32 (GEQ, monotonic committed-length stamps) on its
