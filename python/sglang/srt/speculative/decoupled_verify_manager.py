@@ -31,13 +31,16 @@ launches) and simply falls back -- one round per request, by design.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
+from sglang.srt.speculative.decoupled_doorbell import Doorbell
 from sglang.srt.speculative.decoupled_scripted_drafter import ScriptedFakeDrafter
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
@@ -93,6 +96,16 @@ class EnumArrivalBoard:
             for pool_idx, stamp in zip(pool_indices, stamps):
                 self._stamps[int(pool_idx)] = int(stamp)
             self._cond.notify_all()
+
+    def reset_seat(self, pool_idx: int) -> None:
+        # Mirror of DecoupledEnumBuffer.reset_slot: a reused seat's stale
+        # stamp can exceed the NEW occupant's expectations (shorter prompt),
+        # so a leftover entry makes waits succeed against dead data. Under
+        # the doorbell this is a deadlock: the device flag IS reset, so the
+        # GPU parks, while this stale mirror convinces the watchdog the
+        # block arrived -- nobody force-releases.
+        with self._cond:
+            self._stamps.pop(int(pool_idx), None)
 
     def wait_for(self, expected: dict[int, int], timeout_s: float) -> bool:
         """Wait until every seat's landed stamp equals its expected base.
@@ -186,6 +199,33 @@ class DecoupledVerifyManager:
         # verifier on the drafter; late blocks fall back).
         self.arrival_wait_s = envs.SGLANG_DECOUPLED_ENUM_WAIT_MS.get() / 1000.0
 
+        # Doorbell (device-side C6 gate): the scheduler thread enqueues
+        # per-seat cuStreamWaitValue32 on its compute stream and launches the
+        # round immediately; the landing stream's stamp scatter releases the
+        # GPU. A host watchdog force-releases on timeout (the select then
+        # falls back naturally -- the doorbell never carries correctness).
+        # Requires the landing scatter on a dedicated stream (a landing
+        # kernel behind the wait on the SAME stream could never satisfy it).
+        self.doorbell: Optional[Doorbell] = None
+        self._doorbell_pending: queue.Queue[tuple[dict[int, int], float]] = (
+            queue.Queue()
+        )
+        self._doorbell_closed = threading.Event()
+        self._doorbell_watchdog: Optional[threading.Thread] = None
+        self.land_stream: Optional[torch.cuda.Stream] = None
+        if (
+            envs.SGLANG_ENABLE_DECOUPLED_DOORBELL.get()
+            and get_tensor_model_parallel_world_size() == 1
+        ):
+            self.doorbell = Doorbell(flags=verify_worker.enum_buffer.doorbell_flags)
+            self.land_stream = torch.cuda.Stream(device=verify_worker.device)
+            self._doorbell_watchdog = threading.Thread(
+                target=self._doorbell_watchdog_loop,
+                name="sglang-decoupled-doorbell-watchdog",
+                daemon=True,
+            )
+            self._doorbell_watchdog.start()
+
         self.scripted_drafter: Optional[ScriptedFakeDrafter] = None
         loopback_mode = envs.SGLANG_TEST_DECOUPLED_LOOPBACK.get()
         if loopback_mode is not None:
@@ -205,11 +245,18 @@ class DecoupledVerifyManager:
             on_land=self._on_block_landed,
             num_drafters=self.num_drafters,
             src_verifier_rank=ipc_config.rank,
+            land_stream=self.land_stream,
         )
         self.ipc_thread.start()
         # The worker calls the gate at decode-launch, before its select gather,
-        # and relays each round's result for evented commit sending.
-        verify_worker.select_gate = self.wait_for_select_blocks
+        # and relays each round's result for evented commit sending. With the
+        # doorbell armed the gate enqueues device-side waits instead of
+        # parking the host.
+        verify_worker.select_gate = (
+            self.enqueue_doorbell_gate
+            if self.doorbell is not None
+            else self.wait_for_select_blocks
+        )
         verify_worker.commit_relay = self._relay_round_commits
 
         self._ipc_poll_closed = threading.Event()
@@ -262,8 +309,20 @@ class DecoupledVerifyManager:
                         "decoupled enum IPC block has out-of-range seats; dropped"
                     )
                 else:
-                    enum_buffer.land_rows_device(rows[:, 0], rows[:, 1], rows[:, 2:])
-                    torch.cuda.synchronize(self.verify_worker.device)
+                    if self.land_stream is not None:
+                        # Stream-scoped sync: a device-wide sync would park
+                        # this poll thread behind the compute stream's
+                        # pending doorbell wait for the whole verify round.
+                        with torch.cuda.stream(self.land_stream):
+                            enum_buffer.land_rows_device(
+                                rows[:, 0], rows[:, 1], rows[:, 2:]
+                            )
+                        self.land_stream.synchronize()
+                    else:
+                        enum_buffer.land_rows_device(
+                            rows[:, 0], rows[:, 1], rows[:, 2:]
+                        )
+                        torch.cuda.synchronize(self.verify_worker.device)
                     self.arrival_board.record_pairs(pool_indices, stamps)
             except Exception:
                 logger.exception("decoupled enum IPC landing failed; block dropped")
@@ -300,7 +359,13 @@ class DecoupledVerifyManager:
         )
         return verifier_transport
 
+    def _close_doorbell(self) -> None:
+        self._doorbell_closed.set()
+        if self._doorbell_watchdog is not None:
+            self._doorbell_watchdog.join(timeout=2.0)
+
     def close(self) -> None:
+        self._close_doorbell()
         if self.scripted_drafter is not None:
             self.scripted_drafter.close()
         self.ipc_thread.close()
@@ -352,16 +417,12 @@ class DecoupledVerifyManager:
             self._prof_transport_ct += 1
         self.arrival_board.record(block)
 
-    def wait_for_select_blocks(self, batch: ScheduleBatch) -> None:
-        """C6 launch gate: called by the verify worker at decode-launch, just
-        before the select gather. Waits -- bounded -- for the block each
-        seat's select is about to read (its stamp was armed by the LAST
-        on_batch_result that ran before this launch; see the arming note in
-        ``_collect_req_controls``). A seat with no armed expectation (first
-        decode round: under overlap even its DraftSync is still pending) is
-        simply not gated: its select falls back if the block is not there,
-        never blocks, never errs.
-        """
+    def _collect_gate_expected(self, batch: ScheduleBatch) -> dict[int, int]:
+        """Seats this round's gate covers -> expected stamp. A seat with no
+        armed expectation (first decode round: under overlap even its
+        DraftSync is still pending) is simply not gated: its select falls
+        back if the block is not there, never blocks, never errs. Seats of a
+        quarantined drafter are skipped the same way."""
         now = time.monotonic()
         expected: dict[int, int] = {}
         for req in batch.reqs:
@@ -372,6 +433,75 @@ class DecoupledVerifyManager:
             if self._drafter_cooldown_until.get(rank, 0.0) > now:
                 continue  # quarantined drafter: its seats fall back, no wait
             expected[req.req_pool_idx] = stamp
+        return expected
+
+    def enqueue_doorbell_gate(self, batch: ScheduleBatch) -> None:
+        """Doorbell C6 gate: enqueue one device-side GEQ wait per gated seat
+        on the compute stream and return immediately -- the select and the
+        verify launch queue up behind the waits (measured async), and the
+        landing stream's stamp scatter releases them. The watchdog
+        force-releases on timeout; the select falls back naturally."""
+        expected = self._collect_gate_expected(batch)
+        if not expected or self.arrival_wait_s <= 0:
+            return
+        stream = torch.cuda.current_stream()
+        enqueued: list[tuple[int, int]] = []
+        for pool_idx, stamp in expected.items():
+            if self.doorbell.enqueue_wait(
+                stream=stream, pool_idx=pool_idx, stamp=stamp
+            ):
+                enqueued.append((pool_idx, stamp))
+                continue
+            # Driver refused the wait op. The waits already on the stream
+            # would park the GPU with nobody committed to releasing them, so
+            # force-release those, then run this round as a host gate
+            # (correctness identical either way).
+            for done_idx, done_stamp in enqueued:
+                self.doorbell.force_release(pool_idx=done_idx, stamp=done_stamp)
+            self.arrival_board.wait_for(expected, self.arrival_wait_s)
+            return
+        self._doorbell_pending.put((expected, time.monotonic() + self.arrival_wait_s))
+
+    def _doorbell_watchdog_loop(self) -> None:
+        """Companion of enqueue_doorbell_gate: for each armed round, wait on
+        the host arrival mirror up to the deadline; force-release the seats
+        whose block never landed (GPU unparks, select falls back) and feed
+        the same timeout accounting as the host gate."""
+        while not self._doorbell_closed.is_set():
+            try:
+                expected, deadline = self._doorbell_pending.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            remaining = deadline - time.monotonic()
+            arrived = remaining > 0 and self.arrival_board.wait_for(expected, remaining)
+            if arrived:
+                continue
+            with self.arrival_board._cond:
+                landed = {
+                    seat: self.arrival_board._stamps.get(seat) for seat in expected
+                }
+            now = time.monotonic()
+            for pool_idx, stamp in expected.items():
+                if (landed.get(pool_idx) or -1) < stamp:
+                    self.doorbell.force_release(pool_idx=pool_idx, stamp=stamp)
+            self.sync_wait_timeout_ct += 1
+            self._track_drafter_timeouts(expected, landed, now=now)
+            if self.sync_wait_timeout_ct <= 5 or self._profile:
+                logger.info(
+                    "decoupled doorbell timeout #%d: expected=%s landed=%s",
+                    self.sync_wait_timeout_ct,
+                    expected,
+                    landed,
+                )
+
+    def wait_for_select_blocks(self, batch: ScheduleBatch) -> None:
+        """C6 launch gate: called by the verify worker at decode-launch, just
+        before the select gather. Waits -- bounded -- for the block each
+        seat's select is about to read (its stamp was armed by the LAST
+        on_batch_result that ran before this launch; see the arming note in
+        ``_collect_req_controls``).
+        """
+        expected = self._collect_gate_expected(batch)
         t_wait = time.monotonic() if self._profile else 0.0
         if expected and self.arrival_wait_s > 0:
             # Named for the chrome trace: this range IS the bubble on the
@@ -385,7 +515,7 @@ class DecoupledVerifyManager:
                     landed = {
                         seat: self.arrival_board._stamps.get(seat) for seat in expected
                     }
-                self._track_drafter_timeouts(expected, landed, now=now)
+                self._track_drafter_timeouts(expected, landed, now=time.monotonic())
                 if self.sync_wait_timeout_ct <= 5 or self._profile:
                     # Mismatch probe: a systematic expectation bug shows up in
                     # the first few timeouts (expected vs landed, side by side).
@@ -502,6 +632,7 @@ class DecoupledVerifyManager:
                         )
                     )
             self.verify_worker.enum_buffer.reset_slot(req.req_pool_idx)
+            self.arrival_board.reset_seat(req.req_pool_idx)
             state = _ReqState(
                 pool_idx=req.req_pool_idx,
                 prompt_len=len(req.origin_input_ids),

@@ -41,6 +41,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.decoupled_spec_io import DraftEnumerationBufferBatch
 
 # Stamp for a seat with no valid block (never written, or reset on realloc); a
@@ -137,6 +138,20 @@ class DecoupledEnumBuffer:
             torch.zeros((self.seats,), dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
         ]
+        # Doorbell: per-seat latest REAL landed stamp, written by the landing
+        # stream's scatter strictly AFTER the token/stamp writes, polled by the
+        # verifier stream's cuStreamWaitValue32 (GEQ). int32 because the wait
+        # compares 32-bit unsigned; stamps are positive committed lengths, so
+        # signed/unsigned agree. 0 (not -1: 0xFFFFFFFF satisfies any GEQ)
+        # means "nothing landed". A spurious release is harmless -- the
+        # select's own stamp match is the correctness gate; the doorbell only
+        # paces the launch.
+        self.doorbell_flags = torch.zeros(
+            (self.seats,), dtype=torch.int32, device=device
+        )
+        # Armed only by the (experimental, default-off) doorbell: the flags
+        # scatter is one extra kernel per landing, pointless without a waiter.
+        self._doorbell_armed = envs.SGLANG_ENABLE_DECOUPLED_DOORBELL.get()
 
     @property
     def read_slot(self) -> int:
@@ -273,6 +288,11 @@ class DecoupledEnumBuffer:
             pool_indices, write_gens
         ] = base_committed_lens
         self.enum_last_gen[slot][pool_indices] = write_gens
+        if self._doorbell_armed:
+            # Doorbell LAST: a wait released by this store implies the token
+            # and stamp scatters above already completed (same-stream kernel
+            # order), so the post-wait select reads a fully landed block.
+            self.doorbell_flags[pool_indices] = base_committed_lens.to(torch.int32)
 
     def gather(
         self, req_pool_indices: torch.Tensor
@@ -295,6 +315,12 @@ class DecoupledEnumBuffer:
         # scheduler at prefill alloc / retraction re-admit.
         for slot in range(self.buf_count):
             self.enum_base_committed_lens[slot][pool_idx, :] = _STAMP_EMPTY
+        # The new occupant's committed lengths restart from ITS prompt, which
+        # may be shorter than the previous tenant's stamp: a stale doorbell
+        # would satisfy the GEQ wait early. Harmless for correctness (the
+        # select falls back on the stamp reset above) but it would defeat the
+        # pacing, so clear it with the stamps.
+        self.doorbell_flags[pool_idx] = 0
 
     def swap(self) -> None:
         # Advance the write/read double-buffer at a round boundary; no-op under

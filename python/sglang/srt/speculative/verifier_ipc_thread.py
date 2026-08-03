@@ -23,6 +23,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
+import torch
 
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
@@ -92,8 +93,14 @@ class VerifierIpcThread:
         on_land: Optional[Callable[[DraftEnumerationBufferBatch], None]] = None,
         num_drafters: int = 1,
         src_verifier_rank: int = 0,
+        land_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         self.transport = transport
+        # Doorbell topology rule: with device-side gate waits parked on the
+        # compute stream, the landing scatter must ride its own stream (a
+        # landing kernel enqueued BEHIND the wait could never satisfy it).
+        # None = land on this thread's current stream (pre-doorbell shape).
+        self._land_stream = land_stream
         # The GPU landing buffer. land() holds verifier_rank and rejects a block
         # routed to another verifier, so this thread does no rank check of its
         # own -- only envelope validation.
@@ -312,8 +319,13 @@ class VerifierIpcThread:
             block = self._route_enumeration_message(message)
             # Verifier routing (wrong-verifier reject), validate(), and the
             # seat-range guard all live in land(); the SYNC scatter runs on the
-            # current stream (6.3 moves it to a copy stream).
-            self.enum_buffer.land(block)
+            # current stream (6.3 moves it to a copy stream), or on the
+            # dedicated landing stream when the doorbell is armed.
+            if self._land_stream is not None:
+                with torch.cuda.stream(self._land_stream):
+                    self.enum_buffer.land(block)
+            else:
+                self.enum_buffer.land(block)
             if self._on_land is not None:
                 self._on_land(block)
         return did_work

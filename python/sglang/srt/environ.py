@@ -449,6 +449,18 @@ class Envs:
     # only (the TP path keeps the eager select + broadcast). Capture failure
     # falls back to the eager select permanently. Default off until gated.
     SGLANG_ENABLE_DECOUPLED_SELECT_GRAPH = EnvBool(False)
+    # Decoupled spec: device-side C6 gate (EXPERIMENTAL -- verified UNSAFE on
+    # driver 580.126.09 and kept default-off). The verifier enqueues per-seat
+    # cuStreamWaitValue32 (GEQ, monotonic committed-length stamps) on its
+    # compute stream and launches the round immediately; the landing stream's
+    # stamp scatter releases the GPU, and a host watchdog force-releases on
+    # timeout. Verdict: while such a wait is parked, ordinary stream ops on
+    # the SAME PROCESS (event records, other-stream kernel launches, allocator
+    # calls) can block the host inside the driver -- reproduced twice in
+    # production (process-wide freeze, watchdog kill) and deterministically in
+    # microbenchmarks, while near-identical sequences pass; the boundary is
+    # not predictable enough to ship. Do not enable outside experiments.
+    SGLANG_ENABLE_DECOUPLED_DOORBELL = EnvBool(False)
     # Decoupled spec: spend the drafter's enumeration columns per accept case
     # instead of uniformly. Case a < K is only reached by verify REJECTING
     # backbone token c_{a+1}, so its bonus is a rank-2+ candidate, while case
