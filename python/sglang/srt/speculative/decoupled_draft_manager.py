@@ -15,6 +15,7 @@ machinery. The draft model is driven directly by ``EnumDraftEngine``.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Optional
@@ -228,6 +229,19 @@ class DecoupledDraftManager:
         """Enumeration rounds run so far -- the drafter's forward counter."""
         return self._round_ct
 
+    @staticmethod
+    def _die_if_sticky_cuda(exc: Exception) -> None:
+        """A sticky CUDA failure (device-side assert / illegal access) poisons
+        the context permanently: the belts' continue-on-error would turn this
+        process into an unkillable zombie that holds GPU memory and the IPC
+        endpoint while spamming the log. Better dead than undead."""
+        text = str(exc)
+        if "device-side assert" in text or "illegal memory access" in text:
+            logger.critical(
+                "sticky CUDA failure in the drafter loop; exiting: %s", text
+            )
+            os._exit(70)
+
     def run_loop(self, *, control_plane: DrafterControlPlane) -> None:
         """The drafter scheduler's event loop (never returns)."""
         logger.info(
@@ -281,7 +295,8 @@ class DecoupledDraftManager:
                             for group in by_verifier.values():
                                 self.engine.prebuild_fast_round(group)
                         time.sleep(_IDLE_WAIT_S)
-                except Exception:
+                except Exception as exc:
+                    self._die_if_sticky_cuda(exc)
                     logger.exception(
                         "decoupled drafter idle-window task failed; continuing"
                     )
@@ -289,7 +304,8 @@ class DecoupledDraftManager:
                 continue
             try:
                 self._apply_controls_and_draft(ready)
-            except Exception:
+            except Exception as exc:
+                self._die_if_sticky_cuda(exc)
                 # A bad round must not kill the drafter for every request; the
                 # affected verifier rounds simply fall back. TODO(5c-class):
                 # quarantine the offending request instead of best-effort.

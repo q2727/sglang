@@ -436,6 +436,9 @@ class Envs:
     # on first use and executes that round for real; failure falls back to
     # the step-by-step chain permanently. Default off until gated.
     SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH = EnvBool(False)
+    # Decoupled spec: also run case-0 (miss) rounds' K-step chains through
+    # the captured chain graph. Requires the chain graph itself.
+    SGLANG_ENABLE_DECOUPLED_CASE0_CHAIN_GRAPH = EnvBool(True)
     # Decoupled spec: build the verify round's block-INDEPENDENT half (tree
     # buffers, cache-loc assignment, ForwardBatch) BEFORE the C6 gate wait, so
     # the block's arrival only pays select + one device copy + launch. At

@@ -916,6 +916,9 @@ class EnumDraftEngine:
         self._pending_scratch_frees: list[torch.Tensor] = []
         self._fused_topk = envs.SGLANG_ENABLE_DECOUPLED_FUSED_TOPK.get()
         self._prep_ahead = envs.SGLANG_ENABLE_DECOUPLED_PREP_AHEAD.get()
+        # Kill switch for the case-0 chain graph while it hardens (the fast
+        # path's chain graph is unaffected).
+        self._case0_chain_graph = envs.SGLANG_ENABLE_DECOUPLED_CASE0_CHAIN_GRAPH.get()
         # Round-invariant per-delta_len staging tensors (see
         # prebuild_fast_round): built lazily once, reused by every restage.
         self._case_staging_static: dict[int, tuple] = {}
@@ -1379,6 +1382,8 @@ class EnumDraftEngine:
                 # for the round-tail free.
                 pre = self._prebuilt_fast
                 self._prebuilt_fast = None
+                self._fence_prebuilt(pre)
+                self._record_prebuilt_streams(pre)
                 self._scrap_prebuilt_into(
                     pre, scratch_batches, scratch_slots, scratch_kv_pages
                 )
@@ -1613,8 +1618,8 @@ class EnumDraftEngine:
                 # Prebuilt skeleton: allocation + page-table writes already
                 # happened (on the prebuild stream); order this round's work
                 # after them, then fill the actual delta tokens and go.
-                if prebuilt.ready_event is not None:
-                    torch.cuda.current_stream().wait_event(prebuilt.ready_event)
+                self._fence_prebuilt(prebuilt)
+                self._record_prebuilt_streams(prebuilt)
                 self._prebuilt_fast = None
                 glue_preseeded = prebuilt.glue_seeded
                 graph_round = prebuilt.graph_round
@@ -1638,6 +1643,8 @@ class EnumDraftEngine:
             else:
                 if prebuilt is not None:
                     self._prebuilt_fast = None
+                    self._fence_prebuilt(prebuilt)
+                    self._record_prebuilt_streams(prebuilt)
                     self._scrap_prebuilt_into(
                         prebuilt, scratch_batches, scratch_slots, scratch_kv_pages
                     )
@@ -3297,6 +3304,8 @@ class EnumDraftEngine:
         if pre is None or key not in pre.keys:
             return
         self._prebuilt_fast = None
+        self._fence_prebuilt(pre)
+        self._record_prebuilt_streams(pre)
         tracked: list = []
         self._track_scratch_slots(
             tracked, slots=pre.slots, positions=pre.slot_positions
@@ -3306,6 +3315,56 @@ class EnumDraftEngine:
             pre.scratch_slots + tracked,
             pre.scratch_kv_pages,
         )
+
+    @staticmethod
+    def _fence_prebuilt(pre: _PrebuiltFastRound) -> None:
+        """Order the CURRENT stream after the skeleton's queued device work.
+
+        Consuming a skeleton needs this for correctness of its reads; but so
+        does SCRAPPING one: the prebuild stream holds page-table writes and
+        COW/fork copies, and the scrapped rows/slots are reallocated by the
+        current round immediately -- without this fence the current round's
+        fresh writes race the prebuild stream's stale queued writes into the
+        same pool rows (the first miss after a restage corrupts the page
+        table; surfaces as index-out-of-bounds device asserts).
+        """
+        if pre.ready_event is not None:
+            torch.cuda.current_stream().wait_event(pre.ready_event)
+
+    @staticmethod
+    def _record_prebuilt_streams(pre: _PrebuiltFastRound) -> None:
+        """Mark every prebuilt device tensor as used by the CONSUMING stream.
+
+        The skeleton's tensors were allocated on the prebuild stream; without
+        this, freeing them at round end lets the caching allocator reuse
+        their blocks as soon as the (long-idle) prebuild stream catches up --
+        while this round's main-stream kernels may still be reading them.
+        record_stream defers block reuse until the consuming stream passes
+        the free point. (The lucky-green / usually-red flakiness this fixes
+        surfaced as index-out-of-bounds device asserts from garbage slots.)
+        """
+        stream = torch.cuda.current_stream()
+
+        def mark(obj) -> None:
+            if isinstance(obj, torch.Tensor):
+                if obj.is_cuda:
+                    obj.record_stream(stream)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    mark(item)
+
+        mark(pre.slots)
+        for value in vars(pre.batch).values():
+            mark(value)
+        holder = pre.graph_round
+        fields = getattr(holder, "__struct_fields__", None) or vars(holder).keys()
+        for name in fields:
+            mark(getattr(holder, name, None))
+        if pre.case_staging is not None:
+            for staging in pre.case_staging:
+                mark(staging.out_cache_loc)
+        for extra in pre.scratch_slots:
+            mark(extra)
 
     def _consume_prebuilt(
         self,
@@ -3720,19 +3779,43 @@ class EnumDraftEngine:
                 plan_steps = self._prepare_chain_steps(
                     branch, first_tokens=node0_guesses.reshape(-1)
                 )
-            tokens = node0_guesses.reshape(-1)
-            chain_steps: list[torch.Tensor] = []
-            for step, (fb, step_slots) in enumerate(plan_steps):
+            for step, (_, step_slots) in enumerate(plan_steps):
                 self._track_scratch_slots(
                     scratch_slots,
                     slots=step_slots,
                     positions=[seq + step for seq in seq_host],
                 )
-                with self.profiler.stage("case0-step-fwd"):
-                    fb.input_ids = tokens
-                    logits = self.model_runner.forward(fb).logits_output
-                tokens = logits.next_token_logits.argmax(dim=-1)
-                chain_steps.append(tokens)
+            first_tokens = node0_guesses.reshape(-1)
+            chain_steps = None
+            if self._chain_graph is not None and self._case0_chain_graph:
+                # Same one-graph chain as the fast round's branch phase; the
+                # case-0 row count (bs * f_live) gets its own bucket. This is
+                # the miss round's cost floor: without it a miss storm holds
+                # the drafter's round time above the verify cadence and the
+                # lag self-sustains.
+                rows = int(first_tokens.numel())
+                with self.profiler.stage("case0-chain-graph"):
+                    if self._chain_graph.can_replay(rows):
+                        chain_steps = self._chain_graph.replay(
+                            rows=rows,
+                            plan_steps=plan_steps,
+                            first_tokens=first_tokens,
+                        )
+                    else:
+                        chain_steps = self._chain_graph.try_capture_and_run(
+                            rows=rows,
+                            plan_steps=plan_steps,
+                            first_tokens=first_tokens,
+                        )
+            if chain_steps is None:
+                tokens = first_tokens
+                chain_steps = []
+                for step, (fb, _) in enumerate(plan_steps):
+                    with self.profiler.stage("case0-step-fwd"):
+                        fb.input_ids = tokens
+                        logits = self.model_runner.forward(fb).logits_output
+                    tokens = logits.next_token_logits.argmax(dim=-1)
+                    chain_steps.append(tokens)
         else:
             logits, step_slots = self._decode_step(
                 branch, node0_guesses.reshape(-1), tag="case0"
