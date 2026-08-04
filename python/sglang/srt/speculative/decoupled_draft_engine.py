@@ -1768,51 +1768,9 @@ class EnumDraftEngine:
                     ),
                 )
 
-        # -- A-class hoist: the branch phase's host half -- the chain plan
-        # (allocation, seq-lens family, the K ForwardBatches, chain-graph
-        # static staging) and the COW / fork INDEX builds -- depends only on
-        # the selection and the committed lengths, never on the extend's
-        # logits. Building it here, before the extend launches, leaves the
-        # post-extend tail launch-only (topk -> COW -> fork -> chain fire),
-        # so the GPU never drains waiting for host staging between the
-        # round's two forwards. (The COW / fork COPIES still launch after
-        # the extend: their data deps are the extend's KV / state writes.)
         hoist_plan: Optional[_BranchChainPlan] = None
         hoist_cow: Optional[tuple[list, list]] = None
         hoist_fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-        if self._enable_fused_extend and self._chain_plan:
-            hoist_plan = self._plan_branch_chain(
-                carriers=carriers,
-                states=states,
-                backbone_slots=backbone_slots,
-                scratch_slots=scratch_slots,
-                variant=variant,
-            )
-        if hoist_plan is not None:
-            if self._paged:
-                hoist_cow = self._build_branch_head_cow(
-                    states=states,
-                    carriers=carriers,
-                    base_lens=base_lens,
-                    variant=variant,
-                )
-            if self._hybrid:
-                hoist_fork = self._build_mamba_fork(
-                    src_slots=torch.cat(
-                        [
-                            torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
-                                variant.case_of_row_dev
-                            ]
-                            for state, carrier in zip(states, carriers)
-                        ]
-                    ),
-                    dst_slots=torch.cat(
-                        [
-                            carrier.branch_mamba_slots[variant.sel_rows_dev]
-                            for carrier in carriers
-                        ]
-                    ),
-                )
         if self._enable_fused_extend:
             # -- Fused extend: seat + glue rows in ONE forward. The glue chain
             # tokens are the matched commit's winning unit -- KNOWN values,
@@ -1890,6 +1848,49 @@ class EnumDraftEngine:
             branch_guesses = guesses_stack.reshape(bs, -1)[:, variant.sel_rows_dev]
         else:
             branch_guesses = guesses_stack
+
+        # -- Branch-phase host half, built while the extend (and topk) run on
+        # the GPU: the chain plan (allocation, seq-lens family, the K
+        # ForwardBatches, chain-graph static staging) and the COW / fork
+        # INDEX builds depend only on the selection and the committed
+        # lengths, never on the extend's logit VALUES -- everything below
+        # them is then launch-only, so the launch queue stays ahead of the
+        # GPU. (Building this BEFORE the extend launch was tried and lost
+        # the overlap with the extend's GPU segment: the drafter round grew
+        # ~0.7ms and the 397B good window dropped ~6%.)
+        if self._enable_fused_extend and self._chain_plan:
+            hoist_plan = self._plan_branch_chain(
+                carriers=carriers,
+                states=states,
+                backbone_slots=backbone_slots,
+                scratch_slots=scratch_slots,
+                variant=variant,
+            )
+        if hoist_plan is not None:
+            if self._paged:
+                hoist_cow = self._build_branch_head_cow(
+                    states=states,
+                    carriers=carriers,
+                    base_lens=base_lens,
+                    variant=variant,
+                )
+            if self._hybrid:
+                hoist_fork = self._build_mamba_fork(
+                    src_slots=torch.cat(
+                        [
+                            torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
+                                variant.case_of_row_dev
+                            ]
+                            for state, carrier in zip(states, carriers)
+                        ]
+                    ),
+                    dst_slots=torch.cat(
+                        [
+                            carrier.branch_mamba_slots[variant.sel_rows_dev]
+                            for carrier in carriers
+                        ]
+                    ),
+                )
 
         if self._paged:
             # Branch prefixes (boundary tail + delta + case backbone) now

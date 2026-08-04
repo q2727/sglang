@@ -431,16 +431,16 @@ class DecoupledVerifyManager:
                 continue
             streak = self._seat_timeout_streaks.get(seat, 0) + 1
             self._seat_timeout_streaks[seat] = streak
-            if streak >= 4 and now - self._seat_resync_last.get(seat, 0.0) >= 0.5:
+            if streak >= 4 and now - self._seat_resync_last.get(seat, 0.0) >= 5.0:
                 # Past the anneal (2): this lag is beyond what a longer wait
                 # heals. Queue a full re-seed; the next on_batch_result emits
-                # the DraftSync. The 500ms cooldown bounds the re-prefill
-                # tax: against the readiness-lag basin (commit copy_to_cpu
-                # queued on the scheduler thread BEHIND the gate under
-                # overlap -- the one lag a re-seed can lose to) unbounded
-                # retriggering costs more than the desync itself; the real
-                # cure for that basin is launch-time result staging
-                # (push-model), not more re-seeds.
+                # the DraftSync. The 5s cooldown bounds the re-prefill tax:
+                # against the readiness-lag basin (commit copy_to_cpu queued
+                # on the scheduler thread BEHIND the gate under overlap) a
+                # re-seed only re-rolls the lock lottery -- 500ms retriggering
+                # was measured to cost more than the desync itself (resync
+                # churn, 21-45 tok/s). The real cure for that basin is
+                # launch-time result staging (push-model), not more re-seeds.
                 self._seat_resync_last[seat] = now
                 self._force_resync_seats.add(seat)
                 self._gate_resync_ct += 1
