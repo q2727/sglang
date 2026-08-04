@@ -358,6 +358,7 @@ class DecoupledDraftManager:
                             self._prep_keys.clear()
                             for group in by_verifier.values():
                                 self.engine.prebuild_fast_round(group)
+                                self.engine.pre_launch_extend(group)
                         time.sleep(_IDLE_WAIT_S)
                 except Exception as exc:
                     self._die_if_sticky_cuda(exc)
@@ -517,6 +518,7 @@ class DecoupledDraftManager:
             for group in by_verifier_prep.values():
                 try:
                     self.engine.prebuild_fast_round(group)
+                    self.engine.pre_launch_extend(group)
                 except Exception:
                     logger.exception(
                         "decoupled round-tail restage failed; next round "

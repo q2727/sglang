@@ -1009,11 +1009,33 @@ class EnumDraftEngine:
         self._debug_gpu_scatter = envs.SGLANG_DEBUG_DECOUPLED_GPU_SCATTER.get()
         self._gpu_scatter_probe_ct = 0
         self._scatter_consume = envs.SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME.get()
+        # Pre-launch (see pre_launch_extend): the extend half of the NEXT
+        # fast round enqueued behind a commit gate at this round's tail.
+        self._prelaunch_enabled = (
+            envs.SGLANG_ENABLE_DECOUPLED_DRAFT_PRELAUNCH.get()
+            and envs.SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME.get()
+        )
+        self._prelaunch_gate = None
+        if self._prelaunch_enabled:
+            try:
+                from sglang.srt.speculative.decoupled_stream_gate import StreamGate
+
+                self._prelaunch_gate = StreamGate()
+            except Exception:
+                logger.exception("drafter stream gate unavailable; prelaunch off")
+                self._prelaunch_enabled = False
+        # Outstanding pre-launch: (keys tuple, expected_generation, prebuilt,
+        # node_logits_ready marker). Consumed or discarded by the next
+        # draft_round dispatch.
+        self._prelaunched: Optional[dict] = None
         # Scatter-consume scratch: verdict sink (never host-read on the hot
         # path) and the chains buffer the topk stage reuses.
         self._scatter_verdict = torch.zeros(4, dtype=torch.int64, device=self.device)
         self._scatter_chains = torch.zeros(
             max(1, self.num_steps), dtype=torch.int64, device=self.device
+        )
+        self._scatter_node = torch.zeros(
+            self.num_steps + 1, dtype=torch.int64, device=self.device
         )
 
     # ------------------------------------------------------------------ #
@@ -1304,6 +1326,162 @@ class EnumDraftEngine:
                 selection,
             )
 
+    def _topk_graph_fire(
+        self, *, key: tuple, fused_logits: torch.Tensor, chains_mat: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Replay-only half of the guess-tail graph (no capture): fill the
+        entry's static inputs and replay. None when the shape was never
+        captured -- pre-launch requires a warm graph."""
+        entry = self._topk_graphs.get(key)
+        if entry is None:
+            return None
+        logits_in, chains_in, guesses_out, branch_out, graph = entry
+        logits_in.copy_(fused_logits)
+        if chains_in is not None:
+            chains_in.copy_(chains_mat)
+        graph.replay()
+        return guesses_out, branch_out
+
+    def pre_launch_extend(self, keys: list[DraftReqKey]) -> bool:
+        """Enqueue the NEXT fast round's extend half behind a commit gate,
+        BEFORE the commit exists (the drafter-side pre-launch): [host-func
+        gate on the arrival board] -> [commit_scatter consuming the landed
+        values in-kernel] -> [fused-extend graph] -> [guess-tail graph]. The
+        loop then only runs the chain half when the commit arrives on the
+        host; a gate timeout leaves a stale zero-scan junk round (seat state
+        untouched) and the full host round takes over.
+
+        Call at round tail AFTER prebuild_fast_round. Returns False when any
+        precondition fails (no prebuilt skeleton, cold graphs, non-bs1...);
+        nothing is enqueued in that case."""
+        if not self._prelaunch_enabled or self._prelaunched is not None:
+            return False
+        pre = self._prebuilt_fast
+        mirror, board = self._commit_mirror, self._commit_board
+        if (
+            pre is None
+            or mirror is None
+            or board is None
+            or len(keys) != 1
+            or pre.keys != tuple(keys)
+            or pre.scatter_stacks is None
+            or pre.replay_fb is None
+            or not self._paged
+        ):
+            return False
+        state = self._states.get(keys[0])
+        if (
+            state is None
+            or state.last_units_dev is None
+            or state.last_backbone_dev is None
+        ):
+            return False
+        f_live = max(1, min(int(self.effective_fanout), self.fanout))
+        variant = self._fanout_variant(f_live)
+        guess_width = f_live if variant.guess_dead_mask is None else self.fanout
+        topk_key = (
+            1,
+            f_live,
+            guess_width,
+            True,
+            variant.guess_dead_mask is not None,
+        )
+        if not self._fused_topk or topk_key not in self._topk_graphs:
+            return False  # guess-tail graph not warm yet
+        rows = self.num_steps + 1
+        seat = int(state.req_pool_idx)
+        expected_generation = mirror.host_generation(seat) + 1
+        if envs.SGLANG_DEBUG_DECOUPLED_PRELAUNCH_JUNK.get():
+            # Validation mode: force every pre-launched round down the stale
+            # junk lane (never consumes, never advances state); the host
+            # round redoes everything, so correctness must be unchanged.
+            expected_generation += 1_000_000
+        expected_stamp = (len(state.committed_tokens) - state.prompt_len) + 1
+        carrier = self._seat_carriers[keys[0]]
+        # Take ownership of the skeleton (the host round must not consume it).
+        self._prebuilt_fast = None
+        self._fence_prebuilt(pre)
+        self._record_prebuilt_streams(pre)
+        # Carrier-row private rebind: value-independent of the commit (the
+        # whole hypothesized window), so it runs at enqueue time.
+        self._sync_carrier_rows_paged(
+            states=[state],
+            carriers=[carrier],
+            base_lens=list(pre.base_lens),
+            bind_graph_width=True,
+        )
+        gate = self._prelaunch_gate
+        budget_s = 0.1
+
+        def gate_fn(seat=seat, stamp=expected_stamp, budget=budget_s):
+            board.wait_for({seat: stamp}, budget)
+
+        if not gate.enqueue(torch.cuda.current_stream(), gate_fn):
+            # Driver refused the node; hand the skeleton back untouched.
+            self._prebuilt_fast = pre
+            return False
+        from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
+
+        gather_stack, out_loc_stack, true_stack, node_stack = pre.scatter_stacks
+        fb = pre.replay_fb
+        commit_scatter(
+            mirror=mirror,
+            seat=seat,
+            expected_generation=expected_generation,
+            units_dev=state.last_units_dev.contiguous(),
+            backbone_dev=state.last_backbone_dev,
+            backbone_len=state.last_backbone_len,
+            gather_stack=gather_stack,
+            out_loc_stack=out_loc_stack,
+            true_stack=true_stack,
+            node_stack=node_stack,
+            pad_flats=pre.graph_round.seat_pad_flats[0],
+            table_row=self.model_runner.req_to_token_pool.req_to_token[
+                int(pre.batch.reqs[0].req_pool_idx)
+            ],
+            table_col0=pre.base_lens[0],
+            base_len=pre.base_lens[0],
+            num_steps=self.num_steps,
+            fanout=self.fanout,
+            page_size=self._page_size,
+            extend_width=self._extend_graph_width,
+            outs=(
+                self._scatter_verdict,
+                fb.input_ids,
+                fb.out_cache_loc,
+                fb.spec_info.gdn_true_extend_lens_tensor,
+                self._scatter_node,
+                self._scatter_chains,
+            ),
+        )
+        fused_logits = self._extend_graph_execute(
+            forward_batch=fb,
+            rows=rows,
+            node_gather=self._scatter_node,
+            true_lens_host=pre.case_staging[0].true_lens_host,
+            base_lens=list(pre.base_lens),
+            delta_lens=[0],
+            tag="prelaunch",
+        )
+        topk_out = self._topk_graph_fire(
+            key=topk_key,
+            fused_logits=fused_logits,
+            chains_mat=self._scatter_chains.view(1, self.num_steps),
+        )
+        if topk_out is None:
+            self._prelaunched = None
+            return False
+        self._prelaunched = {
+            "keys": tuple(keys),
+            "expected_generation": expected_generation,
+            "expected_stamp": expected_stamp,
+            "pre": pre,
+            "f_live": f_live,
+            "guesses_out": topk_out[0],
+            "branch_out": topk_out[1],
+        }
+        return True
+
     def _scatter_consume_commit(
         self,
         *,
@@ -1337,7 +1515,7 @@ class EnumDraftEngine:
             return False  # the mirror's latest is not this round's delta
         from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
 
-        gather_stack, out_loc_stack, true_stack = prebuilt.scatter_stacks
+        gather_stack, out_loc_stack, true_stack, node_stack = prebuilt.scatter_stacks
         torch.cuda.current_stream().wait_event(mirror.land_event)
         commit_scatter(
             mirror=mirror,
@@ -1349,6 +1527,7 @@ class EnumDraftEngine:
             gather_stack=gather_stack,
             out_loc_stack=out_loc_stack,
             true_stack=true_stack,
+            node_stack=node_stack,
             pad_flats=graph_round.seat_pad_flats[0],
             table_row=self.model_runner.req_to_token_pool.req_to_token[seat_row],
             table_col0=base_len,
@@ -1362,6 +1541,7 @@ class EnumDraftEngine:
                 prestaged_fb.input_ids,
                 prestaged_fb.out_cache_loc,
                 prestaged_fb.spec_info.gdn_true_extend_lens_tensor,
+                self._scatter_node,
                 self._scatter_chains,
             ),
         )
@@ -1395,7 +1575,7 @@ class EnumDraftEngine:
         expected_generation = mirror.host_generation(seat)
         from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
 
-        gather_stack, out_loc_stack, true_stack = prebuilt.scatter_stacks
+        gather_stack, out_loc_stack, true_stack, node_stack = prebuilt.scatter_stacks
         rows = true_stack.shape[1]
         rows_w = gather_stack.shape[1]
         width = self._extend_graph_width
@@ -1405,6 +1585,7 @@ class EnumDraftEngine:
             torch.zeros(rows_w, dtype=torch.int64, device=dev),
             torch.zeros(rows_w, dtype=torch.int64, device=dev),
             torch.zeros(rows, dtype=true_stack.dtype, device=dev),
+            torch.zeros(rows, dtype=torch.int64, device=dev),
             torch.zeros(self.num_steps, dtype=torch.int64, device=dev),
         )
         shadow_row = torch.zeros(width, dtype=torch.int32, device=dev)
@@ -1419,6 +1600,7 @@ class EnumDraftEngine:
             gather_stack=gather_stack,
             out_loc_stack=out_loc_stack,
             true_stack=true_stack,
+            node_stack=node_stack,
             pad_flats=(
                 graph_round.seat_pad_flats[0]
                 if self._paged
@@ -1460,7 +1642,9 @@ class EnumDraftEngine:
             ),
             "out_loc": (outs[2].tolist(), prestaged.out_cache_loc.tolist()),
             "true": (outs[3].tolist(), prestaged.true_lens.tolist()),
-            "chains": (outs[4].tolist(), chain.to(torch.int64).tolist()),
+            "node": (outs[4].tolist(), prestaged.node_gather.tolist()),
+            "node": (outs[4].tolist(), prestaged.node_gather.tolist()),
+            "chains": (outs[5].tolist(), chain.to(torch.int64).tolist()),
             "pads": (
                 shadow_row[delta_len:width].tolist(),
                 want_pads.to(torch.int32).tolist(),
@@ -1713,6 +1897,16 @@ class EnumDraftEngine:
         scratch_kv_pages: list[torch.Tensor] = []
         self.profiler.start_round()
         try:
+            if self._prelaunched is not None:
+                # Stage-(i) discipline: an outstanding pre-launch that no
+                # dispatch consumed is scrap -- its skeleton's resources ride
+                # this round's frees (record_stream marks were placed at
+                # enqueue; the junk round's writes hit owned slots only).
+                stale_pre = self._prelaunched["pre"]
+                self._prelaunched = None
+                self._scrap_prebuilt_into(
+                    stale_pre, scratch_batches, scratch_slots, scratch_kv_pages
+                )
             hit_keys: list[DraftReqKey] = []
             hit_states: list[_DraftReqState] = []
             selections: list[tuple[int, int]] = []
@@ -4009,6 +4203,7 @@ class EnumDraftEngine:
                 torch.stack([cs.gather for cs in case_staging]).contiguous(),
                 torch.stack([cs.out_cache_loc for cs in case_staging]).contiguous(),
                 torch.stack([cs.true_lens for cs in case_staging]).contiguous(),
+                torch.stack([cs.node_gather for cs in case_staging]).contiguous(),
             )
         positions: list[int] = []
         for base in base_lens:

@@ -242,12 +242,14 @@ def _commit_scatter_kernel(
     gather_stack_ptr,  # [K+1, ROWS_W] int64 (source-gather indices per delta)
     out_loc_stack_ptr,  # [K+1, ROWS_W] int64
     true_stack_ptr,  # [K+1, ROWS] int32
+    node_stack_ptr,  # [K+1, ROWS] int64 (node-logit gather offsets per delta)
     pad_flats_ptr,  # [PADS] int64 (this seat's pad plane, paged layout)
     # outputs
     verdict_ptr,  # [4] int64: verdict, case, f, new_total(delta only here)
     input_out_ptr,  # [ROWS_W] int64
     out_loc_out_ptr,  # [ROWS_W] int64
     true_out_ptr,  # [ROWS] int32
+    node_out_ptr,  # [ROWS] int64
     chains_out_ptr,  # [K] int64
     table_ptr,  # page-table row base (real or shadow); pads land at
     table_col0,  # columns [table_col0 + delta - ? ...]: col0 = base offset
@@ -320,6 +322,9 @@ def _commit_scatter_kernel(
         # Stale -> zero-length GDN scan: the seat's recurrent state is left
         # untouched by a junk round (the timeout junk lane's key property).
         tl.store(true_out_ptr + r, tl.where(stale_row, 0, v))
+    for r in tl.static_range(ROWS):
+        nv = tl.load(node_stack_ptr + case_c * ROWS + r)
+        tl.store(node_out_ptr + r, nv)
     # D: seat-row pad table entries, columns [base+delta, base+WIDTH)
     new_len = base_len + dlen
     pad_offset = new_len - (new_len // PAGE) * PAGE
@@ -345,6 +350,7 @@ def commit_scatter(
     gather_stack: torch.Tensor,
     out_loc_stack: torch.Tensor,
     true_stack: torch.Tensor,
+    node_stack: torch.Tensor,
     pad_flats: torch.Tensor,
     table_row: torch.Tensor,  # 1-D view of the seat row (real or shadow)
     table_col0: int,
@@ -353,14 +359,14 @@ def commit_scatter(
     fanout: int,
     page_size: int,
     extend_width: int,
-    outs: tuple,  # (verdict[4]i64, input[ROWS_W]i64, out_loc[ROWS_W]i64, true[ROWS]i32, chains[K]i64)
+    outs: tuple,  # (verdict[4]i64, input[ROWS_W]i64, out_loc[ROWS_W]i64, true[ROWS]i32, node[ROWS]i64, chains[K]i64)
 ) -> None:
     """One-launch commit consumption: the on-GPU match plus every per-case
     value the fused-extend replay needs (input assembly, out_cache_loc /
     GDN true-lens selection, seat-pad page-table suffix), fed entirely from
     the commit mirror. Stale generation writes only the verdict -- the
     caller's junk-lane / fallback handles the rest."""
-    verdict, input_out, out_loc_out, true_out, chains_out = outs
+    verdict, input_out, out_loc_out, true_out, node_out, chains_out = outs
     rows = true_stack.shape[1]
     rows_w = gather_stack.shape[1]
     _commit_scatter_kernel[(1,)](
@@ -372,11 +378,13 @@ def commit_scatter(
         gather_stack,
         out_loc_stack,
         true_stack,
+        node_stack,
         pad_flats,
         verdict,
         input_out,
         out_loc_out,
         true_out,
+        node_out,
         chains_out,
         table_row,
         table_col0,

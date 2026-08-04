@@ -424,6 +424,19 @@ class Envs:
     # hit-round consume and compare every produced tensor (device syncs --
     # debug only).
     SGLANG_DEBUG_DECOUPLED_GPU_SCATTER = EnvBool(False)
+    # Decoupled spec: pre-launch the drafter fast round's extend half BEFORE
+    # its commit arrives -- a host-func gate on the compute stream waits for
+    # the commit's GPU landing, the scatter consumes it in-kernel, and the
+    # extend + guess-tail graphs run with zero host involvement; the loop
+    # then runs only the chain half. A gate timeout degrades to the stale
+    # zero-scan junk round (seat state untouched) and the loop's full host
+    # round takes over when the commit really arrives. Requires
+    # SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME machinery; bs == 1 fast path.
+    SGLANG_ENABLE_DECOUPLED_DRAFT_PRELAUNCH = EnvBool(False)
+    # Decoupled spec: force every pre-launched round down the stale junk
+    # lane (validation: the pipeline must execute with zero state impact
+    # while the host rounds keep full correctness). Debug only.
+    SGLANG_DEBUG_DECOUPLED_PRELAUNCH_JUNK = EnvBool(False)
     # Decoupled spec: consume hit-round commits through the commit-scatter
     # kernel writing the replay fb's OWN static buffers (input_ids /
     # out_cache_loc / GDN true-lens / seat-pad table suffix in one launch)
