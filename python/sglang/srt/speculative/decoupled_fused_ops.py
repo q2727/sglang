@@ -265,7 +265,15 @@ def _commit_scatter_kernel(
     WIDTH: tl.constexpr,
     PAGE: tl.constexpr,
 ):
-    gen = tl.load(gen_ptr + seat)
+    # Bounded predicated re-read (NOT a scalar while: its lowering is the
+    # fragile path): under pre-launch the gate's host release only proves
+    # the landing was ENQUEUED on the mirror stream; these re-reads absorb
+    # the enqueue-to-execute microseconds. Exhausting them leaves
+    # gen != expected -> the stale zero-scan junk lane.
+    gen = tl.load(gen_ptr + seat, volatile=True)
+    for _spin in tl.static_range(64):
+        fresh = tl.load(gen_ptr + seat, volatile=True)
+        gen = tl.where(gen != expected_gen, fresh, gen)
     dlen = tl.load(dlen_ptr + seat)
     case = dlen - 1
     prefix_ok = (case >= 0) & (case <= K) & (case <= backbone_len)
@@ -286,12 +294,12 @@ def _commit_scatter_kernel(
     tl.store(verdict_ptr + 1, case_c.to(tl.int64))
     tl.store(verdict_ptr + 2, f_found.to(tl.int64))
     tl.store(verdict_ptr + 3, dlen.to(tl.int64))
-    live = verdict != 0  # stale writes nothing (junk-lane handled by caller)
+    stale_row = verdict == 0
     f_c = tl.maximum(f_found, 0)
     # E: winning chain (junk zeros on miss -- its cells are dead by theorem)
     for i in tl.static_range(K):
         c = tl.load(units_ptr + (case_c * F + f_c) * W_UNIT + 1 + i)
-        tl.store(chains_out_ptr + i, tl.where(hit, c, 0), mask=live)
+        tl.store(chains_out_ptr + i, tl.where(hit & ~stale_row, c, 0))
     # A: input assembly out[j] = src[gather[case, j]], src = delta ++ chain
     for j in tl.static_range(ROWS_W):
         gidx = tl.load(gather_stack_ptr + case_c * ROWS_W + j)
@@ -301,14 +309,17 @@ def _commit_scatter_kernel(
         cidx = tl.minimum(tl.maximum(gidx - dlen, 0), K - 1)
         craw = tl.load(units_ptr + (case_c * F + f_c) * W_UNIT + 1 + cidx)
         cval = tl.where(hit, craw, 0)
-        tl.store(input_out_ptr + j, tl.where(from_delta, dval, cval), mask=live)
+        val = tl.where(from_delta, dval, cval)
+        tl.store(input_out_ptr + j, tl.where(stale_row, 0, val))
     # B / C: per-case staging selection
     for j in tl.static_range(ROWS_W):
         v = tl.load(out_loc_stack_ptr + case_c * ROWS_W + j)
-        tl.store(out_loc_out_ptr + j, v, mask=live)
+        tl.store(out_loc_out_ptr + j, v)
     for r in tl.static_range(ROWS):
         v = tl.load(true_stack_ptr + case_c * ROWS + r)
-        tl.store(true_out_ptr + r, v, mask=live)
+        # Stale -> zero-length GDN scan: the seat's recurrent state is left
+        # untouched by a junk round (the timeout junk lane's key property).
+        tl.store(true_out_ptr + r, tl.where(stale_row, 0, v))
     # D: seat-row pad table entries, columns [base+delta, base+WIDTH)
     new_len = base_len + dlen
     pad_offset = new_len - (new_len // PAGE) * PAGE
@@ -319,7 +330,7 @@ def _commit_scatter_kernel(
         tl.store(
             table_ptr + table_col0 + col,
             pval.to(tl.int32),
-            mask=live & in_pad,
+            mask=in_pad & ~stale_row,
         )
 
 
