@@ -732,6 +732,13 @@ class ServerArgs:
     kt_gpu_prefill_token_threshold: Optional[int] = None
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
+    kt_decode_hot_expert_update: bool = False
+    kt_decode_hot_min_tokens: int = 8
+    kt_decode_hot_max_promotions: int = 1
+    kt_decode_hot_ema_decay: float = 0.7
+    kt_decode_hot_hysteresis: float = 1.25
+    kt_decode_hot_min_residency: int = 16
+    kt_decode_hot_refresh_interval: int = 16
     kt_expert_placement_strategy: str = "uniform"
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
@@ -2628,6 +2635,43 @@ class ServerArgs:
                 "KTransformers EP is enabled. --disable-shared-experts-fusion is automatically set "
                 "to prevent shared experts from being offloaded to CPU."
             )
+
+        if self.kt_decode_hot_expert_update:
+            if self.kt_weight_path is None:
+                raise ValueError(
+                    "--kt-decode-hot-expert-update requires --kt-weight-path"
+                )
+            if self.kt_enable_dynamic_expert_update:
+                raise ValueError(
+                    "--kt-decode-hot-expert-update and "
+                    "--kt-enable-dynamic-expert-update cannot be enabled together"
+                )
+            if (self.kt_method or "").upper() not in ("BF16", "AMXBF16"):
+                raise ValueError(
+                    "--kt-decode-hot-expert-update currently supports only BF16 "
+                    "packed Qwen checkpoints"
+                )
+            if not self.kt_num_gpu_experts or self.kt_num_gpu_experts < 1:
+                raise ValueError(
+                    "--kt-decode-hot-expert-update requires --kt-num-gpu-experts > 0"
+                )
+            if self.kt_decode_hot_min_tokens < 1:
+                raise ValueError("--kt-decode-hot-min-tokens must be positive")
+            if self.kt_decode_hot_max_promotions < 1:
+                raise ValueError("--kt-decode-hot-max-promotions must be positive")
+            if self.kt_decode_hot_max_promotions > self.kt_num_gpu_experts:
+                raise ValueError(
+                    "--kt-decode-hot-max-promotions cannot exceed "
+                    "--kt-num-gpu-experts"
+                )
+            if not 0.0 <= self.kt_decode_hot_ema_decay < 1.0:
+                raise ValueError("--kt-decode-hot-ema-decay must be in [0, 1)")
+            if self.kt_decode_hot_hysteresis < 1.0:
+                raise ValueError("--kt-decode-hot-hysteresis must be >= 1")
+            if self.kt_decode_hot_min_residency < 0:
+                raise ValueError("--kt-decode-hot-min-residency must be non-negative")
+            if self.kt_decode_hot_refresh_interval < 1:
+                raise ValueError("--kt-decode-hot-refresh-interval must be positive")
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -4894,6 +4938,48 @@ class ServerArgs:
             help="[ktransformers parameter] Enable dynamic GPU expert updates based on runtime statistics. After full GPU fallback computation, updates original layer's GPU experts to match the most frequently activated experts in the current batch.",
         )
         parser.add_argument(
+            "--kt-decode-hot-expert-update",
+            action="store_true",
+            default=ServerArgs.kt_decode_hot_expert_update,
+            help="[experimental ktransformers parameter] Replace a bounded number of GPU expert slots after each speculative target verification using observed routing load.",
+        )
+        parser.add_argument(
+            "--kt-decode-hot-min-tokens",
+            type=int,
+            default=ServerArgs.kt_decode_hot_min_tokens,
+            help="Minimum current verification-token load required before a CPU expert can be promoted to GPU.",
+        )
+        parser.add_argument(
+            "--kt-decode-hot-max-promotions",
+            type=int,
+            default=ServerArgs.kt_decode_hot_max_promotions,
+            help="Maximum number of expert slots replaced per layer and verification pass.",
+        )
+        parser.add_argument(
+            "--kt-decode-hot-ema-decay",
+            type=float,
+            default=ServerArgs.kt_decode_hot_ema_decay,
+            help="EMA decay applied to per-expert verification-token loads.",
+        )
+        parser.add_argument(
+            "--kt-decode-hot-hysteresis",
+            type=float,
+            default=ServerArgs.kt_decode_hot_hysteresis,
+            help="Required EMA score ratio between a promotion candidate and its GPU eviction victim.",
+        )
+        parser.add_argument(
+            "--kt-decode-hot-min-residency",
+            type=int,
+            default=ServerArgs.kt_decode_hot_min_residency,
+            help="Minimum verification passes a newly promoted expert remains resident before eviction.",
+        )
+        parser.add_argument(
+            "--kt-decode-hot-refresh-interval",
+            type=int,
+            default=ServerArgs.kt_decode_hot_refresh_interval,
+            help="After initially filling GPU slots, allow replacement only once per this many verification passes.",
+        )
+        parser.add_argument(
             "--kt-expert-placement-strategy",
             type=str,
             default=ServerArgs.kt_expert_placement_strategy,
@@ -5824,9 +5910,14 @@ class ServerArgs:
             )
 
         # Check two batch overlap
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+        if (
+            self.enable_two_batch_overlap
+            and self.moe_a2a_backend == "none"
+            and self.kt_weight_path is None
+        ):
             raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+                "When enabling two batch overlap, moe_a2a_backend cannot be "
+                "'none' unless KTransformers CPU MoE is enabled."
             )
 
     def check_torch_2_9_1_cudnn_compatibility(self):

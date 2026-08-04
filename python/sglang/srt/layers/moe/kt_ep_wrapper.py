@@ -37,7 +37,7 @@ import uuid
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -92,6 +92,7 @@ class KTConfig:
         num_layers: Total number of layers in the model (optional)
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
+        kt_decode_hot_expert_update: Enable speculative-decode hot expert replacement
         expert_lora_path: Optional PEFT adapter directory for KT CPU expert LoRA
     """
 
@@ -107,7 +108,30 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    kt_decode_hot_expert_update: bool = False
+    kt_decode_hot_min_tokens: int = 8
+    kt_decode_hot_max_promotions: int = 1
+    kt_decode_hot_ema_decay: float = 0.7
+    kt_decode_hot_hysteresis: float = 1.25
+    kt_decode_hot_min_residency: int = 16
+    kt_decode_hot_refresh_interval: int = 16
     expert_lora_path: Optional[str] = None
+
+
+@dataclass
+class KTTBOHandle:
+    """In-flight routed-expert work for KT two-batch overlap.
+
+    The CPU worker owns ``staging_buffer`` until ``apply_tbo_finish``.  GPU
+    resident experts have already been enqueued into ``output`` on the model
+    stream, so the scheduler is free to enqueue the other microbatch's
+    attention before collecting the CPU result.
+    """
+
+    output: torch.Tensor
+    staging_buffer: Optional[torch.Tensor]
+    cpu_submitted: bool
+    no_cpu_stream: bool
 
 
 @dataclass
@@ -2136,6 +2160,13 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        kt_decode_hot_expert_update=server_args.kt_decode_hot_expert_update,
+        kt_decode_hot_min_tokens=server_args.kt_decode_hot_min_tokens,
+        kt_decode_hot_max_promotions=server_args.kt_decode_hot_max_promotions,
+        kt_decode_hot_ema_decay=server_args.kt_decode_hot_ema_decay,
+        kt_decode_hot_hysteresis=server_args.kt_decode_hot_hysteresis,
+        kt_decode_hot_min_residency=server_args.kt_decode_hot_min_residency,
+        kt_decode_hot_refresh_interval=server_args.kt_decode_hot_refresh_interval,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
     )
 
@@ -2461,6 +2492,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
         self.kt_expert_lora_path = kt_config.expert_lora_path
         self.kt_expert_lora_enabled = bool(self.kt_expert_lora_path)
+        self.kt_decode_hot_enabled = kt_config.kt_decode_hot_expert_update
         self.kt_expert_lora_weights: Optional[KTExpertLoraWeights] = None
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
@@ -2483,6 +2515,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     "--kt-expert-lora-path is not compatible with "
                     "--kt-enable-dynamic-expert-update in the first single-adapter "
                     "implementation."
+                )
+            if kt_config.kt_decode_hot_expert_update:
+                raise ValueError(
+                    "--kt-expert-lora-path is not compatible with "
+                    "--kt-decode-hot-expert-update"
                 )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -2514,6 +2551,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
+        self._decode_hot_expert_counts: Optional[torch.Tensor] = None
+        self._decode_hot_layer: Optional[torch.nn.Module] = None
 
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
         # main stream for GPU computation (initialized in create_weights)
@@ -2583,6 +2622,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+
+        if self.kt_decode_hot_enabled:
+            if params_dtype != torch.bfloat16:
+                raise ValueError(
+                    "KT decode hot expert replacement currently requires BF16 GPU weights"
+                )
+            self._decode_hot_expert_counts = torch.zeros(
+                num_experts, dtype=torch.int32, device=target_device
+            )
+            self._decode_hot_layer = layer
+            from sglang.srt.layers.moe.kt_decode_hot import (
+                register_kt_decode_hot_layer,
+            )
+
+            register_kt_decode_hot_layer(self)
 
         # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
         if self.tp_rank == 0:
@@ -2888,6 +2942,129 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return self._sync_cpu_forward(staged_hidden_states)
 
+    def apply_tbo_begin(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> KTTBOHandle:
+        """Start one KT MoE microbatch without waiting for its CPU experts.
+
+        This is the producer half used by the CPU--GPU two-batch pipeline.  It
+        deliberately mirrors the decode branch of :meth:`apply`: copy the
+        routed input into the persistent staging buffer, submit cold experts
+        to KT's CPU worker, and enqueue resident experts on the current CUDA
+        stream.  ``apply_tbo_finish`` performs the only CPU wait.
+
+        Full-GPU prefill fallback and live expert replacement are excluded
+        because this path is intended for exact decode-only overlap and both
+        features mutate resources shared by the two microbatches.
+        """
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+
+        cls = type(self)
+        if self.tp_rank == 0 and not getattr(cls, "_kt_tbo_path_logged", False):
+            cls._kt_tbo_path_logged = True
+            logger.info(
+                "KT CPU two-batch path active: begin/finish split at layer=%d, "
+                "microbatch_tokens=%d",
+                self.kt_config.layer_idx,
+                num_tokens,
+            )
+
+        if self.kt_config.kt_enable_dynamic_expert_update or self.kt_decode_hot_enabled:
+            raise RuntimeError(
+                "KT two-batch overlap is incompatible with runtime expert "
+                "replacement; disable dynamic/hot expert updates."
+            )
+        if self.gpu_prefill_token_threshold > 0 and num_tokens >= self.gpu_prefill_token_threshold:
+            raise RuntimeError(
+                "KT two-batch overlap only supports the hybrid decode path; "
+                "the full-GPU prefill fallback was selected."
+            )
+
+        if self.tp_rank == 0:
+            get_global_expert_distribution_recorder().on_gpu_expert_mask(
+                self.kt_config.layer_idx, self.gpu_experts_mask_cuda
+            )
+
+        no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
+        staging_buffer = None
+        cpu_submitted = False
+        if self.tp_rank == 0 and self._cpu_stream is not None:
+            assert self._shared_staging_buffer is not None
+            staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
+            staging_buffer.copy_(x, non_blocking=True)
+            if not no_cpu_stream:
+                self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+
+            from contextlib import nullcontext
+
+            stream_context = (
+                nullcontext()
+                if no_cpu_stream
+                else torch.cuda.stream(self._cpu_stream)
+            )
+            with stream_context:
+                self._submit_with_staged_input(
+                    layer, dispatch_output, staging_buffer
+                )
+            cpu_submitted = True
+
+        masked_topk_ids = mask_and_remap_expert_ids(
+            topk_output.topk_ids,
+            self.gpu_experts_mask_cuda,
+            self.logical_to_gpu_index_cuda,
+        )
+        masked_dispatch_output = dispatch_output._replace(
+            topk_output=topk_output._replace(topk_ids=masked_topk_ids)
+        )
+
+        if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
+            output = torch.zeros_like(x)
+        else:
+            output = self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
+
+        return KTTBOHandle(
+            output=output,
+            staging_buffer=staging_buffer,
+            cpu_submitted=cpu_submitted,
+            no_cpu_stream=no_cpu_stream,
+        )
+
+    def apply_tbo_finish(self, handle: KTTBOHandle) -> "CombineInput":
+        """Collect CPU experts for an in-flight KT two-batch microbatch."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        output = handle.output
+        if handle.cpu_submitted:
+            assert handle.staging_buffer is not None
+            assert self._cpu_stream is not None
+
+            from contextlib import nullcontext
+
+            stream_context = (
+                nullcontext()
+                if handle.no_cpu_stream
+                else torch.cuda.stream(self._cpu_stream)
+            )
+            with stream_context:
+                cpu_output = self._sync_with_staged_input(handle.staging_buffer)
+                if not handle.no_cpu_stream:
+                    self._sync_done_event.record(self._cpu_stream)
+            if not handle.no_cpu_stream:
+                torch.cuda.current_stream(output.device).wait_event(
+                    self._sync_done_event
+                )
+            output = output + cpu_output
+
+        return StandardCombineInput(hidden_states=output)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2923,6 +3100,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        from sglang.srt.debug_utils.component_timing import (
+            cpu_isolation_enabled as _component_cpu_isolation_enabled,
+            is_active as _component_timing_is_active,
+            record_cpu_moe as _record_component_cpu_moe,
+        )
+
+        _component_timing = _component_timing_is_active() and self.tp_rank == 0
+        _component_submit_ms = 0.0
+        _component_cpu_output = None
+        _component_isolated = False
+        _component_cpu_service_start = None
+        _component_cpu_service_end = None
+        _component_residual_wait_start = None
+        _component_residual_wait_end = None
+        _component_hybrid_start = None
+        _component_hybrid_end = None
+        if _component_timing:
+            _component_cpu_service_start = torch.cuda.Event(enable_timing=True)
+            _component_cpu_service_end = torch.cuda.Event(enable_timing=True)
+            _component_residual_wait_start = torch.cuda.Event(enable_timing=True)
+            _component_residual_wait_end = torch.cuda.Event(enable_timing=True)
+            _component_hybrid_start = torch.cuda.Event(enable_timing=True)
+            _component_hybrid_end = torch.cuda.Event(enable_timing=True)
+            _component_hybrid_start.record(torch.cuda.current_stream(x.device))
         _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
             and self.tp_rank == 0
@@ -3038,9 +3239,29 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
+                if _component_timing:
+                    _component_cpu_service_start.record(self._cpu_stream)
+                    _component_submit_start = time.perf_counter()
                 self._submit_with_staged_input(
                     layer, dispatch_output, staging_buffer
                 )
+                if _component_timing:
+                    _component_submit_ms = (
+                        time.perf_counter() - _component_submit_start
+                    ) * 1000.0
+                if _component_timing and _component_cpu_isolation_enabled():
+                    # Diagnostic replay: enqueue sync immediately after submit;
+                    # the main stream waits on the resulting completion event
+                    # before it is allowed to enqueue useful GPU-MoE work.
+                    _component_isolated = True
+                    _component_cpu_output = self._sync_with_staged_input(
+                        staging_buffer
+                    )
+                    _component_cpu_service_end.record(self._cpu_stream)
+                    if not _no_cpu_stream:
+                        self._sync_done_event.record(self._cpu_stream)
+        if _component_isolated and not _no_cpu_stream:
+            torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -3049,6 +3270,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
         topk_ids = topk_output.topk_ids
+        if self._decode_hot_expert_counts is not None:
+            # These operations are intentionally graph-capturable. Each replay
+            # overwrites the persistent buffer with the current target verify
+            # batch's token load, while its address remains stable.
+            flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
+            self._decode_hot_expert_counts.zero_()
+            self._decode_hot_expert_counts.scatter_add_(
+                0,
+                flat_topk_ids,
+                torch.ones_like(flat_topk_ids, dtype=torch.int32),
+            )
         masked_topk_ids = mask_and_remap_expert_ids(
             topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
         )
@@ -3121,21 +3353,36 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
             from contextlib import nullcontext as _ctx_null
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
-            with _stream_ctx:
-                # Use staging_buffer for sync to get correct buffer reference
-                _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                cpu_output = self._sync_with_staged_input(staging_buffer)
-                if _kt_t_sync_pre is not None:
-                    _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
-                if not _no_cpu_stream:
-                    self._sync_done_event.record(self._cpu_stream)
+            if _component_cpu_output is None:
+                with _stream_ctx:
+                    # Use staging_buffer for sync to get correct buffer reference
+                    _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
+                    cpu_output = self._sync_with_staged_input(staging_buffer)
+                    if _component_timing:
+                        _component_cpu_service_end.record(self._cpu_stream)
+                    if _kt_t_sync_pre is not None:
+                        _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
+                    if not _no_cpu_stream:
+                        self._sync_done_event.record(self._cpu_stream)
+            else:
+                cpu_output = _component_cpu_output
             if _kt_timing:
                 _kt_t_after_sync = time.perf_counter()
 
             # Main stream waits for cpu_stream to complete before merging results
+            if _component_timing:
+                _component_residual_wait_start.record(
+                    torch.cuda.current_stream(x.device)
+                )
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+            if _component_timing:
+                _component_residual_wait_end.record(
+                    torch.cuda.current_stream(x.device)
+                )
             output = output + cpu_output
+            if _component_timing:
+                _component_hybrid_end.record(torch.cuda.current_stream(x.device))
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU
@@ -3176,6 +3423,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     _stage_mask_ms, _stage_gpu_ms, _stage_sync_ms,
                     _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
                 )
+        if _component_timing:
+            _record_component_cpu_moe(
+                layer=getattr(self.kt_config, "layer_idx", -1),
+                num_tokens=num_tokens,
+                submit_python_ms=_component_submit_ms,
+                isolated=_component_isolated,
+                cpu_service_start=_component_cpu_service_start,
+                cpu_service_end=_component_cpu_service_end,
+                residual_wait_start=_component_residual_wait_start,
+                residual_wait_end=_component_residual_wait_end,
+                hybrid_critical_start=_component_hybrid_start,
+                hybrid_critical_end=_component_hybrid_end,
+            )
         return StandardCombineInput(hidden_states=output)
 
     def _update_gpu_experts_from_batch(

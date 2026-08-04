@@ -284,6 +284,68 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         return self.experts(hidden_states, topk_output)
 
+    def forward_tbo_begin(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        use_reduce_scatter: bool = False,
+    ) -> Dict[str, Any]:
+        """Submit one decode microbatch to the asynchronous KT MoE path."""
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        router_logits, _ = self.gate(hidden_states)
+        with get_global_expert_distribution_recorder().with_current_layer(
+            self.layer_id
+        ):
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+
+        shared_output = self._forward_shared_experts(hidden_states)
+        dispatch_output = self.experts.dispatcher.dispatch(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+        )
+        quant_method = self.experts.quant_method
+        if not hasattr(quant_method, "apply_tbo_begin"):
+            raise RuntimeError(
+                "Qwen two-batch CPU overlap requires the KTransformers MoE wrapper"
+            )
+        moe_handle = quant_method.apply_tbo_begin(self.experts, dispatch_output)
+        return {
+            "hidden_dim": hidden_dim,
+            "num_tokens": num_tokens,
+            "shared_output": shared_output,
+            "moe_handle": moe_handle,
+            "use_reduce_scatter": use_reduce_scatter,
+        }
+
+    def forward_tbo_finish(self, handle: Dict[str, Any]) -> torch.Tensor:
+        """Finish the KT MoE work submitted by :meth:`forward_tbo_begin`."""
+        quant_method = self.experts.quant_method
+        combine_input = quant_method.apply_tbo_finish(handle["moe_handle"])
+        final_hidden_states = self.experts.dispatcher.combine(
+            combine_input=combine_input
+        )
+
+        shared_output = handle["shared_output"]
+        if shared_output is not None:
+            final_hidden_states += shared_output
+        if self.tp_size > 1 and not handle["use_reduce_scatter"]:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
+
+        return final_hidden_states.view(
+            handle["num_tokens"], handle["hidden_dim"]
+        )
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -320,7 +382,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
+            from sglang.srt.debug_utils.component_timing import (
+                shared_dense_region,
+            )
+
+            forward_mode = getattr(
+                getattr(forward_batch, "forward_mode", None), "name", "unknown"
+            )
+            with shared_dense_region(
+                layer=self.layer_id,
+                num_tokens=int(hidden_states.shape[0]),
+                forward_mode=forward_mode,
+            ):
+                shared_output = self._forward_shared_experts(hidden_states)
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:

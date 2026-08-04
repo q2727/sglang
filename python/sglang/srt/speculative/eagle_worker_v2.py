@@ -794,6 +794,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
+        if self.server_args.kt_decode_hot_expert_update:
+            from sglang.srt.layers.moe.kt_decode_hot import (
+                maybe_update_kt_decode_hot_experts,
+            )
+
+            maybe_update_kt_decode_hot_experts()
+
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)

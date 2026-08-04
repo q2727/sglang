@@ -26,6 +26,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.srt.batch_overlap.kt_cpu_tbo import (
+    prepare_qwen35_kt_tbo_forward_batch,
+    register_qwen35_kt_tbo,
+)
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+
 # Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -41,7 +47,11 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -520,6 +530,56 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return output
 
 
+def _qwen35_tbo_moe_begin(layer: nn.Module, state) -> None:
+    if not isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        raise RuntimeError("Qwen3.5 KT two-batch overlap requires sparse MoE layers")
+
+    # KT TBO uses regular TP attention, not DP-attention.  Each child may have
+    # one token, so reduce-scatter padding would violate GDN's batch reshape.
+    use_reduce_scatter = False
+    state.should_allreduce_fusion = (
+        layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            state.forward_batch
+        )
+    )
+    state.moe_handle = layer.mlp.forward_tbo_begin(
+        state.pop("hidden_states_mlp_input"),
+        state.forward_batch,
+        use_reduce_scatter,
+    )
+
+
+def _qwen35_tbo_moe_finish(layer: nn.Module, state):
+    hidden_states = layer.mlp.forward_tbo_finish(state.pop("moe_handle"))
+    residual = state.pop("residual_after_comm_pre_mlp")
+    should_allreduce_fusion = state.pop("should_allreduce_fusion")
+
+    if should_allreduce_fusion:
+        hidden_states._sglang_needs_allreduce_fusion = True
+    else:
+        hidden_states, residual = layer.layer_communicator.postprocess_layer(
+            hidden_states,
+            residual,
+            state.forward_batch,
+        )
+
+    output = dict(
+        positions=state.positions,
+        hidden_states=hidden_states,
+        residual=residual,
+        forward_batch=state.forward_batch,
+        tbo_subbatch_index=state.tbo_subbatch_index,
+    )
+    state.clear(
+        expect_keys={
+            "positions",
+            "forward_batch",
+            "tbo_subbatch_index",
+        }
+    )
+    return output
+
+
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
 
@@ -590,6 +650,39 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             allow_reduce_scatter=True,
         )
 
+    def op_tbo_attention(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ) -> None:
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.linear_attn(hidden_states, forward_batch)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        state.hidden_states_mlp_input = hidden_states
+        state.residual_after_comm_pre_mlp = residual
+        state.update(
+            dict(
+                positions=positions,
+                forward_batch=forward_batch,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_tbo_moe_begin(self, state) -> None:
+        _qwen35_tbo_moe_begin(self, state)
+
+    def op_tbo_moe_finish(self, state):
+        return _qwen35_tbo_moe_finish(self, state)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -603,10 +696,18 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(
-                hidden_states,
-                forward_batch,
-            )
+            from sglang.srt.debug_utils.component_timing import attention_region
+
+            with attention_region(
+                layer=self.linear_attn.layer_id,
+                kind="linear_attention",
+                num_tokens=int(hidden_states.shape[0]),
+                forward_mode=forward_batch.forward_mode.name,
+            ):
+                hidden_states = self.linear_attn(
+                    hidden_states,
+                    forward_batch,
+                )
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -787,6 +888,43 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self._kt_lora_v_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._kt_lora_o_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
+    def op_tbo_attention(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ) -> None:
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.self_attention(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        state.hidden_states_mlp_input = hidden_states
+        state.residual_after_comm_pre_mlp = residual
+        state.update(
+            dict(
+                positions=positions,
+                forward_batch=forward_batch,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_tbo_moe_begin(self, state) -> None:
+        _qwen35_tbo_moe_begin(self, state)
+
+    def op_tbo_moe_finish(self, state):
+        return _qwen35_tbo_moe_finish(self, state)
+
     def load_kt_lora(
         self,
         state_dict: Dict[str, torch.Tensor],
@@ -946,11 +1084,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            from sglang.srt.debug_utils.component_timing import attention_region
+
+            with attention_region(
+                layer=self.layer_id,
+                kind="full_attention",
+                num_tokens=int(hidden_states.shape[0]),
+                forward_mode=forward_batch.forward_mode.name,
+            ):
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -985,6 +1131,11 @@ ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3_5AttentionDecoderLayer,
     "linear_attention": Qwen3_5LinearDecoderLayer,
 }
+
+register_qwen35_kt_tbo(
+    Qwen3_5LinearDecoderLayer,
+    Qwen3_5AttentionDecoderLayer,
+)
 
 
 class Qwen3_5ForCausalLM(nn.Module):
@@ -1141,6 +1292,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        prepare_qwen35_kt_tbo_forward_batch(forward_batch)
+
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1153,29 +1306,45 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        # Pass through decoder layers
-        for layer_idx in range(len(self.layers)):
-            layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
+        # Pass through decoder layers.  TBO splits the request batch once and
+        # interleaves attention with asynchronous KT CPU MoE at layer granularity.
+        if forward_batch.can_run_tbo:
+            if input_deepstack_embeds is not None and input_deepstack_embeds.numel() > 0:
+                raise RuntimeError(
+                    "Qwen3.5 KT two-batch overlap does not support deepstack inputs"
                 )
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers,
+                enable_tbo=True,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        else:
+            for layer_idx in range(len(self.layers)):
+                layer = self.layers[layer_idx]
+                with get_global_expert_distribution_recorder().with_current_layer(
+                    layer_idx
+                ):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                    )
 
-            # Process deepstack embeddings if provided
-            if (
-                input_deepstack_embeds is not None
-                and input_deepstack_embeds.numel() > 0
-                and layer_idx < 3
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+                # Process deepstack embeddings if provided
+                if (
+                    input_deepstack_embeds is not None
+                    and input_deepstack_embeds.numel() > 0
+                    and layer_idx < 3
+                ):
+                    sep = self.hidden_size * layer_idx
+                    hidden_states.add_(
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    )
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:

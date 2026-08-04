@@ -768,6 +768,13 @@ class EAGLEWorker(TpModelWorker):
             vocab_mask,
         )
 
+        if self.server_args.kt_decode_hot_expert_update:
+            from sglang.srt.layers.moe.kt_decode_hot import (
+                maybe_update_kt_decode_hot_experts,
+            )
+
+            maybe_update_kt_decode_hot_experts()
+
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
