@@ -1008,6 +1008,13 @@ class EnumDraftEngine:
         self._gpu_match_probe_ct = 0
         self._debug_gpu_scatter = envs.SGLANG_DEBUG_DECOUPLED_GPU_SCATTER.get()
         self._gpu_scatter_probe_ct = 0
+        self._scatter_consume = envs.SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME.get()
+        # Scatter-consume scratch: verdict sink (never host-read on the hot
+        # path) and the chains buffer the topk stage reuses.
+        self._scatter_verdict = torch.zeros(4, dtype=torch.int64, device=self.device)
+        self._scatter_chains = torch.zeros(
+            max(1, self.num_steps), dtype=torch.int64, device=self.device
+        )
 
     # ------------------------------------------------------------------ #
     # Fused-extend CUDA graph: construction (init-time)
@@ -1297,6 +1304,69 @@ class EnumDraftEngine:
                 selection,
             )
 
+    def _scatter_consume_commit(
+        self,
+        *,
+        state: _DraftReqState,
+        prebuilt: _PrebuiltFastRound,
+        prestaged: _ExtendCaseStaging,
+        prestaged_fb: ForwardBatch,
+        seat_row: int,
+        base_len: int,
+        graph_round: _ExtendGraphRound,
+    ) -> bool:
+        """Consume the landed commit through ONE commit_scatter launch that
+        writes the replay fb's own static buffers (input / out_cache_loc /
+        GDN true-lens) and the seat row's pad table suffix. Returns False
+        when the mirror cannot serve this round (older/newer generation, no
+        stacks) -- the caller falls back to the host pointer-swap path."""
+        mirror, board = self._commit_mirror, self._commit_board
+        if (
+            mirror is None
+            or board is None
+            or prebuilt.scatter_stacks is None
+            or not self._paged
+            or state.last_backbone_dev is None
+            or state.last_units_dev is None
+        ):
+            return False
+        seat = int(state.req_pool_idx)
+        with board._cond:
+            latest = board._stamps.get(seat)
+        if latest is None or latest + state.prompt_len != len(state.committed_tokens):
+            return False  # the mirror's latest is not this round's delta
+        from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
+
+        gather_stack, out_loc_stack, true_stack = prebuilt.scatter_stacks
+        torch.cuda.current_stream().wait_event(mirror.land_event)
+        commit_scatter(
+            mirror=mirror,
+            seat=seat,
+            expected_generation=mirror.host_generation(seat),
+            units_dev=state.last_units_dev.contiguous(),
+            backbone_dev=state.last_backbone_dev,
+            backbone_len=state.last_backbone_len,
+            gather_stack=gather_stack,
+            out_loc_stack=out_loc_stack,
+            true_stack=true_stack,
+            pad_flats=graph_round.seat_pad_flats[0],
+            table_row=self.model_runner.req_to_token_pool.req_to_token[seat_row],
+            table_col0=base_len,
+            base_len=base_len,
+            num_steps=self.num_steps,
+            fanout=self.fanout,
+            page_size=self._page_size,
+            extend_width=self._extend_graph_width,
+            outs=(
+                self._scatter_verdict,
+                prestaged_fb.input_ids,
+                prestaged_fb.out_cache_loc,
+                prestaged_fb.spec_info.gdn_true_extend_lens_tensor,
+                self._scatter_chains,
+            ),
+        )
+        return True
+
     def _probe_gpu_scatter(
         self,
         *,
@@ -1355,6 +1425,7 @@ class EnumDraftEngine:
                 else graph_round.w_slots[0, 0]
             ),
             table_row=shadow_row,
+            table_col0=0,
             base_len=base_len,
             num_steps=self.num_steps,
             fanout=self.fanout,
@@ -1896,6 +1967,7 @@ class EnumDraftEngine:
         seat_input_ids: Optional[torch.Tensor] = None
         glue_preseeded = False
         prestaged_case: Optional[_ExtendCaseStaging] = None
+        prestaged_values_ready = False
         prestaged_fb: Optional[ForwardBatch] = None
         with self.profiler.stage("alloc-seat"):
             prebuilt = self._prebuilt_fast
@@ -1931,6 +2003,16 @@ class EnumDraftEngine:
                 ):
                     prestaged_case = prebuilt.case_staging[delta_lens[0] - 1]
                     prestaged_fb = prebuilt.replay_fb
+                    if self._scatter_consume and prestaged_fb is not None and bs == 1:
+                        prestaged_values_ready = self._scatter_consume_commit(
+                            state=states[0],
+                            prebuilt=prebuilt,
+                            prestaged=prestaged_case,
+                            prestaged_fb=prestaged_fb,
+                            seat_row=int(advance_batch.reqs[0].req_pool_idx),
+                            base_len=base_lens[0],
+                            graph_round=graph_round,
+                        )
                     if self._debug_gpu_scatter:
                         self._probe_gpu_scatter(
                             state=states[0],
@@ -2054,6 +2136,7 @@ class EnumDraftEngine:
                     graph_round=graph_round,
                     prestaged=prestaged_case,
                     prestaged_fb=prestaged_fb,
+                    prestaged_values_ready=prestaged_values_ready,
                 )
             if self._hybrid and envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
                 self._log_mamba_state_nan(
@@ -2546,6 +2629,7 @@ class EnumDraftEngine:
         graph_round: Optional[_ExtendGraphRound],
         prestaged: Optional[_ExtendCaseStaging] = None,
         prestaged_fb: Optional[ForwardBatch] = None,
+        prestaged_values_ready: bool = False,
     ) -> torch.Tensor:
         """Advance + glue as ONE batched extend (the fast round's fusion).
 
@@ -2573,6 +2657,7 @@ class EnumDraftEngine:
         if graph_round is not None:
             graph_logits = self._fused_extend_graph_forward(
                 prestaged_fb=prestaged_fb,
+                prestaged_values_ready=prestaged_values_ready,
                 carriers=carriers,
                 chains=chains,
                 seat_reqs=seat_reqs,
@@ -3048,6 +3133,7 @@ class EnumDraftEngine:
         graph_round: _ExtendGraphRound,
         prestaged: Optional[_ExtendCaseStaging] = None,
         prestaged_fb: Optional[ForwardBatch] = None,
+        prestaged_values_ready: bool = False,
     ) -> torch.Tensor:
         """The fused extend as ONE captured DRAFT_EXTEND_V2 graph replay.
 
@@ -3078,21 +3164,23 @@ class EnumDraftEngine:
         if prestaged is not None and prestaged_fb is not None:
             # Restage-prebuilt replay fb (see _PrebuiltFastRound.replay_fb):
             # the shell rebinds / init_new / spec_info already ran at round
-            # tail. Per-case pieces flow in here -- one device value copy,
-            # two host pointer swaps, and the seat-pad page-table binding
-            # (global pool state, per actual case) -- then straight to the
-            # graph launch.
-            prestaged_fb.out_cache_loc = prestaged.out_cache_loc
-            prestaged_fb.spec_info.gdn_true_extend_lens_tensor = prestaged.true_lens
-            prestaged_fb.input_ids.copy_(
-                torch.cat([seat_input_ids, chains[0]])[prestaged.gather]
-            )
-            self._extend_graph_bind_seat_pads(
-                seat_rows=seat_rows,
-                base_lens=base_lens,
-                delta_lens=delta_lens,
-                graph_round=graph_round,
-            )
+            # tail. Per-case pieces flow in here -- either the commit-scatter
+            # kernel already wrote the fb's own static buffers (values
+            # ready), or the host path does one device value copy, two
+            # pointer swaps and the seat-pad page-table binding -- then
+            # straight to the graph launch.
+            if not prestaged_values_ready:
+                prestaged_fb.out_cache_loc = prestaged.out_cache_loc
+                prestaged_fb.spec_info.gdn_true_extend_lens_tensor = prestaged.true_lens
+                prestaged_fb.input_ids.copy_(
+                    torch.cat([seat_input_ids, chains[0]])[prestaged.gather]
+                )
+                self._extend_graph_bind_seat_pads(
+                    seat_rows=seat_rows,
+                    base_lens=base_lens,
+                    delta_lens=delta_lens,
+                    graph_round=graph_round,
+                )
             self.profiler.mark("fused_graph_mut")
             return self._extend_graph_execute(
                 forward_batch=prestaged_fb,
@@ -3973,21 +4061,31 @@ class EnumDraftEngine:
         fused.input_ids = torch.zeros(
             rows * width, dtype=torch.int64, device=self.device
         )
-        # Placeholder binding; the consume path rebinds the actual case's.
-        fused.out_cache_loc = case_staging[0].out_cache_loc
+        # OWNED static buffers: the scatter-consume path writes VALUES into
+        # them (one kernel); the pointer-swap path rebinds the fb fields to
+        # the case's tensors instead -- the two modes are exclusive.
+        fused.out_cache_loc = torch.zeros(
+            rows * width, dtype=case_staging[0].out_cache_loc.dtype, device=self.device
+        )
         fused.extend_num_tokens = rows * width
         seq_cpu = torch.tensor(fused.prefix_lens, dtype=torch.int64)
         fused.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
         fused.seq_lens_cpu = seq_cpu
         fused.seq_lens_sum = sum(fused.prefix_lens)
         fused.orig_seq_lens = (fused.seq_lens + width).to(torch.int32)
-        return self._extend_graph_prepare_fb(
+        fb = self._extend_graph_prepare_fb(
             fused=fused,
             rows=rows,
             true_lens_host=case_staging[0].true_lens_host,
             prestaged=case_staging[0],
             tag="prestage",
         )
+        # Owned GDN true-lens buffer for the scatter-consume mode (the
+        # pointer-swap path rebinds this field to the case's tensor).
+        fb.spec_info.gdn_true_extend_lens_tensor = torch.zeros(
+            rows, dtype=case_staging[0].true_lens.dtype, device=self.device
+        )
+        return fb
 
     def _scrap_lists(self, batches: list, slots_list: list, kv_pages: list) -> None:
         """Immediate (outside-a-round) release of prebuilt resources. Slot

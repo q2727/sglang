@@ -424,6 +424,12 @@ class Envs:
     # hit-round consume and compare every produced tensor (device syncs --
     # debug only).
     SGLANG_DEBUG_DECOUPLED_GPU_SCATTER = EnvBool(False)
+    # Decoupled spec: consume hit-round commits through the commit-scatter
+    # kernel writing the replay fb's OWN static buffers (input_ids /
+    # out_cache_loc / GDN true-lens / seat-pad table suffix in one launch)
+    # instead of the host pointer-swap path -- the pre-launch pipeline's
+    # value plane, still host-triggered at this stage.
+    SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME = EnvBool(False)
     # Decoupled spec: run the verifier's C6 gate as a host-func node ON the
     # forward stream (cudaLaunchHostFunc parking a condvar the IPC thread's
     # landing notifies) instead of parking the scheduler thread. The round's

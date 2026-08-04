@@ -336,6 +336,7 @@ def commit_scatter(
     true_stack: torch.Tensor,
     pad_flats: torch.Tensor,
     table_row: torch.Tensor,  # 1-D view of the seat row (real or shadow)
+    table_col0: int,
     base_len: int,
     num_steps: int,
     fanout: int,
@@ -367,7 +368,7 @@ def commit_scatter(
         true_out,
         chains_out,
         table_row,
-        0,
+        table_col0,
         seat,
         expected_generation,
         backbone_len,
