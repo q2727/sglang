@@ -252,7 +252,12 @@ class VerifyWorker(BaseVerifyWorker):
         # built in alloc_memory_pool once the enum buffer exists. None = the
         # eager select path.
         self._select_graph = None
-        self.select_hits_queue: deque[torch.Tensor] = deque()
+        # (pinned_hits, ready_event) pairs: the D2H is staged pinned+async
+        # at PRODUCTION so the deferred accounting hook never issues a
+        # pageable copy -- a pageable D2H waits on the WHOLE device, which
+        # under the stream gate means stalling the scheduler thread on the
+        # gated forward stream.
+        self.select_hits_queue: deque[tuple[torch.Tensor, torch.cuda.Event]] = deque()
         # C6 launch gate, injected by DecoupledVerifyManager: called with the
         # batch at decode-launch, before the select gather, to (boundedly)
         # wait for the enumeration blocks the select is about to read.
@@ -439,8 +444,19 @@ class VerifyWorker(BaseVerifyWorker):
                 )
         # The graph's hits output is a static buffer the next replay
         # overwrites; the accounting hook consumes deferred, so queue a copy.
-        self.select_hits_queue.append(hits.clone())
+        self._queue_select_hits(hits)
         return selected
+
+    def _queue_select_hits(self, hits: torch.Tensor) -> None:
+        """Stage the round's hit flags for the deferred accounting hook:
+        pinned + async at production, so the consumer reads host memory and
+        never issues a pageable D2H (device-wide wait -- deadly under the
+        stream gate)."""
+        pinned = torch.empty_like(hits, device="cpu", pin_memory=True)
+        pinned.copy_(hits, non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record()
+        self.select_hits_queue.append((pinned, ready))
 
     def _select_units_tp_safe(
         self, batch: ScheduleBatch, select_input: EnumSelectInput
@@ -460,7 +476,7 @@ class VerifyWorker(BaseVerifyWorker):
                 return selected
             with profile_range("verifier.select_units"):
                 selected, hits = self._select_enum_units(batch, select_input)
-            self.select_hits_queue.append(hits)
+            self._queue_select_hits(hits)
             return selected
         if self._tp_rank == 0:
             # The graph replaces only rank 0's COMPUTE; the broadcast below
@@ -469,7 +485,7 @@ class VerifyWorker(BaseVerifyWorker):
             selected = self._select_units_graph(batch, select_input)
             if selected is None:
                 selected, hits = self._select_enum_units(batch, select_input)
-                self.select_hits_queue.append(hits)
+                self._queue_select_hits(hits)
         else:
             selected = torch.empty(
                 (len(batch.reqs), self.speculative_num_draft_tokens),

@@ -237,6 +237,24 @@ class DecoupledVerifyManager:
         self._force_resync_seats: set[int] = set()
         self._seat_resync_last: dict[int, float] = {}
         self._gate_resync_ct = 0
+        # Stream gate (see decoupled_stream_gate): the C6 wait as a host-func
+        # node ON the forward stream -- the scheduler thread enqueues it and
+        # returns, the round's launches pile up behind it, and the IPC
+        # thread's landing notifies the same arrival board to release it.
+        # Timeout accounting then runs on the driver's callback thread; the
+        # counters it touches are GIL-guarded primitives and their readers
+        # tolerate one-round staleness.
+        self._stream_gate = None
+        if envs.SGLANG_ENABLE_DECOUPLED_STREAM_GATE.get() and self.arrival_wait_s > 0:
+            try:
+                from sglang.srt.speculative.decoupled_stream_gate import StreamGate
+
+                self._stream_gate = StreamGate()
+                logger.info("decoupled C6 gate: host-func stream gate enabled")
+            except Exception:
+                logger.exception(
+                    "stream gate unavailable; falling back to the host gate"
+                )
 
         # Doorbell (device-side C6 gate): the scheduler thread enqueues
         # per-seat cuStreamWaitValue32 on its compute stream and launches the
@@ -616,6 +634,37 @@ class DecoupledVerifyManager:
             else 0.9 * self._gate_arrival_ewma_s + 0.1 * waited_s
         )
 
+    def _stream_gate_wait(self, expected: dict[int, int], budget_s: float) -> None:
+        """Runs on the driver's host-func callback thread, occupying the
+        forward stream's timeline while the launch thread keeps going. Same
+        wait, same budget, same timeout bookkeeping as the host gate; a
+        timeout releases the stream and the gated select reads whatever
+        stamp is there -- the natural fallback. No CUDA API in here (spec
+        requirement for host funcs)."""
+        t_gate = time.monotonic()
+        with profile_range("verifier.c6_stream_gate"):
+            arrived = self.arrival_board.wait_for(expected, budget_s)
+        if arrived:
+            self._observe_gate_arrival(time.monotonic() - t_gate)
+            self._gate_consec_timeouts = 0
+            for seat in expected:
+                self._seat_timeout_streaks.pop(seat, None)
+            return
+        self._gate_consec_timeouts += 1
+        if self._gate_consec_timeouts == 2:
+            self._gate_anneal_ct += 1
+        self.sync_wait_timeout_ct += 1
+        with self.arrival_board._cond:
+            landed = {seat: self.arrival_board._stamps.get(seat) for seat in expected}
+        self._track_drafter_timeouts(expected, landed, now=time.monotonic())
+        if self.sync_wait_timeout_ct <= 5 or self._profile:
+            logger.info(
+                "decoupled stream-gate timeout #%d: expected=%s landed=%s",
+                self.sync_wait_timeout_ct,
+                expected,
+                landed,
+            )
+
     def wait_for_select_blocks(self, batch: ScheduleBatch) -> None:
         """C6 launch gate: called by the verify worker at decode-launch, just
         before the select gather. Waits -- bounded -- for the block each
@@ -643,6 +692,14 @@ class DecoupledVerifyManager:
                     self._skip_log_ct,
                     ahead,
                 )
+        if expected and self.arrival_wait_s > 0 and self._stream_gate is not None:
+            budget_s = self._gate_budget_s()
+            if self._stream_gate.enqueue(
+                torch.cuda.current_stream(),
+                lambda: self._stream_gate_wait(expected, budget_s),
+            ):
+                return
+            # driver refused the node: fall through to the host gate
         if expected and self.arrival_wait_s > 0:
             t_gate = time.monotonic()
             # Named for the chrome trace: this range IS the bubble on the
@@ -843,11 +900,13 @@ class DecoupledVerifyManager:
             return
         if not batch.forward_mode.is_decode_or_idle():
             return
-        hits = self.verify_worker.select_hits_queue.popleft()
-        # The select ops run at the head of their round's GPU work, which has
-        # long executed by the time this deferred hook runs (the tolist adds
-        # no stall in either scheduler mode).
-        hit_list = hits.tolist()
+        pinned_hits, ready = self.verify_worker.select_hits_queue[0]
+        if not ready.query():
+            # Under the stream gate the round's select may still sit behind
+            # its gate; the hook runs every round, so just take it next time.
+            return
+        self.verify_worker.select_hits_queue.popleft()
+        hit_list = pinned_hits.tolist()
         self.enum_round_ct += len(hit_list)
         self.enum_hit_ct += sum(hit_list)
         if self.enum_round_ct and self.enum_round_ct % 200 < len(hit_list):
