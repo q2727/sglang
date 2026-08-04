@@ -105,9 +105,17 @@ class DrafterIpcThread:
         *,
         transport: BaseDecoupledSpecTransport,
         drafter_rank: int = 0,
+        commit_mirror=None,
+        on_commits_landed=None,
     ) -> None:
         self.transport = transport
         self.drafter_rank = int(drafter_rank)
+        # Optional GPU commit mirror (see DrafterCommitMirror): every routed
+        # VerifyCommit also lands its values per seat, and the hook (the
+        # manager's arrival-board notify) runs after the batch's landing
+        # event is recorded.
+        self._commit_mirror = commit_mirror
+        self._on_commits_landed = on_commits_landed
         self._control_inbox = DraftControlInbox()
         # Protects _control_inbox (loop writes, scheduler reads).
         self._inbox_lock = threading.Lock()
@@ -203,6 +211,12 @@ class DrafterIpcThread:
             control_batch = self._route_control_message(message)
             if control_batch is None:
                 continue
+            if self._commit_mirror is not None and control_batch.verify_commit_messages:
+                for commit in control_batch.verify_commit_messages:
+                    self._commit_mirror.land(commit)
+                self._commit_mirror.record_landing()
+                if self._on_commits_landed is not None:
+                    self._on_commits_landed(control_batch.verify_commit_messages)
             with self._inbox_lock:
                 self._control_inbox.add_control_batch_locked(control_batch)
         return did_work

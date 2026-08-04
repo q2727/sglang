@@ -326,6 +326,11 @@ class _DraftReqState:
         self.last_units_dev: Optional[torch.Tensor] = None  # [K+1, F, K+1]
         self.last_units_host: Optional[torch.Tensor] = None  # pinned mirror
         self.last_backbone_host: Optional[list[int]] = None  # c_1..c_K
+        # Device twin of the backbone (the GPU match kernel's prefix key;
+        # length tracked separately -- a case-0 block has an empty backbone
+        # and must fail every case > 0 prefix check).
+        self.last_backbone_dev: Optional[torch.Tensor] = None  # [K]
+        self.last_backbone_len = 0
         self.mirror_event: Optional[torch.cuda.Event] = None
         # Top-1 prerun bet: number of speculatively committed tokens (0 = no
         # active bet) + the pre-bet mirror snapshot for rollback.
@@ -990,6 +995,13 @@ class EnumDraftEngine:
         self._topk_graph_enabled = envs.SGLANG_ENABLE_DECOUPLED_TOPK_GRAPH.get()
         self._topk_graphs: dict[tuple, tuple] = {}
         self._topk_failed: set[tuple] = set()
+        # Commit mirror + host board (attached by the manager): the GPU value
+        # plane the unified bet round reads; Phase B uses it for the
+        # match-kernel A/B probe only.
+        self._commit_mirror = None
+        self._commit_board = None
+        self._debug_gpu_match = envs.SGLANG_DEBUG_DECOUPLED_GPU_MATCH.get()
+        self._gpu_match_probe_ct = 0
 
     # ------------------------------------------------------------------ #
     # Fused-extend CUDA graph: construction (init-time)
@@ -1208,6 +1220,81 @@ class EnumDraftEngine:
             pool = self.model_runner.req_to_token_pool
             pool.mamba_pool.clear_slots(pool.translate_mamba_indices(state.mamba_slot))
         self._states[key] = state
+
+    def attach_commit_mirror(self, mirror, board) -> None:
+        self._commit_mirror = mirror
+        self._commit_board = board
+
+    def _probe_gpu_match(
+        self, state: _DraftReqState, selection: Optional[tuple[int, int]]
+    ) -> None:
+        """Debug-only (device sync): the GPU match kernel must agree with
+        _match_seat whenever the mirror's latest landing IS the pending
+        delta this round consumes."""
+        mirror, board = self._commit_mirror, self._commit_board
+        if (
+            mirror is None
+            or board is None
+            or state.last_units_dev is None
+            or state.last_backbone_dev is None
+        ):
+            return
+        seat = int(state.req_pool_idx)
+        with board._cond:
+            latest = board._stamps.get(seat)
+        if latest is None or latest + state.prompt_len != len(state.committed_tokens):
+            return  # mirror holds a newer/older commit than this round's delta
+        expected_generation = self._commit_mirror.host_generation(seat)
+        from sglang.srt.speculative.decoupled_fused_ops import commit_match
+
+        # Cross-stream order: the landing copies ride the mirror's own
+        # stream; every consumer of mirror values must first wait its
+        # land_event on the reading stream (the record happened before the
+        # board update that let us get here, so this is the safe
+        # record-before-wait event usage).
+        torch.cuda.current_stream().wait_event(mirror.land_event)
+        out = commit_match(
+            mirror=mirror,
+            seat=seat,
+            expected_generation=expected_generation,
+            units_dev=state.last_units_dev.contiguous(),
+            backbone_dev=state.last_backbone_dev,
+            backbone_len=state.last_backbone_len,
+            num_steps=self.num_steps,
+            fanout=self.fanout,
+        ).tolist()
+        with board._cond:
+            latest_after = board._stamps.get(seat)
+        if (
+            latest_after != latest
+            or mirror.host_generation(seat) != expected_generation
+        ):
+            return  # a new commit landed mid-probe: sample invalid, skip
+        verdict, case, f, new_len = out
+        want_hit = selection is not None
+        ok = (verdict == 2) == want_hit and (not want_hit or (case, f) == selection)
+        self._gpu_match_probe_ct += 1
+        if (
+            not ok
+            or self._gpu_match_probe_ct <= 3
+            or self._gpu_match_probe_ct % 200 == 0
+        ):
+            log = logger.info if ok else logger.error
+            log(
+                "gpu-match probe #%d %s: kernel=(v=%d case=%d f=%d len=%d) " "host=%s",
+                self._gpu_match_probe_ct,
+                "OK" if ok else "MISMATCH",
+                verdict,
+                case,
+                f,
+                new_len,
+                selection,
+            )
+
+    def seat_of(self, key: DraftReqKey) -> Optional[int]:
+        """The verifier seat (req_pool_idx) this key occupies, or None."""
+        state = self._states.get(key)
+        return None if state is None else int(state.req_pool_idx)
 
     def commit_base_aligned(
         self, key: DraftReqKey, pre_verify_committed_len: int
@@ -1438,6 +1525,8 @@ class EnumDraftEngine:
             for key in keys:
                 state = self._states[key]
                 selection = self._match_seat(key, state)
+                if self._debug_gpu_match:
+                    self._probe_gpu_match(state, selection)
                 if selection is not None:
                     hit_keys.append(key)
                     hit_states.append(state)
@@ -4643,6 +4732,18 @@ class EnumDraftEngine:
                 )
             state.last_units_host.copy_(units_device[i], non_blocking=True)
             state.last_backbone_host = list(new_backbones[i])
+            backbone = new_backbones[i]
+            state.last_backbone_len = len(backbone)
+            if state.last_backbone_dev is None:
+                state.last_backbone_dev = torch.zeros(
+                    max(1, self.num_steps),
+                    dtype=torch.int64,
+                    device=units_device.device,
+                )
+            if backbone:
+                state.last_backbone_dev[: len(backbone)].copy_(
+                    self._h2d.to_device(backbone, dtype=torch.int64)
+                )
             state.mirror_event = mirror_event
         mirror_event.record()
         self.profiler.mark("mirror")

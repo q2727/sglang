@@ -150,3 +150,80 @@ def fused_guess_topk(
         num_warps=1,
     )
     return out
+
+
+@triton.jit
+def _commit_match_kernel(
+    gen_ptr,
+    new_len_ptr,
+    dlen_ptr,
+    tok_ptr,
+    units_ptr,
+    backbone_ptr,
+    out_ptr,
+    seat,
+    expected_gen,
+    backbone_len,
+    K: tl.constexpr,
+    F: tl.constexpr,
+    W_MIRROR: tl.constexpr,
+    W_UNIT: tl.constexpr,
+):
+    gen = tl.load(gen_ptr + seat)
+    dlen = tl.load(dlen_ptr + seat)
+    new_len = tl.load(new_len_ptr + seat)
+    case = dlen - 1
+    prefix_ok = (case >= 0) & (case <= K) & (case <= backbone_len)
+    for i in tl.static_range(K):
+        d = tl.load(tok_ptr + seat * W_MIRROR + i)
+        b = tl.load(backbone_ptr + i)
+        prefix_ok &= (i >= case) | (d == b)
+    case_c = tl.minimum(tl.maximum(case, 0), K)
+    bonus = tl.load(tok_ptr + seat * W_MIRROR + tl.minimum(case_c, W_MIRROR - 1))
+    f_found = -1
+    for f in tl.static_range(F):
+        g = tl.load(units_ptr + (case_c * F + f) * W_UNIT)
+        f_found = tl.where((g == bonus) & (f_found < 0), f, f_found)
+    hit = prefix_ok & (f_found >= 0)
+    stale = gen != expected_gen
+    verdict = tl.where(stale, 0, tl.where(hit, 2, 1))
+    tl.store(out_ptr + 0, verdict.to(tl.int64))
+    tl.store(out_ptr + 1, case_c.to(tl.int64))
+    tl.store(out_ptr + 2, f_found.to(tl.int64))
+    tl.store(out_ptr + 3, new_len)
+
+
+def commit_match(
+    *,
+    mirror,
+    seat: int,
+    expected_generation: int,
+    units_dev: torch.Tensor,  # [K+1, F, K+1] this seat's last block (contiguous)
+    backbone_dev: torch.Tensor,  # [K] device backbone twin
+    backbone_len: int,
+    num_steps: int,
+    fanout: int,
+) -> torch.Tensor:
+    """The drafter-side GPU replica of ``_match_seat``, fed from the commit
+    mirror: out = [verdict(0=stale gen, 1=miss, 2=hit), case, f, new_total].
+    Self-consistent by construction -- it compares the landed commit against
+    the drafter's OWN last block, exactly like the host match, so no wire
+    protocol change (and no merge/stale ambiguity) is involved."""
+    out = torch.empty(4, dtype=torch.int64, device=units_dev.device)
+    _commit_match_kernel[(1,)](
+        mirror.generations,
+        mirror.new_committed_lens,
+        mirror.delta_lens,
+        mirror.tokens,
+        units_dev,
+        backbone_dev,
+        out,
+        seat,
+        expected_generation,
+        backbone_len,
+        K=num_steps,
+        F=fanout,
+        W_MIRROR=mirror.width,
+        W_UNIT=num_steps + 1,
+    )
+    return out

@@ -414,6 +414,12 @@ class Envs:
     # dead-cell poison + branch selection) as one CUDA graph per
     # (bs, fanout) shape; False restores the eager kernel launches.
     SGLANG_ENABLE_DECOUPLED_TOPK_GRAPH = EnvBool(True)
+    # Decoupled spec: compare the drafter's GPU commit mirror against each
+    # host-applied commit (a device sync per check -- debug only).
+    SGLANG_DEBUG_DECOUPLED_COMMIT_MIRROR = EnvBool(False)
+    # Decoupled spec: run the GPU commit-match kernel next to every host
+    # match and compare verdicts (a device sync per round -- debug only).
+    SGLANG_DEBUG_DECOUPLED_GPU_MATCH = EnvBool(False)
     # Decoupled spec: run the verifier's C6 gate as a host-func node ON the
     # forward stream (cudaLaunchHostFunc parking a condvar the IPC thread's
     # landing notifies) instead of parking the scheduler thread. The round's

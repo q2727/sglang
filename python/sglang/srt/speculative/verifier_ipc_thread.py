@@ -333,6 +333,7 @@ class VerifierIpcThread:
                     dst_drafter_rank=rank,
                     pre_verify_committed_len=pre_len,
                     committed_tokens=[int(token) for token in tokens],
+                    req_pool_idx=int(pool_idx),
                 )
             )
         for rank, batch in control_batches.items():

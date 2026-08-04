@@ -24,6 +24,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput
+from sglang.srt.speculative.decoupled_commit_mirror import DrafterCommitMirror
 from sglang.srt.speculative.decoupled_draft_engine import EnumDraftEngine
 from sglang.srt.speculative.decoupled_spec_io import (
     DecoupledSpecIpcConfig,
@@ -34,6 +35,7 @@ from sglang.srt.speculative.decoupled_spec_transport import (
     DecoupledSpecTransportKind,
     build_transport,
 )
+from sglang.srt.speculative.decoupled_verify_manager import EnumArrivalBoard
 from sglang.srt.speculative.drafter_ipc_thread import (
     DrafterIpcThread,
     EventedDraftBlock,
@@ -159,8 +161,21 @@ class DecoupledDraftManager:
             connect_endpoints=ipc_config.connect_endpoints,
             context=zmq.Context(2),
         )
+        # GPU commit mirror + host arrival board (the drafter-side symmetry
+        # of the verifier's enum buffer + board): the IPC thread lands every
+        # commit's values per seat and notifies the board; the unified bet
+        # round's scatter kernel reads the mirror, and the commit gate's
+        # callback waits on the board.
+        self.commit_mirror = DrafterCommitMirror(
+            num_steps=self.num_steps, device=self.engine.device
+        )
+        self.commit_arrival_board = EnumArrivalBoard()
+        self.engine.attach_commit_mirror(self.commit_mirror, self.commit_arrival_board)
         self.ipc_thread = DrafterIpcThread(
-            transport=transport, drafter_rank=ipc_config.rank
+            transport=transport,
+            drafter_rank=ipc_config.rank,
+            commit_mirror=self.commit_mirror,
+            on_commits_landed=self._on_commits_landed,
         )
         self.ipc_thread.start()
         self._round_ct = 0
@@ -190,6 +205,7 @@ class DecoupledDraftManager:
         )
         self._prep_keys: dict[DraftReqKey, None] = {}
         self._misaligned_ct = 0
+        self._mirror_probe_ct = 0
         # Adaptive fanout: keep the round time inside the verifier's enum-wait
         # budget by halving / restoring the engine's effective width. Only
         # meaningful under a positive wait gate (sync pacing).
@@ -244,6 +260,51 @@ class DecoupledDraftManager:
                 "sticky CUDA failure in the drafter loop; exiting: %s", text
             )
             os._exit(70)
+
+    def _probe_commit_mirror(self, segment) -> None:
+        """Debug-only (device sync): when this host apply consumes exactly
+        the mirror's LATEST landed commit, its values must match."""
+        seat = self.engine.seat_of(segment.draft_key)
+        if seat is None:
+            return
+        new_len = int(segment.pre_verify_committed_len) + len(segment.committed_tokens)
+        board = self.commit_arrival_board
+        with board._cond:
+            latest = board._stamps.get(seat)
+        if latest != new_len or len(segment.round_lens) != 1:
+            return  # merged/lagged segment: the mirror holds a newer commit
+        torch.cuda.synchronize()
+        got_len = int(self.commit_mirror.new_committed_lens[seat].item())
+        got_delta = int(self.commit_mirror.delta_lens[seat].item())
+        got_tokens = self.commit_mirror.tokens[seat, :got_delta].tolist()
+        want = [int(t) for t in segment.committed_tokens]
+        ok = got_len == new_len and got_tokens == want
+        self._mirror_probe_ct += 1
+        if not ok or self._mirror_probe_ct <= 3 or self._mirror_probe_ct % 200 == 0:
+            log = logger.info if ok else logger.error
+            log(
+                "commit-mirror probe #%d %s: seat=%d gpu(len=%d, delta=%s) "
+                "host(len=%d, delta=%s)",
+                self._mirror_probe_ct,
+                "OK" if ok else "MISMATCH",
+                seat,
+                got_len,
+                got_tokens[:6],
+                new_len,
+                want[:6],
+            )
+
+    def _on_commits_landed(self, commits) -> None:
+        """IPC-thread hook, after the landing event was recorded: publish
+        each seat's new committed total to the host board (the commit gate's
+        wakeup source)."""
+        self.commit_arrival_board.record_pairs(
+            [int(c.req_pool_idx) for c in commits],
+            [
+                int(c.pre_verify_committed_len) + len(c.committed_tokens)
+                for c in commits
+            ],
+        )
 
     def run_loop(self, *, control_plane: DrafterControlPlane) -> None:
         """The drafter scheduler's event loop (never returns)."""
@@ -379,6 +440,8 @@ class DecoupledDraftManager:
                             int(segment.pre_verify_committed_len),
                         )
                     continue
+                if envs.SGLANG_DEBUG_DECOUPLED_COMMIT_MIRROR.get():
+                    self._probe_commit_mirror(segment)
                 if self.engine.apply_commit(
                     segment.draft_key, list(segment.committed_tokens)
                 ):

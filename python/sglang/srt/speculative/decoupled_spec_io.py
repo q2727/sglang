@@ -94,6 +94,11 @@ class VerifyCommit:
     dst_drafter_rank: int
     pre_verify_committed_len: int
     committed_tokens: list[int]
+    # The seat (verifier req_to_token row) this commit belongs to: lets the
+    # drafter's IPC thread land the commit into its GPU mirror without a
+    # host rid lookup (the same seat-routing idea as the enumeration block's
+    # pool_idx echo). -1 on messages from older verifiers.
+    req_pool_idx: int = -1
 
     @property
     def draft_key(self) -> DraftReqKey:
