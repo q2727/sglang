@@ -121,6 +121,9 @@ class VerifierIpcThread:
         # builds, retired by DraftClose. Owning it here (not mirroring the
         # scheduler's) keeps the wire stream self-consistent by construction.
         self._sent_committed_lens: dict[str, int] = {}
+        # Desync re-seed floors (see _drain_send_queue): rid -> the snapshot
+        # length its in-flight rounds must clear before commits resume.
+        self._resync_floors: dict[str, int] = {}
         # Recently retired rids (bounded ring + set): lets an overlap tail
         # round's commits be dropped instantly instead of stalling the FIFO.
         self._closed_rid_ring: deque[str] = deque(maxlen=CLOSED_RID_RING_CAPACITY)
@@ -198,11 +201,23 @@ class VerifierIpcThread:
             did_work = True
             # The ledger follows the wire: a DraftSync (re-)roots the
             # request's committed-output total, a DraftClose retires it.
+            # A desync re-seed keeps the cursor (the chain is intact, the
+            # snapshot merely re-tells it to the drafter) and instead sets a
+            # send FLOOR: in-flight rounds whose base falls under the
+            # snapshot are already inside its committed_outputs -- sending
+            # them would double-apply on the re-opened seat.
             for sync in batch.sync_messages:
-                self._sent_committed_lens[sync.request_id] = len(sync.committed_outputs)
+                if sync.desync_reseed:
+                    self._resync_floors[sync.request_id] = len(sync.committed_outputs)
+                else:
+                    self._sent_committed_lens[sync.request_id] = len(
+                        sync.committed_outputs
+                    )
+                    self._resync_floors.pop(sync.request_id, None)
                 self._closed_rids.discard(sync.request_id)
             for close in batch.close_messages:
                 self._sent_committed_lens.pop(close.request_id, None)
+                self._resync_floors.pop(close.request_id, None)
                 if close.request_id not in self._closed_rids:
                     if len(self._closed_rid_ring) == self._closed_rid_ring.maxlen:
                         self._closed_rids.discard(self._closed_rid_ring[0])
@@ -279,12 +294,25 @@ class VerifierIpcThread:
             tokens = next_token_ids[i * stride : i * stride + int(accept_lens[i])]
             if not tokens:
                 continue
+            # The ledger follows RESULTS, not sends: a skipped send (resync
+            # floor, negative-token guard) must still advance the cursor, or
+            # every later commit gets attributed to the wrong absolute base
+            # and the drafter's alignment check passes on corrupt splices.
+            self._sent_committed_lens[rid] = pre_len + len(tokens)
+            floor = self._resync_floors.get(rid)
+            if floor is not None:
+                if pre_len < floor:
+                    # This round predates the desync re-seed: its tokens are
+                    # already inside the snapshot's committed_outputs.
+                    continue
+                self._resync_floors.pop(rid, None)
             if any(token < 0 for token in tokens):
                 # A negative id is the verify output's not-accepted padding:
                 # it must never reach the wire (the drafter would gather an
                 # embedding with it and die on a device assert). Skipping the
-                # round only costs staleness fallbacks; the loud log is the
-                # probe for whoever produced it.
+                # round costs a base gap the drafter's alignment check turns
+                # into staleness fallbacks (healed by the streak resync); the
+                # loud log is the probe for whoever produced it.
                 logger.error(
                     "evented commit for %s dropped: negative token in accepted "
                     "run %s (accept_len=%d) -- verify output padding leaked",
@@ -307,7 +335,6 @@ class VerifierIpcThread:
                     committed_tokens=[int(token) for token in tokens],
                 )
             )
-            self._sent_committed_lens[rid] = pre_len + len(tokens)
         for rank, batch in control_batches.items():
             self.transport.send(rank, DraftMeshMessage.from_control_batch(batch))
 

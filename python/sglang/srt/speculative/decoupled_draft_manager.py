@@ -58,6 +58,8 @@ _IDLE_WAIT_S = 0.0005
 # backlog to catch up instead of producing every generation; <= this depth is
 # the overlap scheduler's normal in-flight allowance (one in-flight commit
 # plus jitter headroom).
+_MERGE_STATS = {"merged": 0, "skipped_rounds": 0, "lockstep": 0}
+
 _CATCH_UP_BACKLOG_ROUNDS = 2
 
 # CUDA IPC slot capacity in block rows; bounds the verifier batch size a
@@ -187,6 +189,7 @@ class DecoupledDraftManager:
             and not envs.SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN.get()
         )
         self._prep_keys: dict[DraftReqKey, None] = {}
+        self._misaligned_ct = 0
         # Adaptive fanout: keep the round time inside the verifier's enum-wait
         # budget by halving / restoring the engine's effective width. Only
         # meaningful under a positive wait gate (sync pacing).
@@ -327,7 +330,10 @@ class DecoupledDraftManager:
         wait would eventually exceed the budget and cascade anyway.
         """
         if segment.pending_rounds > _CATCH_UP_BACKLOG_ROUNDS:
+            _MERGE_STATS["merged"] += 1
+            _MERGE_STATS["skipped_rounds"] += segment.pending_rounds - 1
             return len(segment.committed_tokens)
+        _MERGE_STATS["lockstep"] += 1
         return segment.round_lens[0] if segment.round_lens else 0
 
     def _apply_controls_and_draft(self, ready) -> None:
@@ -356,6 +362,22 @@ class DecoupledDraftManager:
                 self._open_seats += 1
             for segment in ready.ready_commit_segments:
                 if not self.engine.has(segment.draft_key):
+                    continue
+                if not self.engine.commit_base_aligned(
+                    segment.draft_key, int(segment.pre_verify_committed_len)
+                ):
+                    # Stale (pre-resync) or gapped segment: applying it would
+                    # corrupt the committed mirror. Drop it -- the seat rides
+                    # fallbacks until the verifier's streak resync re-seeds.
+                    self._misaligned_ct += 1
+                    if self._misaligned_ct <= 5:
+                        logger.warning(
+                            "decoupled drafter: dropped misaligned commit "
+                            "segment #%d for %s (base=%d)",
+                            self._misaligned_ct,
+                            segment.draft_key.request_id,
+                            int(segment.pre_verify_committed_len),
+                        )
                     continue
                 if self.engine.apply_commit(
                     segment.draft_key, list(segment.committed_tokens)
@@ -388,7 +410,8 @@ class DecoupledDraftManager:
                 logger.info(
                     "decoupled drafter rounds: ct=%d avg_ms=%.1f push_ms=%.2f "
                     "idle_ms=%.2f starved=%.0f%% last_bs=%d fast=%d slow=%d "
-                    "eff_fanout=%d prerun_hit=%d prerun_miss=%d",
+                    "eff_fanout=%d prerun_hit=%d prerun_miss=%d merge=%d "
+                    "skips=%d lockstep=%d",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
                     1000.0 * self._push_time_s / self._round_ct,
@@ -400,6 +423,9 @@ class DecoupledDraftManager:
                     self.engine.effective_fanout,
                     self.engine.prerun_hit_ct,
                     self.engine.prerun_miss_ct,
+                    _MERGE_STATS["merged"],
+                    _MERGE_STATS["skipped_rounds"],
+                    _MERGE_STATS["lockstep"],
                 )
                 if self.engine.profiler.enabled:
                     logger.info(

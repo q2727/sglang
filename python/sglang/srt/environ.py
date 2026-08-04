@@ -346,6 +346,14 @@ class Envs:
     # never waits (pure async pacing -- the cross-engine overlap form: a late
     # block only costs a fallback round, never correctness).
     SGLANG_DECOUPLED_ENUM_WAIT_MS = EnvInt(200)
+    # Decoupled spec: size the verifier's per-round gate wait from measured
+    # block arrivals (4x EWMA + 5ms margin; timeouts never sample), with the
+    # env bound above as ceiling and bootstrap budget. A window-sized budget
+    # is self-sustaining in the desynced regime: one parked round delays its
+    # commits by the window, starving the drafter into missing the NEXT
+    # round too (the 397B 5-25 tok/s orbit); an arrival-sized budget re-locks
+    # in a few generations. False restores the fixed env bound.
+    SGLANG_ENABLE_DECOUPLED_ADAPTIVE_GATE_WAIT = EnvBool(True)
     # Decoupled spec: per-phase host-time breakdown of the drafter's
     # enumeration round. Adds a device sync at every phase boundary, so the
     # round itself gets slower -- debug instrumentation only.

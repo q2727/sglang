@@ -62,6 +62,11 @@ class DraftSync:
     req_pool_idx: int
     prompt_token_ids: list[int] = field(default_factory=list)
     committed_outputs: list[int] = field(default_factory=list)
+    # Desync re-seed (same rid, same seat, chain intact): the verifier IPC
+    # thread keeps its commit-ledger cursor and applies a send floor instead
+    # of re-rooting it (see _drain_send_queue). False = initial seed or a
+    # retraction re-root, where the snapshot IS the new absolute truth.
+    desync_reseed: bool = False
 
     @property
     def draft_key(self) -> DraftReqKey:

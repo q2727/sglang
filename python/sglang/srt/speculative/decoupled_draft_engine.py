@@ -305,6 +305,10 @@ class _DraftReqState:
         # engine's own scratch rows are unrelated and transient.
         self.req_pool_idx = req_pool_idx
         self.committed_tokens: list[int] = []
+        # Prompt prefix length inside committed_tokens: VerifyCommit bases
+        # (pre_verify_committed_len) index OUTPUT tokens only, so alignment
+        # checks compare against len(committed_tokens) - prompt_len.
+        self.prompt_len = 0
         # Slot ids of the committed prefix's KV in the drafter's pool
         # (device-resident: the round must never sync on slot bookkeeping).
         self.committed_slots = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1147,6 +1151,7 @@ class EnumDraftEngine:
         self.close(key)
         state = _DraftReqState(req_pool_idx=req_pool_idx, device=self.device)
         state.committed_tokens = list(prompt_tokens) + list(committed_outputs)
+        state.prompt_len = len(prompt_tokens)
         if self._hybrid:
             # The seat slot must start ZEROED: the GDN extend kernel reads the
             # slot's ssm state as the initial state unconditionally, and an
@@ -1155,6 +1160,21 @@ class EnumDraftEngine:
             pool = self.model_runner.req_to_token_pool
             pool.mamba_pool.clear_slots(pool.translate_mamba_indices(state.mamba_slot))
         self._states[key] = state
+
+    def commit_base_aligned(
+        self, key: DraftReqKey, pre_verify_committed_len: int
+    ) -> bool:
+        """True when a commit segment's absolute base (its
+        pre_verify_committed_len, counted in OUTPUT tokens) lands exactly at
+        this seat's current committed end. Misaligned segments are stale
+        (pre-resync rounds arriving after a re-seed) or gapped (a lost
+        commit); either way blind application would corrupt the mirror --
+        the caller drops them and the verifier's desync resync re-seeds."""
+        state = self._states.get(key)
+        if state is None:
+            return False
+        true_len = len(state.committed_tokens) - state.prerun_len
+        return true_len == state.prompt_len + int(pre_verify_committed_len)
 
     def apply_commit(self, key: DraftReqKey, committed_tokens: list[int]) -> bool:
         """Apply a real commit; returns True when an active top-1 prerun bet

@@ -178,6 +178,7 @@ class DecoupledVerifyManager:
         self.enum_round_ct = 0
         self.enum_hit_ct = 0
         self.sync_wait_timeout_ct = 0
+        self._skip_log_ct = 0
         # Round-timeline profile (SGLANG_DEBUG_DECOUPLED_VERIFY_PROFILE): the
         # verify round seen from this hook. Per on_batch_result call:
         #   loop_ms = entry - previous exit  (verify forward + batch-result +
@@ -198,6 +199,44 @@ class DecoupledVerifyManager:
         # sync-mode pacing by default; 0 = pure async pacing (never stall the
         # verifier on the drafter; late blocks fall back).
         self.arrival_wait_s = envs.SGLANG_DECOUPLED_ENUM_WAIT_MS.get() / 1000.0
+        # Adaptive gate budget (see _gate_budget_s): EWMA of the MEASURED
+        # arrival wait on rounds whose block arrived. Timeouts are censored
+        # (never sampled), so a desync episode cannot inflate the budget --
+        # only real arrivals, which reflect the drafter's true loop time
+        # (commit lag + draft round + transport), can move it.
+        self._adaptive_gate = (
+            envs.SGLANG_ENABLE_DECOUPLED_ADAPTIVE_GATE_WAIT.get()
+            and self.arrival_wait_s > 0
+        )
+        self._gate_arrival_ewma_s: Optional[float] = None
+        self._gate_arrival_ct = 0
+        # Anneal escape (see _gate_budget_s): consecutive gate timeouts mean
+        # the pair phase-locked in the WRONG phase -- blocks arriving a
+        # constant hair after their gate closes, every generation, forever
+        # (the frozen-hit basin: overlap defers each round's commit by one
+        # round, both loops advance at the same cadence, so the constant
+        # phase lag never decays and no tight budget can catch it). One
+        # ceiling-budget park lets the in-flight block land INSIDE the gate,
+        # which re-enters the good phase -- paying the window once instead
+        # of missing forever.
+        self._gate_consec_timeouts = 0
+        self._gate_anneal_ct = 0
+        # Desync resync (the cure the anneal cannot be): under the overlap
+        # loop, a commit's readiness flip (copy_to_cpu) is queued on THIS
+        # thread BEHIND the next round's gate park, so once a seat slips k
+        # generations behind, no wait budget can ever recover it -- the
+        # unlock event is sequenced after the gate, every round, forever
+        # (observed as whole benches frozen at expected == landed + 2 with
+        # 200ms budget). A fresh DraftSync collapses the lag at any depth:
+        # the drafter re-opens the seat at the CURRENT committed length
+        # (engine.open == retraction re-sync, drops the old prefix KV) and
+        # the next block stamps correctly. Control-channel FIFO makes it
+        # safe against in-flight commits: stale ones apply to the old seat
+        # state before the re-open discards it.
+        self._seat_timeout_streaks: dict[int, int] = {}
+        self._force_resync_seats: set[int] = set()
+        self._seat_resync_last: dict[int, float] = {}
+        self._gate_resync_ct = 0
 
         # Doorbell (device-side C6 gate): the scheduler thread enqueues
         # per-seat cuStreamWaitValue32 on its compute stream and launches the
@@ -386,6 +425,36 @@ class DecoupledVerifyManager:
     def _track_drafter_timeouts(
         self, expected: dict[int, int], landed: dict[int, Optional[int]], *, now: float
     ) -> None:
+        for seat, stamp in expected.items():
+            if (landed.get(seat) or -1) >= stamp:
+                self._seat_timeout_streaks.pop(seat, None)
+                continue
+            streak = self._seat_timeout_streaks.get(seat, 0) + 1
+            self._seat_timeout_streaks[seat] = streak
+            if streak >= 4 and now - self._seat_resync_last.get(seat, 0.0) >= 0.5:
+                # Past the anneal (2): this lag is beyond what a longer wait
+                # heals. Queue a full re-seed; the next on_batch_result emits
+                # the DraftSync. The 500ms cooldown bounds the re-prefill
+                # tax: against the readiness-lag basin (commit copy_to_cpu
+                # queued on the scheduler thread BEHIND the gate under
+                # overlap -- the one lag a re-seed can lose to) unbounded
+                # retriggering costs more than the desync itself; the real
+                # cure for that basin is launch-time result staging
+                # (push-model), not more re-seeds.
+                self._seat_resync_last[seat] = now
+                self._force_resync_seats.add(seat)
+                self._gate_resync_ct += 1
+                if self._gate_resync_ct <= 10 or self._gate_resync_ct % 50 == 0:
+                    logger.info(
+                        "decoupled gate: seat %d desynced (%d consecutive "
+                        "timeouts, expected=%d landed=%s) -- forcing DraftSync "
+                        "re-seed #%d",
+                        seat,
+                        streak,
+                        stamp,
+                        landed.get(seat),
+                        self._gate_resync_ct,
+                    )
         missing_ranks = {
             self._drafter_rank_of(seat)
             for seat, stamp in expected.items()
@@ -444,6 +513,7 @@ class DecoupledVerifyManager:
         expected = self._collect_gate_expected(batch)
         if not expected or self.arrival_wait_s <= 0:
             return
+        budget_s = self._gate_budget_s()
         stream = torch.cuda.current_stream()
         enqueued: list[tuple[int, int]] = []
         for pool_idx, stamp in expected.items():
@@ -458,9 +528,9 @@ class DecoupledVerifyManager:
             # (correctness identical either way).
             for done_idx, done_stamp in enqueued:
                 self.doorbell.force_release(pool_idx=done_idx, stamp=done_stamp)
-            self.arrival_board.wait_for(expected, self.arrival_wait_s)
+            self.arrival_board.wait_for(expected, budget_s)
             return
-        self._doorbell_pending.put((expected, time.monotonic() + self.arrival_wait_s))
+        self._doorbell_pending.put((expected, time.monotonic() + budget_s))
 
     def _doorbell_watchdog_loop(self) -> None:
         """Companion of enqueue_doorbell_gate: for each armed round, wait on
@@ -494,6 +564,58 @@ class DecoupledVerifyManager:
                     landed,
                 )
 
+    def _gate_budget_s(self) -> float:
+        """This round's bounded gate-wait budget.
+
+        A window-sized budget (the raw env bound, 200ms) is self-sustaining
+        in the desynced regime: one parked round delays its commits by the
+        full window, which starves the drafter and guarantees the NEXT
+        round's block is late too -- the pair orbits at window period
+        (observed at 397B as the 5-25 tok/s basin, drafter idle pinned at
+        the retry cadence). Sizing the budget from MEASURED arrivals keeps
+        a desynced round near fallback price, so the pair re-locks within a
+        few generations instead of orbiting.
+
+        4x the arrival EWMA + 5ms margin: arrivals reflect the drafter's
+        whole loop (commit lag + draft round + transport), so slow-round /
+        bootstrap excursions a couple of times the steady arrival still fit
+        -- a budget tight enough to clip them would feed the consecutive-
+        timeout quarantine and collapse the hit rate (the 0.8B pair failure
+        mode of the 2x-verify-round formula this replaced). The env bound
+        stays the ceiling, and the bootstrap budget until enough arrivals
+        have been sampled.
+        """
+        if (
+            not self._adaptive_gate
+            or self._gate_arrival_ct < 20
+            or self._gate_arrival_ewma_s is None
+        ):
+            return self.arrival_wait_s
+        if self._gate_consec_timeouts == 2:
+            # Anneal: ONE ceiling park per desync episode, for the lag modes
+            # a longer wait CAN heal (a time-late block -- drafter capture
+            # stall, transport hiccup -- lands inside the park and wait_for
+            # returns on arrival). Exactly once: if the ceiling round also
+            # misses, the lag is the order-deadlocked kind (see the resync
+            # note in __init__) and further parks would burn the window
+            # every round for nothing -- drop back to the tight budget and
+            # let the seat-streak resync collapse the lag instead.
+            return self.arrival_wait_s
+        return min(
+            self.arrival_wait_s, max(0.008, 4.0 * self._gate_arrival_ewma_s + 0.005)
+        )
+
+    def _observe_gate_arrival(self, waited_s: float) -> None:
+        """EWMA the measured wait of a round whose block ARRIVED (an
+        already-landed block samples ~0). Timeout rounds never sample, so
+        the budget can only track the healthy arrival distribution."""
+        self._gate_arrival_ct += 1
+        self._gate_arrival_ewma_s = (
+            waited_s
+            if self._gate_arrival_ewma_s is None
+            else 0.9 * self._gate_arrival_ewma_s + 0.1 * waited_s
+        )
+
     def wait_for_select_blocks(self, batch: ScheduleBatch) -> None:
         """C6 launch gate: called by the verify worker at decode-launch, just
         before the select gather. Waits -- bounded -- for the block each
@@ -503,13 +625,40 @@ class DecoupledVerifyManager:
         """
         expected = self._collect_gate_expected(batch)
         t_wait = time.monotonic() if self._profile else 0.0
+        if expected and self._skip_log_ct < 30:
+            with self.arrival_board._cond:
+                snapshot = {
+                    seat: self.arrival_board._stamps.get(seat) for seat in expected
+                }
+            ahead = {
+                seat: (exp, snapshot[seat])
+                for seat, exp in expected.items()
+                if snapshot.get(seat) is not None and snapshot[seat] > exp
+            }
+            if ahead:
+                self._skip_log_ct += 1
+                logger.info(
+                    "decoupled gate skip-signature #%d (landed AHEAD of "
+                    "expected -- drafter merge outran the arming): %s",
+                    self._skip_log_ct,
+                    ahead,
+                )
         if expected and self.arrival_wait_s > 0:
+            t_gate = time.monotonic()
             # Named for the chrome trace: this range IS the bubble on the
             # verifier's compute stream (the CPU parks here while the GPU
             # drains, waiting for the drafter's block to land).
             with profile_range("verifier.c6_gate_wait"):
-                arrived = self.arrival_board.wait_for(expected, self.arrival_wait_s)
+                arrived = self.arrival_board.wait_for(expected, self._gate_budget_s())
+            if arrived:
+                self._observe_gate_arrival(time.monotonic() - t_gate)
+                self._gate_consec_timeouts = 0
+                for seat in expected:
+                    self._seat_timeout_streaks.pop(seat, None)
             if not arrived:
+                self._gate_consec_timeouts += 1
+                if self._gate_consec_timeouts == 2:
+                    self._gate_anneal_ct += 1
                 self.sync_wait_timeout_ct += 1
                 with self.arrival_board._cond:
                     landed = {
@@ -610,13 +759,27 @@ class DecoupledVerifyManager:
                 )
                 self._rid_states.pop(req.rid, None)
                 self._gate_expected.pop(state.pool_idx, None)
+                self._seat_timeout_streaks.pop(state.pool_idx, None)
+                self._force_resync_seats.discard(state.pool_idx)
             return
 
-        if state is None or state.pool_idx != req.req_pool_idx:
-            # New request, or a retraction re-admit moved its seat: (re-)open
+        if (
+            state is None
+            or state.pool_idx != req.req_pool_idx
+            or req.req_pool_idx in self._force_resync_seats
+        ):
+            # New request, a retraction re-admit that moved its seat, or a
+            # desync-forced re-seed (see the resync note in __init__): (re-)open
             # with the full committed prefix and poison the seat's stamp so the
             # previous occupant's landed block cannot look fresh. A seat move
             # can also change the owning drafter -- close on the old one.
+            desync_reseed = (
+                req.req_pool_idx in self._force_resync_seats
+                and state is not None
+                and state.pool_idx == req.req_pool_idx
+            )
+            self._force_resync_seats.discard(req.req_pool_idx)
+            self._seat_timeout_streaks.pop(req.req_pool_idx, None)
             if state is not None:
                 old_rank = self._drafter_rank_of(state.pool_idx)
                 self._gate_expected.pop(state.pool_idx, None)
@@ -648,6 +811,7 @@ class DecoupledVerifyManager:
                     req_pool_idx=req.req_pool_idx,
                     prompt_token_ids=list(req.origin_input_ids),
                     committed_outputs=list(req.output_ids),
+                    desync_reseed=desync_reseed,
                 )
             )
             # A fresh sync re-roots the drafter: the very next round's select
@@ -689,9 +853,13 @@ class DecoupledVerifyManager:
         if self.enum_round_ct and self.enum_round_ct % 200 < len(hit_list):
             logger.info(
                 "decoupled enum select: hit_ct=%d round_ct=%d hit_rate=%.3f "
-                "sync_wait_timeout_ct=%d",
+                "sync_wait_timeout_ct=%d gate_budget_ms=%.1f anneal_ct=%d "
+                "resync_ct=%d",
                 self.enum_hit_ct,
                 self.enum_round_ct,
                 self.enum_hit_ct / self.enum_round_ct,
                 self.sync_wait_timeout_ct,
+                1000.0 * self._gate_budget_s(),
+                self._gate_anneal_ct,
+                self._gate_resync_ct,
             )
