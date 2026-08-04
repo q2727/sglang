@@ -80,15 +80,16 @@ class ChainGraphRunner:
         bucket = self._buckets.get(rows)
         return bucket is not None and bucket.graph is not None
 
-    def _fill(self, bucket: _ChainBucket, plan_steps, first_tokens) -> None:
-        """Stage this round's values into the bucket's static buffers.
+    def _fill_meta(self, bucket: _ChainBucket, plan_steps) -> None:
+        """Stage this round's plan-known values into the bucket's static
+        buffers -- everything EXCEPT the first tokens, which the round's
+        extend has not produced yet on the hoisted path (see stage/fire).
 
         ``plan_steps`` is the chain plan's [(fb, slots)] list: fb0 carries the
         round's positions/seq_lens (post-prepare_for_decode for step 0), each
         step its own out_cache_loc.
         """
         fb0 = plan_steps[0][0]
-        bucket.input_ids.copy_(first_tokens.to(torch.int64))
         bucket.positions.copy_(fb0.positions)
         bucket.seq_lens.copy_(fb0.seq_lens)
         # Pool rows are PER SEAT: a new request lands on new carrier rows, so
@@ -99,6 +100,10 @@ class ChainGraphRunner:
             bucket.mrope_positions.copy_(fb0.mrope_positions)
         for s, (_, slots) in enumerate(plan_steps):
             bucket.out_locs[s].copy_(slots)
+
+    def _fill(self, bucket: _ChainBucket, plan_steps, first_tokens) -> None:
+        self._fill_meta(bucket, plan_steps)
+        bucket.input_ids.copy_(first_tokens.to(torch.int64))
 
     def try_capture_and_run(
         self, *, rows: int, plan_steps, first_tokens: torch.Tensor
@@ -201,11 +206,17 @@ class ChainGraphRunner:
         # round's actual execution (side effects happen exactly once here).
         return self.replay(rows=rows, plan_steps=plan_steps, first_tokens=first_tokens)
 
-    def replay(
-        self, *, rows: int, plan_steps, first_tokens: torch.Tensor
-    ) -> list[torch.Tensor]:
+    def stage(self, *, rows: int, plan_steps) -> None:
+        """Hoisted-replay first half: the static-buffer fills and fb0
+        rebinds, which depend only on the chain PLAN -- callable before the
+        round's extend has produced the first tokens. The replay-prep
+        backend metadata (init_forward_metadata_out_graph) deliberately
+        stays in fire(): the hybrid backend's linear plane stages real
+        replay state there, and hoisting it above the extend's OWN metadata
+        prep is an unaudited ordering (the trtllm half is a pointer swap,
+        but the shared-buffer question is open for the GDN half)."""
         bucket = self._buckets[rows]
-        self._fill(bucket, plan_steps, first_tokens)
+        self._fill_meta(bucket, plan_steps)
         fb0 = plan_steps[0][0]
         fb0.input_ids = bucket.input_ids
         fb0.positions = bucket.positions
@@ -213,8 +224,23 @@ class ChainGraphRunner:
         fb0.req_pool_indices = bucket.req_rows
         if fb0.mrope_positions is not None:
             fb0.mrope_positions = bucket.mrope_positions
+
+    def fire(
+        self, *, rows: int, plan_steps, first_tokens: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Hoisted-replay second half: replay-prep backend metadata, feed
+        the extend's first tokens (a device-to-device copy, no host read)
+        and replay. Only valid after stage() for the same rows this round."""
+        bucket = self._buckets[rows]
         self.model_runner.attn_backend.init_forward_metadata_out_graph(
-            fb0, in_capture=False
+            plan_steps[0][0], in_capture=False
         )
+        bucket.input_ids.copy_(first_tokens.to(torch.int64))
         bucket.graph.replay()
         return [bucket.out_tokens[s] for s in range(self.num_steps)]
+
+    def replay(
+        self, *, rows: int, plan_steps, first_tokens: torch.Tensor
+    ) -> list[torch.Tensor]:
+        self.stage(rows=rows, plan_steps=plan_steps)
+        return self.fire(rows=rows, plan_steps=plan_steps, first_tokens=first_tokens)

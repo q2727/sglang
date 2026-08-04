@@ -371,6 +371,23 @@ class _SlowRoundPages(msgspec.Struct):
     branch_flats: torch.Tensor  # [bs * (K+1) * F, pages_per_row * P]
 
 
+class _BranchChainPlan(msgspec.Struct):
+    """The branch chain's host half, hoisted above the round's extend launch.
+
+    Everything here is value-independent of the extend's logits (allocation,
+    seq-lens family, the K ForwardBatches, chain-graph static staging), so
+    it can be built while the previous GPU segment still runs; the first
+    tokens bind as a placeholder buffer and arrive in ``_run_branch_chain``
+    as a device-to-device copy. ``staged`` = the chain graph's stage() ran
+    (fire() is the only remaining call); False = capture round or graph
+    unavailable, the run half falls back to capture-or-eager with the real
+    tokens, exactly the unhoisted flow."""
+
+    plan_steps: list  # [(ForwardBatch, out_cache_loc)] per chain step
+    rows: int
+    staged: bool
+
+
 class _FanoutVariant(msgspec.Struct):
     """Row selections + scatter templates for one per-case column budget.
 
@@ -942,6 +959,11 @@ class EnumDraftEngine:
                 model_runner=self.model_runner, num_steps=self.num_steps
             )
         self._prebuilt_fast: Optional[_PrebuiltFastRound] = None
+        # Hoisted branch plan (see _plan_branch_chain): the placeholder that
+        # binds as the plan's first tokens before the extend has produced
+        # them -- never read by any forward (the graph path feeds tokens via
+        # fire(); the eager path rebinds fb.input_ids per step).
+        self._branch_first_placeholder: dict[int, torch.Tensor] = {}
 
     # ------------------------------------------------------------------ #
     # Fused-extend CUDA graph: construction (init-time)
@@ -1745,6 +1767,52 @@ class EnumDraftEngine:
                         [states[0].mamba_slot, carriers[0].glue_mamba_slots]
                     ),
                 )
+
+        # -- A-class hoist: the branch phase's host half -- the chain plan
+        # (allocation, seq-lens family, the K ForwardBatches, chain-graph
+        # static staging) and the COW / fork INDEX builds -- depends only on
+        # the selection and the committed lengths, never on the extend's
+        # logits. Building it here, before the extend launches, leaves the
+        # post-extend tail launch-only (topk -> COW -> fork -> chain fire),
+        # so the GPU never drains waiting for host staging between the
+        # round's two forwards. (The COW / fork COPIES still launch after
+        # the extend: their data deps are the extend's KV / state writes.)
+        hoist_plan: Optional[_BranchChainPlan] = None
+        hoist_cow: Optional[tuple[list, list]] = None
+        hoist_fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        if self._enable_fused_extend and self._chain_plan:
+            hoist_plan = self._plan_branch_chain(
+                carriers=carriers,
+                states=states,
+                backbone_slots=backbone_slots,
+                scratch_slots=scratch_slots,
+                variant=variant,
+            )
+        if hoist_plan is not None:
+            if self._paged:
+                hoist_cow = self._build_branch_head_cow(
+                    states=states,
+                    carriers=carriers,
+                    base_lens=base_lens,
+                    variant=variant,
+                )
+            if self._hybrid:
+                hoist_fork = self._build_mamba_fork(
+                    src_slots=torch.cat(
+                        [
+                            torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
+                                variant.case_of_row_dev
+                            ]
+                            for state, carrier in zip(states, carriers)
+                        ]
+                    ),
+                    dst_slots=torch.cat(
+                        [
+                            carrier.branch_mamba_slots[variant.sel_rows_dev]
+                            for carrier in carriers
+                        ]
+                    ),
+                )
         if self._enable_fused_extend:
             # -- Fused extend: seat + glue rows in ONE forward. The glue chain
             # tokens are the matched commit's winning unit -- KNOWN values,
@@ -1829,12 +1897,19 @@ class EnumDraftEngine:
             # private pages -- copy each selected row's head into its own
             # pages before the chain decodes read them.
             with self.profiler.stage("cow-branch-heads"):
-                self._cow_carrier_branch_heads(
-                    states=states,
-                    carriers=carriers,
-                    base_lens=base_lens,
-                    variant=variant,
-                )
+                if hoist_cow is not None:
+                    self._cow_kv(
+                        src_pieces=hoist_cow[0],
+                        dst_pieces=hoist_cow[1],
+                        tag="branch_head",
+                    )
+                else:
+                    self._cow_carrier_branch_heads(
+                        states=states,
+                        carriers=carriers,
+                        base_lens=base_lens,
+                        variant=variant,
+                    )
 
         # -- Branch chains: K decode replays on the assembled carrier rows.
         if self._hybrid:
@@ -1843,31 +1918,41 @@ class EnumDraftEngine:
             # exactly at node a). One batched fork for all selected rows; the
             # chain decode steps then advance the branch slots in place.
             with self.profiler.stage("gdn-fork-branch"):
-                self._fork_mamba_states(
-                    src_slots=torch.cat(
-                        [
-                            torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
-                                variant.case_of_row_dev
+                if hoist_fork is not None:
+                    self._launch_mamba_fork(
+                        src_indices=hoist_fork[0], dst_indices=hoist_fork[1]
+                    )
+                else:
+                    self._fork_mamba_states(
+                        src_slots=torch.cat(
+                            [
+                                torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
+                                    variant.case_of_row_dev
+                                ]
+                                for state, carrier in zip(states, carriers)
                             ]
-                            for state, carrier in zip(states, carriers)
-                        ]
-                    ),
-                    dst_slots=torch.cat(
-                        [
-                            carrier.branch_mamba_slots[variant.sel_rows_dev]
-                            for carrier in carriers
-                        ]
-                    ),
-                )
+                        ),
+                        dst_slots=torch.cat(
+                            [
+                                carrier.branch_mamba_slots[variant.sel_rows_dev]
+                                for carrier in carriers
+                            ]
+                        ),
+                    )
         with self.profiler.stage("branch-chain"):
-            chain_steps = self._branch_decode_chain(
-                carriers=carriers,
-                states=states,
-                branch_guesses=branch_guesses,
-                backbone_slots=backbone_slots,
-                scratch_slots=scratch_slots,
-                variant=variant,
-            )
+            if hoist_plan is not None:
+                chain_steps = self._run_branch_chain(
+                    hoist_plan, branch_guesses.reshape(-1)
+                )
+            else:
+                chain_steps = self._branch_decode_chain(
+                    carriers=carriers,
+                    states=states,
+                    branch_guesses=branch_guesses,
+                    backbone_slots=backbone_slots,
+                    scratch_slots=scratch_slots,
+                    variant=variant,
+                )
         with self.profiler.stage("pack-block"):
             return self._pack_and_mirror(
                 states=states,
@@ -2977,26 +3062,20 @@ class EnumDraftEngine:
         self.profiler.mark("glue_mut")
         return self._forward(glue, tag="glue")
 
-    def _branch_decode_chain(
+    def _stage_branch_template(
         self,
         *,
         carriers: list[_SeatCarrier],
         states: list[_DraftReqState],
-        branch_guesses: torch.Tensor,
-        backbone_slots: Optional[torch.Tensor],
-        scratch_slots: list[torch.Tensor],
         variant: _FanoutVariant,
-    ) -> list[torch.Tensor]:
-        """Run the (case, guess) chains as K decode replays on the seats'
-        selected carrier rows. ``branch_guesses`` holds each selected row's
-        first token in the batch's row order (case-major, budgeted columns).
+    ) -> tuple[ScheduleBatch, list[int], list[int]]:
+        """Rebind the shared branch template to this round's selection.
 
         Everything the row SELECTION determines -- the Req stubs, the pool-row
         gather, the mrope row list -- is round-invariant per (seat, width) and
         comes from the seats' caches; only the seq-len family is rebuilt (the
-        rebind-only discipline of _glue_template).
-        """
-        num_steps = self.num_steps
+        rebind-only discipline of _glue_template). Returns (branch, seq_host,
+        lens)."""
         branch = self._branch_template
         sels = [carrier.branch_sel_for(variant=variant) for carrier in carriers]
         if len(sels) == 1:
@@ -3015,6 +3094,26 @@ class EnumDraftEngine:
         branch.seq_lens_cpu = seq_cpu
         branch.seq_lens_sum = None
         branch.orig_seq_lens = branch.seq_lens.to(torch.int32)
+        return branch, seq_host, lens
+
+    def _plan_branch_chain(
+        self,
+        *,
+        carriers: list[_SeatCarrier],
+        states: list[_DraftReqState],
+        backbone_slots: Optional[torch.Tensor],
+        scratch_slots: list[torch.Tensor],
+        variant: _FanoutVariant,
+    ) -> Optional[_BranchChainPlan]:
+        """Hoisted branch-chain host half (see _BranchChainPlan): callable
+        BEFORE the round's extend launches -- nothing here reads the extend's
+        outputs. None when this round belongs to the cascade / per-step path,
+        which stays on the unhoisted tail."""
+        if not self._chain_plan:
+            return None
+        branch, seq_host, lens = self._stage_branch_template(
+            carriers=carriers, states=states, variant=variant
+        )
         cascade = self._build_branch_cascade(
             states=states,
             lens=lens,
@@ -3022,47 +3121,99 @@ class EnumDraftEngine:
             variant=variant,
         )
         self.profiler.mark("branch_mut")
-        if self._chain_plan and cascade is None:
-            # Whole-chain staging: allocation, seq-lens family and the K
-            # ForwardBatches are built in one prep pass; the step loop only
-            # rebinds the input tokens and replays. (The fa3 cascade path
-            # keeps the per-step loop: its tail state advances in place.)
-            with self.profiler.stage("branch-plan"):
-                plan_steps = self._prepare_chain_steps(
-                    branch, first_tokens=branch_guesses.reshape(-1)
+        if cascade is not None:
+            return None
+        rows = len(branch.reqs)
+        placeholder = self._branch_first_placeholder.get(rows)
+        if placeholder is None:
+            placeholder = torch.zeros(rows, dtype=torch.int64, device=self.device)
+            self._branch_first_placeholder[rows] = placeholder
+        # Whole-chain staging: allocation, seq-lens family and the K
+        # ForwardBatches are built in one prep pass; the run half only
+        # rebinds the input tokens and replays. (The fa3 cascade path
+        # keeps the per-step loop: its tail state advances in place.)
+        with self.profiler.stage("branch-plan"):
+            plan_steps = self._prepare_chain_steps(branch, first_tokens=placeholder)
+        for step, (_, step_slots) in enumerate(plan_steps):
+            self._track_scratch_slots(
+                scratch_slots,
+                slots=step_slots,
+                positions=[seq + step for seq in seq_host],
+            )
+        staged = False
+        if self._chain_graph is not None and self._chain_graph.can_replay(rows):
+            self._chain_graph.stage(rows=rows, plan_steps=plan_steps)
+            staged = True
+        return _BranchChainPlan(plan_steps=plan_steps, rows=rows, staged=staged)
+
+    def _run_branch_chain(
+        self, plan: _BranchChainPlan, first_tokens: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Launch-only branch-chain second half: everything host-side ran in
+        the plan, so from the extend's logits to the chain replay there are
+        only kernel launches (fire / capture / the eager step loop)."""
+        if plan.staged:
+            with self.profiler.stage("branch-chain-graph"):
+                return self._chain_graph.fire(
+                    rows=plan.rows,
+                    plan_steps=plan.plan_steps,
+                    first_tokens=first_tokens,
                 )
-            for step, (_, step_slots) in enumerate(plan_steps):
-                self._track_scratch_slots(
-                    scratch_slots,
-                    slots=step_slots,
-                    positions=[seq + step for seq in seq_host],
+        if self._chain_graph is not None:
+            with self.profiler.stage("branch-chain-graph"):
+                captured = self._chain_graph.try_capture_and_run(
+                    rows=plan.rows,
+                    plan_steps=plan.plan_steps,
+                    first_tokens=first_tokens,
                 )
-            first_tokens = branch_guesses.reshape(-1)
-            rows = int(first_tokens.numel())
-            if self._chain_graph is not None:
-                with self.profiler.stage("branch-chain-graph"):
-                    if self._chain_graph.can_replay(rows):
-                        return self._chain_graph.replay(
-                            rows=rows,
-                            plan_steps=plan_steps,
-                            first_tokens=first_tokens,
-                        )
-                    captured = self._chain_graph.try_capture_and_run(
-                        rows=rows,
-                        plan_steps=plan_steps,
-                        first_tokens=first_tokens,
-                    )
-                    if captured is not None:
-                        return captured
-            tokens = first_tokens
-            chain_steps: list[torch.Tensor] = []
-            for step, (fb, _) in enumerate(plan_steps):
-                with self.profiler.stage("branch-step-fwd"):
-                    fb.input_ids = tokens
-                    logits = self.model_runner.forward(fb).logits_output
-                tokens = logits.next_token_logits.argmax(dim=-1)
-                chain_steps.append(tokens)
-            return chain_steps
+                if captured is not None:
+                    return captured
+        tokens = first_tokens
+        chain_steps: list[torch.Tensor] = []
+        for step, (fb, _) in enumerate(plan.plan_steps):
+            with self.profiler.stage("branch-step-fwd"):
+                fb.input_ids = tokens
+                logits = self.model_runner.forward(fb).logits_output
+            tokens = logits.next_token_logits.argmax(dim=-1)
+            chain_steps.append(tokens)
+        return chain_steps
+
+    def _branch_decode_chain(
+        self,
+        *,
+        carriers: list[_SeatCarrier],
+        states: list[_DraftReqState],
+        branch_guesses: torch.Tensor,
+        backbone_slots: Optional[torch.Tensor],
+        scratch_slots: list[torch.Tensor],
+        variant: _FanoutVariant,
+    ) -> list[torch.Tensor]:
+        """Run the (case, guess) chains as K decode replays on the seats'
+        selected carrier rows. ``branch_guesses`` holds each selected row's
+        first token in the batch's row order (case-major, budgeted columns).
+
+        Unhoisted entry (cascade / per-step rounds, and any caller without a
+        prebuilt plan): plans and runs back to back."""
+        num_steps = self.num_steps
+        plan = self._plan_branch_chain(
+            carriers=carriers,
+            states=states,
+            backbone_slots=backbone_slots,
+            scratch_slots=scratch_slots,
+            variant=variant,
+        )
+        if plan is not None:
+            return self._run_branch_chain(plan, branch_guesses.reshape(-1))
+        branch, seq_host, lens = self._stage_branch_template(
+            carriers=carriers, states=states, variant=variant
+        )
+        cascade = self._build_branch_cascade(
+            states=states,
+            lens=lens,
+            backbone_slots=backbone_slots,
+            variant=variant,
+        )
+        self.profiler.mark("branch_mut")
         logits, step_slots = self._decode_step(
             branch, branch_guesses.reshape(-1), tag="branch", cascade=cascade
         )
@@ -3532,22 +3683,18 @@ class EnumDraftEngine:
             dst_pieces.append(carrier.glue_private_slots[:, :span].reshape(-1))
         self._cow_kv(src_pieces=src_pieces, dst_pieces=dst_pieces, tag="glue_head")
 
-    def _cow_carrier_branch_heads(
+    def _build_branch_head_cow(
         self,
         *,
         states: list[_DraftReqState],
         carriers: list[_SeatCarrier],
         base_lens: list[int],
         variant: _FanoutVariant,
-    ) -> None:
-        """Copy each selected branch row's prefix head -- boundary tail +
-        delta + c_1..c_case -- into its own private pages, after the fused /
-        glue forward wrote the chain KV. Case 0 sources from the seat (its
-        pages hold tail + delta once the advance KV landed); case a >= 1
-        sources from glue row a - 1, whose private head holds exactly
-        tail + delta + c_1..c_a. Unselected (dead-fanout) rows keep stale KV:
-        they are never forwarded, and their page-table entries are rewritten
-        before any later round reads them."""
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Index build for _cow_carrier_branch_heads, hoistable above the
+        extend launch: the pieces are slot-INDEX views (which slots to copy),
+        value-independent of the KV the extend writes -- only the copy itself
+        must launch after the extend."""
         src_pieces: list[torch.Tensor] = []
         dst_pieces: list[torch.Tensor] = []
         for i, (state, carrier) in enumerate(zip(states, carriers)):
@@ -3564,6 +3711,27 @@ class EnumDraftEngine:
                     else carrier.glue_private_slots[case - 1, :span]
                 )
                 dst_pieces.append(carrier.branch_private_slots[row, :span])
+        return src_pieces, dst_pieces
+
+    def _cow_carrier_branch_heads(
+        self,
+        *,
+        states: list[_DraftReqState],
+        carriers: list[_SeatCarrier],
+        base_lens: list[int],
+        variant: _FanoutVariant,
+    ) -> None:
+        """Copy each selected branch row's prefix head -- boundary tail +
+        delta + c_1..c_case -- into its own private pages, after the fused /
+        glue forward wrote the chain KV. Case 0 sources from the seat (its
+        pages hold tail + delta once the advance KV landed); case a >= 1
+        sources from glue row a - 1, whose private head holds exactly
+        tail + delta + c_1..c_a. Unselected (dead-fanout) rows keep stale KV:
+        they are never forwarded, and their page-table entries are rewritten
+        before any later round reads them."""
+        src_pieces, dst_pieces = self._build_branch_head_cow(
+            states=states, carriers=carriers, base_lens=base_lens, variant=variant
+        )
         self._cow_kv(src_pieces=src_pieces, dst_pieces=dst_pieces, tag="branch_head")
 
     def _case0_sync_paged(
@@ -4445,15 +4613,29 @@ class EnumDraftEngine:
         alias). The flatten also materializes strided column views -- the
         fused copy kernel consumes raw index arrays, not strides.
         """
-        pool = self.model_runner.req_to_token_pool
-        pool.mamba_pool.copy_from(
-            src_indices=pool.translate_mamba_indices(
-                src_slots.reshape(-1).contiguous()
-            ),
-            dst_indices=pool.translate_mamba_indices(
-                dst_slots.reshape(-1).contiguous()
-            ),
+        src_indices, dst_indices = self._build_mamba_fork(
+            src_slots=src_slots, dst_slots=dst_slots
         )
+        self._launch_mamba_fork(src_indices=src_indices, dst_indices=dst_indices)
+
+    def _build_mamba_fork(
+        self, *, src_slots: torch.Tensor, dst_slots: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Index half of _fork_mamba_states, hoistable above the extend
+        launch: slot ids and their physical translation are constants of the
+        seat/carrier layout -- only the state COPY depends on the extend
+        having advanced the source slots."""
+        pool = self.model_runner.req_to_token_pool
+        return (
+            pool.translate_mamba_indices(src_slots.reshape(-1).contiguous()),
+            pool.translate_mamba_indices(dst_slots.reshape(-1).contiguous()),
+        )
+
+    def _launch_mamba_fork(
+        self, *, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        pool = self.model_runner.req_to_token_pool
+        pool.mamba_pool.copy_from(src_indices=src_indices, dst_indices=dst_indices)
 
     def _extend_batch(
         self,
