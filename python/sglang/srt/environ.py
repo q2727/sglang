@@ -410,6 +410,10 @@ class Envs:
     # Decoupled spec: fuse the drafter fast round's advance + glue extends
     # into one batched forward; False restores the two-forward path.
     SGLANG_ENABLE_DECOUPLED_FUSED_EXTEND = EnvBool(True)
+    # Decoupled spec: capture the fast round's guess tail (fused top-F +
+    # dead-cell poison + branch selection) as one CUDA graph per
+    # (bs, fanout) shape; False restores the eager kernel launches.
+    SGLANG_ENABLE_DECOUPLED_TOPK_GRAPH = EnvBool(True)
     # Decoupled spec: replay the drafter fast round's fused extend as one
     # captured DRAFT_EXTEND_V2 CUDA graph -- every fused row padded to the
     # static width W = 2K+1 -- instead of launching it eagerly. Requires the

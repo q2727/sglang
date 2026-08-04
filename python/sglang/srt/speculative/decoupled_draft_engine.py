@@ -173,6 +173,15 @@ class _PrebuiltFastRound(msgspec.Struct):
     glue_seeded: bool = False
     # bs == 1 only: per-case fused-extend staging, indexed by delta_len - 1.
     case_staging: Optional[list] = None
+    # bs == 1 only: ONE prebuilt replay ForwardBatch shared by every accept
+    # case -- under uniform-W padding the positions / seq-lens family /
+    # extend metadata are case-INDEPENDENT (prefix == base for all rows), so
+    # only three things flow at consume: the token values (one device copy
+    # into the static input_ids buffer), and the per-case out_cache_loc /
+    # gdn true-lens rebinds (host pointer swaps). The page-table seat-pad
+    # binding stays at consume too: it mutates GLOBAL pool state and the
+    # five cases are mutually exclusive there.
+    replay_fb: Optional[ForwardBatch] = None
     # Recorded on the prebuild stream after the skeleton's GPU work; the
     # consuming round waits on it (record-then-wait) before touching any
     # prebuilt tensor.
@@ -386,6 +395,11 @@ class _BranchChainPlan(msgspec.Struct):
     plan_steps: list  # [(ForwardBatch, out_cache_loc)] per chain step
     rows: int
     staged: bool
+    # GDN branch fork riding INSIDE the chain graph as its prologue (index
+    # buffers staged with the plan); when set, the round's eager fork launch
+    # is skipped -- the graph replay performs the state copy.
+    fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    fork_in_graph: bool = False
 
 
 class _FanoutVariant(msgspec.Struct):
@@ -964,6 +978,18 @@ class EnumDraftEngine:
         # them -- never read by any forward (the graph path feeds tokens via
         # fire(); the eager path rebinds fb.input_ids per step).
         self._branch_first_placeholder: dict[int, torch.Tensor] = {}
+        # Branch-fork index cache: the fork's translated src/dst indices are
+        # pure functions of (seat set, f_live) -- seat and carrier slot ids
+        # never move for a seat's lifetime -- so the cat/gather/translate
+        # chain runs once per composition. Invalidated on any open/close.
+        self._branch_fork_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Guess-tail graph (fused top-F + poison + branch gather) per
+        # (bs, f_live, width, ...) shape; entry = (logits_in, chains_in,
+        # guesses_out, branch_out, graph). Capture-failed shapes fall back
+        # to the eager kernels permanently.
+        self._topk_graph_enabled = envs.SGLANG_ENABLE_DECOUPLED_TOPK_GRAPH.get()
+        self._topk_graphs: dict[tuple, tuple] = {}
+        self._topk_failed: set[tuple] = set()
 
     # ------------------------------------------------------------------ #
     # Fused-extend CUDA graph: construction (init-time)
@@ -1339,6 +1365,11 @@ class EnumDraftEngine:
     def close(self, key: DraftReqKey) -> None:
         self.drop_prebuilt_for(key)
         self._evict_seat(key)
+        # Any composition containing this seat is invalid now (open() calls
+        # close() first, so re-seeds funnel through here too).
+        self._branch_fork_cache = {
+            k: v for k, v in self._branch_fork_cache.items() if key not in k[0]
+        }
         state = self._states.pop(key, None)
         if state is None:
             return
@@ -1649,6 +1680,7 @@ class EnumDraftEngine:
         seat_input_ids: Optional[torch.Tensor] = None
         glue_preseeded = False
         prestaged_case: Optional[_ExtendCaseStaging] = None
+        prestaged_fb: Optional[ForwardBatch] = None
         with self.profiler.stage("alloc-seat"):
             prebuilt = self._prebuilt_fast
             if (
@@ -1682,6 +1714,7 @@ class EnumDraftEngine:
                     and 1 <= delta_lens[0] <= len(prebuilt.case_staging)
                 ):
                     prestaged_case = prebuilt.case_staging[delta_lens[0] - 1]
+                    prestaged_fb = prebuilt.replay_fb
             else:
                 if prebuilt is not None:
                     self._prebuilt_fast = None
@@ -1771,6 +1804,7 @@ class EnumDraftEngine:
         hoist_plan: Optional[_BranchChainPlan] = None
         hoist_cow: Optional[tuple[list, list]] = None
         hoist_fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        branch_guesses: Optional[torch.Tensor] = None
         if self._enable_fused_extend:
             # -- Fused extend: seat + glue rows in ONE forward. The glue chain
             # tokens are the matched commit's winning unit -- KNOWN values,
@@ -1791,6 +1825,7 @@ class EnumDraftEngine:
                     delta_lens=delta_lens,
                     graph_round=graph_round,
                     prestaged=prestaged_case,
+                    prestaged_fb=prestaged_fb,
                 )
             if self._hybrid and envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK.get():
                 self._log_mamba_state_nan(
@@ -1804,7 +1839,17 @@ class EnumDraftEngine:
                 # first branch replay overwrites it. Node a's dead token is
                 # c_{a+1}, so rows 0..K-1 mask c_1..c_K; node K keeps its full
                 # top-F (a full accept's bonus is unconstrained).
-                if self._fused_topk:
+                topk_graph_out = self._topk_guess_graph_run(
+                    fused_logits=fused_logits,
+                    chains_mat=chains_mat,
+                    bs=bs,
+                    guess_width=guess_width,
+                    variant=variant,
+                    f_live=f_live,
+                )
+                if topk_graph_out is not None:
+                    guesses_stack, branch_guesses = topk_graph_out
+                elif self._fused_topk:
                     guesses_stack = fused_guess_topk(
                         fused_logits,
                         chains_mat,
@@ -1839,14 +1884,14 @@ class EnumDraftEngine:
                 )
             glue_guesses = torch.topk(glue_view, guess_width, dim=-1).indices
             guesses_stack = torch.cat([node0_guesses.unsqueeze(1), glue_guesses], dim=1)
-        if variant.guess_dead_mask is not None:
+        if branch_guesses is None and variant.guess_dead_mask is not None:
             # Per-case budget: the top-k ran at FULL width, so poison every
             # column past its case's budget. The block ships those cells dead
             # (-1, matching nothing on either side) and the branch phase below
             # drafts only the budgeted ones.
             guesses_stack = guesses_stack.masked_fill(variant.guess_dead_mask, -1)
             branch_guesses = guesses_stack.reshape(bs, -1)[:, variant.sel_rows_dev]
-        else:
+        elif branch_guesses is None:
             branch_guesses = guesses_stack
 
         # -- Branch-phase host half, built while the extend (and topk) run on
@@ -1859,38 +1904,43 @@ class EnumDraftEngine:
         # the overlap with the extend's GPU segment: the drafter round grew
         # ~0.7ms and the 397B good window dropped ~6%.)
         if self._enable_fused_extend and self._chain_plan:
+            with self.profiler.stage("branch-build"):
+                if self._paged:
+                    hoist_cow = self._build_branch_head_cow(
+                        states=states,
+                        carriers=carriers,
+                        base_lens=base_lens,
+                        variant=variant,
+                    )
+                if self._hybrid:
+                    fork_key = (tuple(keys), f_live)
+                    hoist_fork = self._branch_fork_cache.get(fork_key)
+                    if hoist_fork is None:
+                        hoist_fork = self._build_mamba_fork(
+                            src_slots=torch.cat(
+                                [
+                                    torch.cat(
+                                        [state.mamba_slot, carrier.glue_mamba_slots]
+                                    )[variant.case_of_row_dev]
+                                    for state, carrier in zip(states, carriers)
+                                ]
+                            ),
+                            dst_slots=torch.cat(
+                                [
+                                    carrier.branch_mamba_slots[variant.sel_rows_dev]
+                                    for carrier in carriers
+                                ]
+                            ),
+                        )
+                        self._branch_fork_cache[fork_key] = hoist_fork
             hoist_plan = self._plan_branch_chain(
                 carriers=carriers,
                 states=states,
                 backbone_slots=backbone_slots,
                 scratch_slots=scratch_slots,
                 variant=variant,
+                fork=hoist_fork,
             )
-        if hoist_plan is not None:
-            if self._paged:
-                hoist_cow = self._build_branch_head_cow(
-                    states=states,
-                    carriers=carriers,
-                    base_lens=base_lens,
-                    variant=variant,
-                )
-            if self._hybrid:
-                hoist_fork = self._build_mamba_fork(
-                    src_slots=torch.cat(
-                        [
-                            torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
-                                variant.case_of_row_dev
-                            ]
-                            for state, carrier in zip(states, carriers)
-                        ]
-                    ),
-                    dst_slots=torch.cat(
-                        [
-                            carrier.branch_mamba_slots[variant.sel_rows_dev]
-                            for carrier in carriers
-                        ]
-                    ),
-                )
 
         if self._paged:
             # Branch prefixes (boundary tail + delta + case backbone) now
@@ -1919,7 +1969,9 @@ class EnumDraftEngine:
             # exactly at node a). One batched fork for all selected rows; the
             # chain decode steps then advance the branch slots in place.
             with self.profiler.stage("gdn-fork-branch"):
-                if hoist_fork is not None:
+                if hoist_plan is not None and hoist_plan.fork_in_graph:
+                    pass  # the chain graph's prologue performs the fork
+                elif hoist_fork is not None:
                     self._launch_mamba_fork(
                         src_indices=hoist_fork[0], dst_indices=hoist_fork[1]
                     )
@@ -1964,6 +2016,105 @@ class EnumDraftEngine:
                     None if variant.guess_dead_mask is None else variant.sel_rows_dev
                 ),
             )
+
+    def _topk_guess_graph_run(
+        self,
+        *,
+        fused_logits: torch.Tensor,
+        chains_mat: Optional[torch.Tensor],
+        bs: int,
+        guess_width: int,
+        variant: _FanoutVariant,
+        f_live: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """The fast round's guess tail -- fused top-F, dead-cell poison and
+        the branch-row gather -- as ONE captured graph per shape, replacing
+        4-6 eager kernel launches with a logits copy + one graph launch.
+        Returns (guesses_stack, branch_guesses) static views, or None (shape
+        failed capture / disabled): caller falls back to the eager tail.
+
+        Capture-on-first-use with a pre-capture eager warmup (a Triton JIT
+        compile inside stream capture would invalidate it); the capture
+        records without executing and the immediate replay below is the
+        round's real execution, exactly the chain-graph discipline.
+        """
+        if not self._topk_graph_enabled or not self._fused_topk:
+            return None
+        nodes = self.num_steps + 1
+        key = (
+            bs,
+            f_live,
+            guess_width,
+            chains_mat is not None,
+            variant.guess_dead_mask is not None,
+        )
+        if key in self._topk_failed:
+            return None
+        entry = self._topk_graphs.get(key)
+        if entry is None:
+            try:
+                entry = self._topk_guess_graph_capture(
+                    key=key,
+                    fused_logits=fused_logits,
+                    chains_mat=chains_mat,
+                    bs=bs,
+                    guess_width=guess_width,
+                    variant=variant,
+                )
+            except Exception:
+                logger.exception(
+                    "guess-tail graph capture failed for %s; eager tail "
+                    "permanently for this shape",
+                    key,
+                )
+                self._topk_failed.add(key)
+                return None
+            self._topk_graphs[key] = entry
+        logits_in, chains_in, guesses_out, branch_out, graph = entry
+        logits_in.copy_(fused_logits)
+        if chains_in is not None:
+            chains_in.copy_(chains_mat)
+        graph.replay()
+        return guesses_out, branch_out
+
+    def _topk_guess_graph_capture(
+        self,
+        *,
+        key: tuple,
+        fused_logits: torch.Tensor,
+        chains_mat: Optional[torch.Tensor],
+        bs: int,
+        guess_width: int,
+        variant: _FanoutVariant,
+    ) -> tuple:
+        nodes = self.num_steps + 1
+        logits_in = torch.empty_like(fused_logits)
+        chains_in = torch.empty_like(chains_mat) if chains_mat is not None else None
+        guesses_out = torch.empty(
+            (bs, nodes, guess_width), dtype=torch.int64, device=self.device
+        )
+        # Warm the Triton kernels OUTSIDE capture (JIT inside capture
+        # invalidates it); junk inputs, outputs discarded.
+        fused_guess_topk(logits_in, chains_in, nodes=nodes, width=guess_width)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            with torch.cuda.graph(
+                graph, stream=stream, capture_error_mode="thread_local"
+            ):
+                got = fused_guess_topk(
+                    logits_in, chains_in, nodes=nodes, width=guess_width
+                ).view(bs, nodes, guess_width)
+                if variant.guess_dead_mask is not None:
+                    got = got.masked_fill(variant.guess_dead_mask, -1)
+                    branch_out = got.reshape(bs, -1)[:, variant.sel_rows_dev]
+                else:
+                    branch_out = got
+                guesses_out.copy_(got)
+                branch_out = branch_out.clone()
+        torch.cuda.current_stream().wait_stream(stream)
+        return (logits_in, chains_in, guesses_out, branch_out, graph)
 
     def _sync_carrier_rows(
         self,
@@ -2166,6 +2317,7 @@ class EnumDraftEngine:
         delta_lens: list[int],
         graph_round: Optional[_ExtendGraphRound],
         prestaged: Optional[_ExtendCaseStaging] = None,
+        prestaged_fb: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """Advance + glue as ONE batched extend (the fast round's fusion).
 
@@ -2192,6 +2344,7 @@ class EnumDraftEngine:
         graph_logits: Optional[torch.Tensor] = None
         if graph_round is not None:
             graph_logits = self._fused_extend_graph_forward(
+                prestaged_fb=prestaged_fb,
                 carriers=carriers,
                 chains=chains,
                 seat_reqs=seat_reqs,
@@ -2666,6 +2819,7 @@ class EnumDraftEngine:
         delta_lens: list[int],
         graph_round: _ExtendGraphRound,
         prestaged: Optional[_ExtendCaseStaging] = None,
+        prestaged_fb: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """The fused extend as ONE captured DRAFT_EXTEND_V2 graph replay.
 
@@ -2693,6 +2847,34 @@ class EnumDraftEngine:
         bs * (K+1) * W replay logits at each row's last REAL position -- the
         same contract as the eager fused forward's per-row last logits.
         """
+        if prestaged is not None and prestaged_fb is not None:
+            # Restage-prebuilt replay fb (see _PrebuiltFastRound.replay_fb):
+            # the shell rebinds / init_new / spec_info already ran at round
+            # tail. Per-case pieces flow in here -- one device value copy,
+            # two host pointer swaps, and the seat-pad page-table binding
+            # (global pool state, per actual case) -- then straight to the
+            # graph launch.
+            prestaged_fb.out_cache_loc = prestaged.out_cache_loc
+            prestaged_fb.spec_info.gdn_true_extend_lens_tensor = prestaged.true_lens
+            prestaged_fb.input_ids.copy_(
+                torch.cat([seat_input_ids, chains[0]])[prestaged.gather]
+            )
+            self._extend_graph_bind_seat_pads(
+                seat_rows=seat_rows,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
+                graph_round=graph_round,
+            )
+            self.profiler.mark("fused_graph_mut")
+            return self._extend_graph_execute(
+                forward_batch=prestaged_fb,
+                rows=len(carriers) * (self.num_steps + 1),
+                node_gather=prestaged.node_gather,
+                true_lens_host=prestaged.true_lens_host,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
+                tag="fused_graph",
+            )
         fused, true_lens_host, node_offsets = self._extend_graph_assemble_rows(
             carriers=carriers,
             chains=chains,
@@ -2716,30 +2898,20 @@ class EnumDraftEngine:
             prestaged=prestaged,
         )
 
-    def _extend_graph_replay(
+    def _extend_graph_prepare_fb(
         self,
         *,
         fused: ScheduleBatch,
         rows: int,
         true_lens_host: list[int],
-        node_offsets: list[int],
-        base_lens: list[int],
-        delta_lens: list[int],
+        prestaged: Optional[_ExtendCaseStaging],
         tag: str,
-        prestaged: Optional[_ExtendCaseStaging] = None,
-    ) -> torch.Tensor:
-        """Replay one assembled DRAFT_EXTEND_V2 shell (fused rows or the
-        advance-only degenerate shape) and gather the node logits.
-
-        Carries the dual-plane length contract described by
-        ``_fused_extend_graph_forward``: the full-attn plane sees the uniform
-        padded width W everywhere, the recurrent plane the TRUE per-row scan
-        lengths. Row counts below the smallest captured bucket replay padded;
-        the runner points those rows at reserved pool row 0 and the GDN plane
-        scans them through its junk state slot, so they cannot touch any real
-        row's state. ``base_lens`` / ``delta_lens`` are debug-probe context
-        only.
-        """
+    ) -> ForwardBatch:
+        """Replay-prep host half of the extend graph: spec_info construction,
+        ForwardBatch.init_new and the post-write seq-lens bump. Everything
+        here depends only on (base_lens, delta_len, carrier layout) -- never
+        on token VALUES -- so the restage prebuilds one per accept case and
+        the consume path skips straight to _extend_graph_execute."""
         width = self._extend_graph_width
         width_tensor, width_list = self._extend_graph_consts_for(rows)
         spec_info = EagleDraftExtendInput(
@@ -2785,6 +2957,67 @@ class EnumDraftEngine:
         forward_batch.seq_lens = forward_batch.seq_lens + width
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + width
         forward_batch.seq_lens_sum = fused.seq_lens_sum + rows * width
+        return forward_batch
+
+    def _extend_graph_replay(
+        self,
+        *,
+        fused: ScheduleBatch,
+        rows: int,
+        true_lens_host: list[int],
+        node_offsets: list[int],
+        base_lens: list[int],
+        delta_lens: list[int],
+        tag: str,
+        prestaged: Optional[_ExtendCaseStaging] = None,
+    ) -> torch.Tensor:
+        """Replay one assembled DRAFT_EXTEND_V2 shell (fused rows or the
+        advance-only degenerate shape) and gather the node logits.
+
+        Carries the dual-plane length contract described by
+        ``_fused_extend_graph_forward``: the full-attn plane sees the uniform
+        padded width W everywhere, the recurrent plane the TRUE per-row scan
+        lengths. Row counts below the smallest captured bucket replay padded;
+        the runner points those rows at reserved pool row 0 and the GDN plane
+        scans them through its junk state slot, so they cannot touch any real
+        row's state. ``base_lens`` / ``delta_lens`` are debug-probe context
+        only.
+        """
+        forward_batch = self._extend_graph_prepare_fb(
+            fused=fused,
+            rows=rows,
+            true_lens_host=true_lens_host,
+            prestaged=prestaged,
+            tag=tag,
+        )
+        node_gather = (
+            prestaged.node_gather
+            if prestaged is not None
+            else self._h2d.to_device(node_offsets, dtype=torch.int64)
+        )
+        return self._extend_graph_execute(
+            forward_batch=forward_batch,
+            rows=rows,
+            node_gather=node_gather,
+            true_lens_host=true_lens_host,
+            base_lens=base_lens,
+            delta_lens=delta_lens,
+            tag=tag,
+        )
+
+    def _extend_graph_execute(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        rows: int,
+        node_gather: torch.Tensor,
+        true_lens_host: list[int],
+        base_lens: list[int],
+        delta_lens: list[int],
+        tag: str,
+    ) -> torch.Tensor:
+        """Launch-only second half of the extend graph replay."""
+        width = self._extend_graph_width
         runner = self._extend_graph_runner
         assert runner.can_run_graph(forward_batch), (
             "fused-extend graph precheck passed but the runner refused the "
@@ -2817,11 +3050,6 @@ class EnumDraftEngine:
                 ["".join("N" if p else "." for p in row) for row in nan_mask],
             )
             self._log_extend_graph_attn_metadata(rows=rows)
-        node_gather = (
-            prestaged.node_gather
-            if prestaged is not None
-            else self._h2d.to_device(node_offsets, dtype=torch.int64)
-        )
         # The gather copies out of the runner's private static logits buffer
         # before any later replay could overwrite it.
         return logits_output.next_token_logits[node_gather]
@@ -3105,6 +3333,7 @@ class EnumDraftEngine:
         backbone_slots: Optional[torch.Tensor],
         scratch_slots: list[torch.Tensor],
         variant: _FanoutVariant,
+        fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[_BranchChainPlan]:
         """Hoisted branch-chain host half (see _BranchChainPlan): callable
         BEFORE the round's extend launches -- nothing here reads the extend's
@@ -3135,17 +3364,27 @@ class EnumDraftEngine:
         # keeps the per-step loop: its tail state advances in place.)
         with self.profiler.stage("branch-plan"):
             plan_steps = self._prepare_chain_steps(branch, first_tokens=placeholder)
-        for step, (_, step_slots) in enumerate(plan_steps):
-            self._track_scratch_slots(
-                scratch_slots,
-                slots=step_slots,
-                positions=[seq + step for seq in seq_host],
-            )
-        staged = False
-        if self._chain_graph is not None and self._chain_graph.can_replay(rows):
-            self._chain_graph.stage(rows=rows, plan_steps=plan_steps)
-            staged = True
-        return _BranchChainPlan(plan_steps=plan_steps, rows=rows, staged=staged)
+            for step, (_, step_slots) in enumerate(plan_steps):
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=step_slots,
+                    positions=[seq + step for seq in seq_host],
+                )
+            staged = False
+            fork_in_graph = False
+            if self._chain_graph is not None and self._chain_graph.can_replay(
+                rows, forked=fork is not None
+            ):
+                self._chain_graph.stage(rows=rows, plan_steps=plan_steps, fork=fork)
+                staged = True
+                fork_in_graph = fork is not None
+        return _BranchChainPlan(
+            plan_steps=plan_steps,
+            rows=rows,
+            staged=staged,
+            fork=fork,
+            fork_in_graph=fork_in_graph,
+        )
 
     def _run_branch_chain(
         self, plan: _BranchChainPlan, first_tokens: torch.Tensor
@@ -3159,13 +3398,18 @@ class EnumDraftEngine:
                     rows=plan.rows,
                     plan_steps=plan.plan_steps,
                     first_tokens=first_tokens,
+                    forked=plan.fork_in_graph,
                 )
         if self._chain_graph is not None:
             with self.profiler.stage("branch-chain-graph"):
+                # Capture round: the eager fork already ran this round; the
+                # captured prologue re-copies the same src -> dst (sources
+                # untouched by the copy), so the duplicate is idempotent.
                 captured = self._chain_graph.try_capture_and_run(
                     rows=plan.rows,
                     plan_steps=plan.plan_steps,
                     first_tokens=first_tokens,
+                    fork=plan.fork,
                 )
                 if captured is not None:
                     return captured
@@ -3323,6 +3567,10 @@ class EnumDraftEngine:
         keys = [k for k in keys if k in self._states and k in self._seat_carriers]
         if not keys:
             return
+        with torch.profiler.record_function("drafter.restage"):
+            self._prebuild_fast_round(keys)
+
+    def _prebuild_fast_round(self, keys: list[DraftReqKey]) -> None:
         states = [self._states[k] for k in keys]
         bs = len(states)
         width = self.num_steps + 1
@@ -3418,6 +3666,27 @@ class EnumDraftEngine:
                         node_offsets=node_off,
                     )
                 )
+        replay_fb = None
+        if (
+            case_staging is not None
+            and not envs.SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_FULLSCAN.get()
+        ):
+            # The replay ForwardBatch, built ONCE here (see the field note on
+            # _PrebuiltFastRound): shell rebinds + init_new + spec_info are
+            # the bulk of the extend replay-prep the consume path used to pay
+            # in front of the graph launch.
+            try:
+                replay_fb = self._prebuild_replay_fb(
+                    batch=batch,
+                    carriers=carriers,
+                    base_lens=base_lens,
+                    case_staging=case_staging,
+                )
+            except Exception:
+                logger.exception(
+                    "decoupled restage: replay-fb prebuild failed; the round "
+                    "falls back to inline replay prep"
+                )
         positions: list[int] = []
         for base in base_lens:
             positions.extend(range(base, base + width))
@@ -3436,7 +3705,52 @@ class EnumDraftEngine:
             scratch_kv_pages=pre_pages,
             glue_seeded=True,
             case_staging=case_staging,
+            replay_fb=replay_fb,
             ready_event=ready_event,
+        )
+
+    def _prebuild_replay_fb(
+        self,
+        *,
+        batch: ScheduleBatch,
+        carriers: list,
+        base_lens: list[int],
+        case_staging: list,
+    ) -> ForwardBatch:
+        """Build the case-independent replay ForwardBatch at restage time
+        (bs == 1). Mirrors _extend_graph_assemble_rows' prestaged branch with
+        a zeroed static input buffer; the per-case pieces (out_cache_loc,
+        gdn true lens, token values, seat-pad page-table binding) flow in at
+        consume."""
+        width = self._extend_graph_width
+        rows = self.num_steps + 1
+        fused = self._glue_template
+        fused.reqs = [batch.reqs[0]] + carriers[0].glue_reqs
+        fused.multimodal_inputs = [None] * rows
+        fused.req_pool_indices = torch.cat(
+            [batch.req_pool_indices[0:1], carriers[0].glue_rows]
+        )
+        fused.extend_logprob_start_lens = [0] * rows
+        _, width_list = self._extend_graph_consts_for(rows)
+        fused.extend_lens = list(width_list)
+        fused.prefix_lens = [base_lens[0]] * rows
+        fused.input_ids = torch.zeros(
+            rows * width, dtype=torch.int64, device=self.device
+        )
+        # Placeholder binding; the consume path rebinds the actual case's.
+        fused.out_cache_loc = case_staging[0].out_cache_loc
+        fused.extend_num_tokens = rows * width
+        seq_cpu = torch.tensor(fused.prefix_lens, dtype=torch.int64)
+        fused.seq_lens = self._h2d.to_device(seq_cpu, dtype=torch.int64)
+        fused.seq_lens_cpu = seq_cpu
+        fused.seq_lens_sum = sum(fused.prefix_lens)
+        fused.orig_seq_lens = (fused.seq_lens + width).to(torch.int32)
+        return self._extend_graph_prepare_fb(
+            fused=fused,
+            rows=rows,
+            true_lens_host=case_staging[0].true_lens_host,
+            prestaged=case_staging[0],
+            tag="prestage",
         )
 
     def _scrap_lists(self, batches: list, slots_list: list, kv_pages: list) -> None:
@@ -3535,6 +3849,12 @@ class EnumDraftEngine:
         if pre.case_staging is not None:
             for staging in pre.case_staging:
                 mark(staging.out_cache_loc)
+        if pre.replay_fb is not None:
+            for value in vars(pre.replay_fb).values():
+                mark(value)
+            if pre.replay_fb.spec_info is not None:
+                for value in vars(pre.replay_fb.spec_info).values():
+                    mark(value)
         for extra in pre.scratch_slots:
             mark(extra)
 
@@ -3712,7 +4032,11 @@ class EnumDraftEngine:
                     else carrier.glue_private_slots[case - 1, :span]
                 )
                 dst_pieces.append(carrier.branch_private_slots[row, :span])
-        return src_pieces, dst_pieces
+        if not src_pieces:
+            return src_pieces, dst_pieces
+        # Pre-cat at build time (overlapped with the extend's GPU segment):
+        # the post-extend tail then launches ONE copy kernel, not cat+cat+copy.
+        return [torch.cat(src_pieces)], [torch.cat(dst_pieces)]
 
     def _cow_carrier_branch_heads(
         self,
@@ -4692,8 +5016,13 @@ class EnumDraftEngine:
             not self._hybrid or batch.mamba_clear_indices is None
         ), f"hybrid {tag} batch fresh-allocated mamba slots (preset missed)"
         if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
-            batch.input_ids = batch.prefill_input_ids_cpu.to(
-                batch.device, non_blocking=True
+            # Pinned staging, not a raw .to(): non_blocking is a no-op on
+            # unpinned memory, and a pageable H2D drains EVERYTHING queued on
+            # the stream first -- inside the round-tail restage that meant
+            # blocking the host ~0.5ms on the round's whole GPU tail (the
+            # per-round cudaStreamSynchronize the traces showed).
+            batch.input_ids = self._h2d.to_device(
+                batch.prefill_input_ids_cpu, dtype=torch.int64
             )
             batch.prefill_input_ids_cpu = None
         self.profiler.mark(f"{tag}_build")

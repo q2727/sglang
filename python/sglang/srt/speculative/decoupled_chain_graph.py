@@ -45,10 +45,21 @@ logger = logging.getLogger(__name__)
 
 
 class _ChainBucket:
-    def __init__(self, *, rows: int, num_steps: int, device: str) -> None:
+    def __init__(
+        self, *, rows: int, num_steps: int, device: str, fork_rows: int = 0
+    ) -> None:
         self.rows = rows
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.input_ids = torch.zeros(rows, dtype=torch.int64, device=device)
+        # GDN branch-fork prologue (fast rounds on hybrid models): the
+        # recurrent-state copy captured INSIDE the graph, reading static
+        # index buffers refreshed at stage(). fork_rows == 0 captures no
+        # prologue (case-0 chains fork earlier with a different pattern, so
+        # forked and plain chains live in separate buckets).
+        self.fork_rows = fork_rows
+        if fork_rows:
+            self.fork_src = torch.zeros(fork_rows, dtype=torch.int64, device=device)
+            self.fork_dst = torch.zeros(fork_rows, dtype=torch.int64, device=device)
         self.positions = torch.zeros(rows, dtype=torch.int64, device=device)
         self.seq_lens = torch.zeros(rows, dtype=torch.int64, device=device)
         self.req_rows = torch.zeros(rows, dtype=torch.int64, device=device)
@@ -73,11 +84,11 @@ class ChainGraphRunner:
         # decode graph's max bs; a chain with more rows would index past them
         # (hybrid backend: state_indices_list[bs - 1] IndexError).
         self.max_rows = model_runner.server_args.cuda_graph_config.decode.max_bs
-        self._buckets: dict[int, _ChainBucket] = {}
-        self._failed_rows: set[int] = set()
+        self._buckets: dict[tuple[int, bool], _ChainBucket] = {}
+        self._failed_rows: set[tuple[int, bool]] = set()
 
-    def can_replay(self, rows: int) -> bool:
-        bucket = self._buckets.get(rows)
+    def can_replay(self, rows: int, *, forked: bool = False) -> bool:
+        bucket = self._buckets.get((rows, forked))
         return bucket is not None and bucket.graph is not None
 
     def _fill_meta(self, bucket: _ChainBucket, plan_steps) -> None:
@@ -106,13 +117,14 @@ class ChainGraphRunner:
         bucket.input_ids.copy_(first_tokens.to(torch.int64))
 
     def try_capture_and_run(
-        self, *, rows: int, plan_steps, first_tokens: torch.Tensor
+        self, *, rows: int, plan_steps, first_tokens: torch.Tensor, fork=None
     ) -> Optional[list[torch.Tensor]]:
         """First use for this row count: capture the K-step chain while
         EXECUTING it (this round's real work happens inside the capture).
         Returns the chain tokens, or None on capture failure (caller falls
         back; the bucket is then permanently disabled)."""
-        if rows in self._failed_rows:
+        key = (rows, fork is not None)
+        if key in self._failed_rows:
             return None
         if rows > self.max_rows:
             logger.info(
@@ -121,15 +133,21 @@ class ChainGraphRunner:
                 rows,
                 self.max_rows,
             )
-            self._failed_rows.add(rows)
+            self._failed_rows.add(key)
             return None
-        bucket = self._buckets.get(rows)
+        bucket = self._buckets.get(key)
         if bucket is None:
             bucket = _ChainBucket(
-                rows=rows, num_steps=self.num_steps, device=self.device
+                rows=rows,
+                num_steps=self.num_steps,
+                device=self.device,
+                fork_rows=fork[0].numel() if fork is not None else 0,
             )
-            self._buckets[rows] = bucket
+            self._buckets[key] = bucket
         self._fill(bucket, plan_steps, first_tokens)
+        if fork is not None:
+            bucket.fork_src.copy_(fork[0])
+            bucket.fork_dst.copy_(fork[1])
         fb0 = plan_steps[0][0]
         attn_backend = self.model_runner.attn_backend
         model = self.model_runner.model
@@ -173,6 +191,14 @@ class ChainGraphRunner:
                         fb0.global_num_tokens_cpu,
                     )
                     set_is_extend_in_batch(False)
+                    if bucket.fork_rows:
+                        # GDN branch fork as the graph's prologue: state copy
+                        # driven by the static index buffers stage() refreshes.
+                        pool = self.model_runner.req_to_token_pool
+                        pool.mamba_pool.copy_from(
+                            src_indices=bucket.fork_src,
+                            dst_indices=bucket.fork_dst,
+                        )
                     for s in range(self.num_steps):
                         fb0.out_cache_loc = bucket.out_locs[s]
                         attn_backend.init_forward_metadata_in_graph(fb0)
@@ -199,14 +225,19 @@ class ChainGraphRunner:
                 "step-by-step chain permanently for this bucket",
                 rows,
             )
-            self._failed_rows.add(rows)
-            self._buckets.pop(rows, None)
+            self._failed_rows.add(key)
+            self._buckets.pop(key, None)
             return None
         # Stream capture RECORDS without executing: this replay is the
         # round's actual execution (side effects happen exactly once here).
-        return self.replay(rows=rows, plan_steps=plan_steps, first_tokens=first_tokens)
+        return self.replay(
+            rows=rows,
+            plan_steps=plan_steps,
+            first_tokens=first_tokens,
+            fork=fork,
+        )
 
-    def stage(self, *, rows: int, plan_steps) -> None:
+    def stage(self, *, rows: int, plan_steps, fork=None) -> None:
         """Hoisted-replay first half: the static-buffer fills and fb0
         rebinds, which depend only on the chain PLAN -- callable before the
         round's extend has produced the first tokens. The replay-prep
@@ -215,8 +246,11 @@ class ChainGraphRunner:
         replay state there, and hoisting it above the extend's OWN metadata
         prep is an unaudited ordering (the trtllm half is a pointer swap,
         but the shared-buffer question is open for the GDN half)."""
-        bucket = self._buckets[rows]
+        bucket = self._buckets[(rows, fork is not None)]
         self._fill_meta(bucket, plan_steps)
+        if fork is not None:
+            bucket.fork_src.copy_(fork[0])
+            bucket.fork_dst.copy_(fork[1])
         fb0 = plan_steps[0][0]
         fb0.input_ids = bucket.input_ids
         fb0.positions = bucket.positions
@@ -226,12 +260,12 @@ class ChainGraphRunner:
             fb0.mrope_positions = bucket.mrope_positions
 
     def fire(
-        self, *, rows: int, plan_steps, first_tokens: torch.Tensor
+        self, *, rows: int, plan_steps, first_tokens: torch.Tensor, forked: bool = False
     ) -> list[torch.Tensor]:
         """Hoisted-replay second half: replay-prep backend metadata, feed
         the extend's first tokens (a device-to-device copy, no host read)
         and replay. Only valid after stage() for the same rows this round."""
-        bucket = self._buckets[rows]
+        bucket = self._buckets[(rows, forked)]
         self.model_runner.attn_backend.init_forward_metadata_out_graph(
             plan_steps[0][0], in_capture=False
         )
@@ -240,7 +274,12 @@ class ChainGraphRunner:
         return [bucket.out_tokens[s] for s in range(self.num_steps)]
 
     def replay(
-        self, *, rows: int, plan_steps, first_tokens: torch.Tensor
+        self, *, rows: int, plan_steps, first_tokens: torch.Tensor, fork=None
     ) -> list[torch.Tensor]:
-        self.stage(rows=rows, plan_steps=plan_steps)
-        return self.fire(rows=rows, plan_steps=plan_steps, first_tokens=first_tokens)
+        self.stage(rows=rows, plan_steps=plan_steps, fork=fork)
+        return self.fire(
+            rows=rows,
+            plan_steps=plan_steps,
+            first_tokens=first_tokens,
+            forked=fork is not None,
+        )
