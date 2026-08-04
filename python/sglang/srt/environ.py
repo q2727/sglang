@@ -420,6 +420,10 @@ class Envs:
     # Decoupled spec: run the GPU commit-match kernel next to every host
     # match and compare verdicts (a device sync per round -- debug only).
     SGLANG_DEBUG_DECOUPLED_GPU_MATCH = EnvBool(False)
+    # Decoupled spec: run the full commit-scatter kernel next to every host
+    # hit-round consume and compare every produced tensor (device syncs --
+    # debug only).
+    SGLANG_DEBUG_DECOUPLED_GPU_SCATTER = EnvBool(False)
     # Decoupled spec: run the verifier's C6 gate as a host-func node ON the
     # forward stream (cudaLaunchHostFunc parking a condvar the IPC thread's
     # landing notifies) instead of parking the scheduler thread. The round's

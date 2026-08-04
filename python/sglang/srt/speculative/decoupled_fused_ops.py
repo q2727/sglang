@@ -227,3 +227,157 @@ def commit_match(
         W_UNIT=num_steps + 1,
     )
     return out
+
+
+@triton.jit
+def _commit_scatter_kernel(
+    # mirror (seat-indexed)
+    gen_ptr,
+    dlen_ptr,
+    tok_ptr,
+    # last block
+    units_ptr,
+    backbone_ptr,
+    # per-case stacks (restage-prebuilt)
+    gather_stack_ptr,  # [K+1, ROWS_W] int64 (source-gather indices per delta)
+    out_loc_stack_ptr,  # [K+1, ROWS_W] int64
+    true_stack_ptr,  # [K+1, ROWS] int32
+    pad_flats_ptr,  # [PADS] int64 (this seat's pad plane, paged layout)
+    # outputs
+    verdict_ptr,  # [4] int64: verdict, case, f, new_total(delta only here)
+    input_out_ptr,  # [ROWS_W] int64
+    out_loc_out_ptr,  # [ROWS_W] int64
+    true_out_ptr,  # [ROWS] int32
+    chains_out_ptr,  # [K] int64
+    table_ptr,  # page-table row base (real or shadow); pads land at
+    table_col0,  # columns [table_col0 + delta - ? ...]: col0 = base offset
+    # scalars
+    seat,
+    expected_gen,
+    backbone_len,
+    base_len,
+    K: tl.constexpr,
+    F: tl.constexpr,
+    W_MIRROR: tl.constexpr,
+    W_UNIT: tl.constexpr,
+    ROWS_W: tl.constexpr,
+    ROWS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    gen = tl.load(gen_ptr + seat)
+    dlen = tl.load(dlen_ptr + seat)
+    case = dlen - 1
+    prefix_ok = (case >= 0) & (case <= K) & (case <= backbone_len)
+    for i in tl.static_range(K):
+        d = tl.load(tok_ptr + seat * W_MIRROR + i)
+        b = tl.load(backbone_ptr + i)
+        prefix_ok &= (i >= case) | (d == b)
+    case_c = tl.minimum(tl.maximum(case, 0), K)
+    bonus = tl.load(tok_ptr + seat * W_MIRROR + tl.minimum(case_c, W_MIRROR - 1))
+    f_found = -1
+    for f in tl.static_range(F):
+        g = tl.load(units_ptr + (case_c * F + f) * W_UNIT)
+        f_found = tl.where((g == bonus) & (f_found < 0), f, f_found)
+    hit = prefix_ok & (f_found >= 0)
+    stale = gen != expected_gen
+    verdict = tl.where(stale, 0, tl.where(hit, 2, 1))
+    tl.store(verdict_ptr + 0, verdict.to(tl.int64))
+    tl.store(verdict_ptr + 1, case_c.to(tl.int64))
+    tl.store(verdict_ptr + 2, f_found.to(tl.int64))
+    tl.store(verdict_ptr + 3, dlen.to(tl.int64))
+    live = verdict != 0  # stale writes nothing (junk-lane handled by caller)
+    f_c = tl.maximum(f_found, 0)
+    # E: winning chain (junk zeros on miss -- its cells are dead by theorem)
+    for i in tl.static_range(K):
+        c = tl.load(units_ptr + (case_c * F + f_c) * W_UNIT + 1 + i)
+        tl.store(chains_out_ptr + i, tl.where(hit, c, 0), mask=live)
+    # A: input assembly out[j] = src[gather[case, j]], src = delta ++ chain
+    for j in tl.static_range(ROWS_W):
+        gidx = tl.load(gather_stack_ptr + case_c * ROWS_W + j)
+        from_delta = gidx < dlen
+        didx = tl.minimum(gidx, W_MIRROR - 1)
+        dval = tl.load(tok_ptr + seat * W_MIRROR + didx)
+        cidx = tl.minimum(tl.maximum(gidx - dlen, 0), K - 1)
+        craw = tl.load(units_ptr + (case_c * F + f_c) * W_UNIT + 1 + cidx)
+        cval = tl.where(hit, craw, 0)
+        tl.store(input_out_ptr + j, tl.where(from_delta, dval, cval), mask=live)
+    # B / C: per-case staging selection
+    for j in tl.static_range(ROWS_W):
+        v = tl.load(out_loc_stack_ptr + case_c * ROWS_W + j)
+        tl.store(out_loc_out_ptr + j, v, mask=live)
+    for r in tl.static_range(ROWS):
+        v = tl.load(true_stack_ptr + case_c * ROWS + r)
+        tl.store(true_out_ptr + r, v, mask=live)
+    # D: seat-row pad table entries, columns [base+delta, base+WIDTH)
+    new_len = base_len + dlen
+    pad_offset = new_len - (new_len // PAGE) * PAGE
+    for i in tl.static_range(WIDTH):
+        col = dlen + i  # relative to base
+        in_pad = (col >= dlen) & (col < WIDTH)
+        pval = tl.load(pad_flats_ptr + tl.minimum(pad_offset + i, PAGE + WIDTH - 2))
+        tl.store(
+            table_ptr + table_col0 + col,
+            pval.to(tl.int32),
+            mask=live & in_pad,
+        )
+
+
+def commit_scatter(
+    *,
+    mirror,
+    seat: int,
+    expected_generation: int,
+    units_dev: torch.Tensor,
+    backbone_dev: torch.Tensor,
+    backbone_len: int,
+    gather_stack: torch.Tensor,
+    out_loc_stack: torch.Tensor,
+    true_stack: torch.Tensor,
+    pad_flats: torch.Tensor,
+    table_row: torch.Tensor,  # 1-D view of the seat row (real or shadow)
+    base_len: int,
+    num_steps: int,
+    fanout: int,
+    page_size: int,
+    extend_width: int,
+    outs: tuple,  # (verdict[4]i64, input[ROWS_W]i64, out_loc[ROWS_W]i64, true[ROWS]i32, chains[K]i64)
+) -> None:
+    """One-launch commit consumption: the on-GPU match plus every per-case
+    value the fused-extend replay needs (input assembly, out_cache_loc /
+    GDN true-lens selection, seat-pad page-table suffix), fed entirely from
+    the commit mirror. Stale generation writes only the verdict -- the
+    caller's junk-lane / fallback handles the rest."""
+    verdict, input_out, out_loc_out, true_out, chains_out = outs
+    rows = true_stack.shape[1]
+    rows_w = gather_stack.shape[1]
+    _commit_scatter_kernel[(1,)](
+        mirror.generations,
+        mirror.delta_lens,
+        mirror.tokens,
+        units_dev,
+        backbone_dev,
+        gather_stack,
+        out_loc_stack,
+        true_stack,
+        pad_flats,
+        verdict,
+        input_out,
+        out_loc_out,
+        true_out,
+        chains_out,
+        table_row,
+        0,
+        seat,
+        expected_generation,
+        backbone_len,
+        base_len,
+        K=num_steps,
+        F=fanout,
+        W_MIRROR=mirror.width,
+        W_UNIT=num_steps + 1,
+        ROWS_W=rows_w,
+        ROWS=rows,
+        WIDTH=extend_width,
+        PAGE=page_size,
+    )

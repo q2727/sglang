@@ -173,6 +173,10 @@ class _PrebuiltFastRound(msgspec.Struct):
     glue_seeded: bool = False
     # bs == 1 only: per-case fused-extend staging, indexed by delta_len - 1.
     case_staging: Optional[list] = None
+    # bs == 1 only: per-case staging tensors stacked for the commit-scatter
+    # kernel's case indexing: (gather [K+1, rows*W], out_cache_loc
+    # [K+1, rows*W], true_lens [K+1, rows]).
+    scatter_stacks: Optional[tuple] = None
     # bs == 1 only: ONE prebuilt replay ForwardBatch shared by every accept
     # case -- under uniform-W padding the positions / seq-lens family /
     # extend metadata are case-INDEPENDENT (prefix == base for all rows), so
@@ -1002,6 +1006,8 @@ class EnumDraftEngine:
         self._commit_board = None
         self._debug_gpu_match = envs.SGLANG_DEBUG_DECOUPLED_GPU_MATCH.get()
         self._gpu_match_probe_ct = 0
+        self._debug_gpu_scatter = envs.SGLANG_DEBUG_DECOUPLED_GPU_SCATTER.get()
+        self._gpu_scatter_probe_ct = 0
 
     # ------------------------------------------------------------------ #
     # Fused-extend CUDA graph: construction (init-time)
@@ -1289,6 +1295,127 @@ class EnumDraftEngine:
                 f,
                 new_len,
                 selection,
+            )
+
+    def _probe_gpu_scatter(
+        self,
+        *,
+        state: _DraftReqState,
+        selection: tuple[int, int],
+        prebuilt: _PrebuiltFastRound,
+        prestaged: _ExtendCaseStaging,
+        seat_input_ids: torch.Tensor,
+        chain: torch.Tensor,
+        base_len: int,
+        delta_len: int,
+        graph_round: _ExtendGraphRound,
+    ) -> None:
+        """Debug-only (device syncs): the commit-scatter kernel must
+        reproduce every tensor the host consume path produced this round."""
+        mirror, board = self._commit_mirror, self._commit_board
+        if mirror is None or board is None or prebuilt.scatter_stacks is None:
+            return
+        if state.last_backbone_dev is None or not self._paged:
+            return  # the kernel's pad arithmetic is paged-layout only
+        seat = int(state.req_pool_idx)
+        with board._cond:
+            latest = board._stamps.get(seat)
+        if latest is None or latest + state.prompt_len != len(state.committed_tokens):
+            return
+        expected_generation = mirror.host_generation(seat)
+        from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
+
+        gather_stack, out_loc_stack, true_stack = prebuilt.scatter_stacks
+        rows = true_stack.shape[1]
+        rows_w = gather_stack.shape[1]
+        width = self._extend_graph_width
+        dev = self.device
+        outs = (
+            torch.zeros(4, dtype=torch.int64, device=dev),
+            torch.zeros(rows_w, dtype=torch.int64, device=dev),
+            torch.zeros(rows_w, dtype=torch.int64, device=dev),
+            torch.zeros(rows, dtype=true_stack.dtype, device=dev),
+            torch.zeros(self.num_steps, dtype=torch.int64, device=dev),
+        )
+        shadow_row = torch.zeros(width, dtype=torch.int32, device=dev)
+        torch.cuda.current_stream().wait_event(mirror.land_event)
+        commit_scatter(
+            mirror=mirror,
+            seat=seat,
+            expected_generation=expected_generation,
+            units_dev=state.last_units_dev.contiguous(),
+            backbone_dev=state.last_backbone_dev,
+            backbone_len=state.last_backbone_len,
+            gather_stack=gather_stack,
+            out_loc_stack=out_loc_stack,
+            true_stack=true_stack,
+            pad_flats=(
+                graph_round.seat_pad_flats[0]
+                if self._paged
+                else graph_round.w_slots[0, 0]
+            ),
+            table_row=shadow_row,
+            base_len=base_len,
+            num_steps=self.num_steps,
+            fanout=self.fanout,
+            page_size=self._page_size if self._paged else 1,
+            extend_width=width,
+            outs=outs,
+        )
+        torch.cuda.synchronize()
+        with board._cond:
+            latest_after = board._stamps.get(seat)
+        if (
+            latest_after != latest
+            or mirror.host_generation(seat) != expected_generation
+        ):
+            return  # a new commit landed mid-probe
+        verdict, case, f, dlen = outs[0].tolist()
+        want_input = torch.cat([seat_input_ids, chain])[prestaged.gather]
+        want_pads = self._extend_graph_seat_pads(
+            seat=0,
+            base_len=base_len,
+            delta_len=delta_len,
+            graph_round=graph_round,
+        )
+        checks = {
+            "verdict": (verdict, 2),
+            "case": (case, selection[0]),
+            "f": (f, selection[1]),
+            "dlen": (dlen, delta_len),
+            "input": (
+                outs[1].tolist(),
+                want_input.to(torch.int64).tolist(),
+            ),
+            "out_loc": (outs[2].tolist(), prestaged.out_cache_loc.tolist()),
+            "true": (outs[3].tolist(), prestaged.true_lens.tolist()),
+            "chains": (outs[4].tolist(), chain.to(torch.int64).tolist()),
+            "pads": (
+                shadow_row[delta_len:width].tolist(),
+                want_pads.to(torch.int32).tolist(),
+            ),
+        }
+        bad = {k: v for k, v in checks.items() if v[0] != v[1]}
+        self._gpu_scatter_probe_ct += 1
+        if (
+            bad
+            or self._gpu_scatter_probe_ct <= 3
+            or self._gpu_scatter_probe_ct % 200 == 0
+        ):
+            log = logger.error if bad else logger.info
+            log(
+                "gpu-scatter probe #%d %s%s",
+                self._gpu_scatter_probe_ct,
+                "MISMATCH " if bad else "OK",
+                (
+                    {
+                        k: v
+                        for k, v in (bad or checks).items()
+                        if k in ("verdict", "case", "f", "dlen")
+                    }
+                    if not bad
+                    else bad
+                ),
             )
 
     def seat_of(self, key: DraftReqKey) -> Optional[int]:
@@ -1804,6 +1931,18 @@ class EnumDraftEngine:
                 ):
                     prestaged_case = prebuilt.case_staging[delta_lens[0] - 1]
                     prestaged_fb = prebuilt.replay_fb
+                    if self._debug_gpu_scatter:
+                        self._probe_gpu_scatter(
+                            state=states[0],
+                            selection=selections[0],
+                            prebuilt=prebuilt,
+                            prestaged=prestaged_case,
+                            seat_input_ids=seat_input_ids,
+                            chain=chains[0],
+                            base_len=base_lens[0],
+                            delta_len=delta_lens[0],
+                            graph_round=graph_round,
+                        )
             else:
                 if prebuilt is not None:
                     self._prebuilt_fast = None
@@ -3776,6 +3915,13 @@ class EnumDraftEngine:
                     "decoupled restage: replay-fb prebuild failed; the round "
                     "falls back to inline replay prep"
                 )
+        scatter_stacks = None
+        if case_staging is not None:
+            scatter_stacks = (
+                torch.stack([cs.gather for cs in case_staging]).contiguous(),
+                torch.stack([cs.out_cache_loc for cs in case_staging]).contiguous(),
+                torch.stack([cs.true_lens for cs in case_staging]).contiguous(),
+            )
         positions: list[int] = []
         for base in base_lens:
             positions.extend(range(base, base + width))
@@ -3794,6 +3940,7 @@ class EnumDraftEngine:
             scratch_kv_pages=pre_pages,
             glue_seeded=True,
             case_staging=case_staging,
+            scatter_stacks=scatter_stacks,
             replay_fb=replay_fb,
             ready_event=ready_event,
         )
