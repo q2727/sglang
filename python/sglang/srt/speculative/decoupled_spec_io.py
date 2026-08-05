@@ -67,6 +67,10 @@ class DraftSync:
     # of re-rooting it (see _drain_send_queue). False = initial seed or a
     # retraction re-root, where the snapshot IS the new absolute truth.
     desync_reseed: bool = False
+    # Drafter-LOCAL annotation (never serialized meaningfully): the seat's
+    # mirror landing generation at the moment the drafter's IPC thread saw
+    # this sync -- the arrival-order base for the seat's processed count.
+    landed_generation: int = -1
 
     @property
     def draft_key(self) -> DraftReqKey:

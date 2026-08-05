@@ -87,6 +87,12 @@ class EnumArrivalBoard:
     def __init__(self) -> None:
         self._cond = threading.Condition()
         self._stamps: dict[int, int] = {}
+        # Landing-generation plane (drafter-side commit gate): seat -> count
+        # of commits landed into the GPU mirror. The pre-launch gate waits on
+        # THIS, not on stamps -- generations share their source of truth with
+        # the mirror the gated scatter reads, so there is no sampling window
+        # between "what the gate waits for" and "what the kernel checks".
+        self._generations: dict[int, int] = {}
 
     def record(self, block: DraftEnumerationBufferBatch) -> None:
         self.record_pairs(block.pool_indices, block.base_committed_lens)
@@ -97,6 +103,26 @@ class EnumArrivalBoard:
                 self._stamps[int(pool_idx)] = int(stamp)
             self._cond.notify_all()
 
+    def record_generation(self, pool_idx: int, generation: int) -> None:
+        with self._cond:
+            self._generations[int(pool_idx)] = int(generation)
+            self._cond.notify_all()
+
+    def wait_for_generation(
+        self, pool_idx: int, generation: int, timeout_s: float
+    ) -> bool:
+        """Wait until the seat's landed-commit generation reaches the given
+        value (monotonic per seat; ">=" for the same merge-skip reason as
+        wait_for). Returns False on timeout."""
+        deadline = time.monotonic() + timeout_s
+        with self._cond:
+            while self._generations.get(int(pool_idx), 0) < generation:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(timeout=remaining)
+            return True
+
     def reset_seat(self, pool_idx: int) -> None:
         # Mirror of DecoupledEnumBuffer.reset_slot: a reused seat's stale
         # stamp can exceed the NEW occupant's expectations (shorter prompt),
@@ -106,6 +132,7 @@ class EnumArrivalBoard:
         # block arrived -- nobody force-releases.
         with self._cond:
             self._stamps.pop(int(pool_idx), None)
+            self._generations.pop(int(pool_idx), None)
 
     def wait_for(self, expected: dict[int, int], timeout_s: float) -> bool:
         """Wait until every seat's landed stamp equals its expected base.

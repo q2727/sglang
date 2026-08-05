@@ -157,6 +157,7 @@ def _commit_match_kernel(
     gen_ptr,
     new_len_ptr,
     dlen_ptr,
+    pre_len_ptr,
     tok_ptr,
     units_ptr,
     backbone_ptr,
@@ -164,29 +165,44 @@ def _commit_match_kernel(
     seat,
     expected_gen,
     backbone_len,
+    base_out_len,
     K: tl.constexpr,
     F: tl.constexpr,
     W_MIRROR: tl.constexpr,
     W_UNIT: tl.constexpr,
 ):
-    gen = tl.load(gen_ptr + seat)
-    dlen = tl.load(dlen_ptr + seat)
+    gen = tl.atomic_add(gen_ptr + seat, 0, sem="acquire", scope="sys")
+    wire_len = tl.load(dlen_ptr + seat)
+    pre_len = tl.load(pre_len_ptr + seat)
     new_len = tl.load(new_len_ptr + seat)
+    # Re-base the ABSOLUTE wire segment [pre_len, pre_len + wire_len)
+    # against the caller's committed total: skip the overlap, judge only the
+    # effective tail -- the same arithmetic the host's apply/match performs,
+    # from the same base, so the two verdicts can never diverge on framing.
+    skip = base_out_len - pre_len
+    dlen = pre_len + wire_len - base_out_len
+    seg_ok = (skip >= 0) & (dlen >= 1) & (dlen <= wire_len)
     case = dlen - 1
-    prefix_ok = (case >= 0) & (case <= K) & (case <= backbone_len)
+    prefix_ok = seg_ok & (case >= 0) & (case <= K) & (case <= backbone_len)
+    skip_c = tl.minimum(tl.maximum(skip, 0), W_MIRROR - 1)
     for i in tl.static_range(K):
-        d = tl.load(tok_ptr + seat * W_MIRROR + i)
+        d = tl.load(tok_ptr + seat * W_MIRROR + tl.minimum(skip_c + i, W_MIRROR - 1))
         b = tl.load(backbone_ptr + i)
         prefix_ok &= (i >= case) | (d == b)
     case_c = tl.minimum(tl.maximum(case, 0), K)
-    bonus = tl.load(tok_ptr + seat * W_MIRROR + tl.minimum(case_c, W_MIRROR - 1))
+    bonus = tl.load(
+        tok_ptr + seat * W_MIRROR + tl.minimum(skip_c + case_c, W_MIRROR - 1)
+    )
     f_found = -1
     for f in tl.static_range(F):
         g = tl.load(units_ptr + (case_c * F + f) * W_UNIT)
         f_found = tl.where((g == bonus) & (f_found < 0), f, f_found)
     hit = prefix_ok & (f_found >= 0)
     stale = gen != expected_gen
-    verdict = tl.where(stale, 0, tl.where(hit, 2, 1))
+    # 3 = the commit LANDED but its frame cannot be re-based against the
+    # caller's committed total (negative skip after an absorb-skipped round,
+    # oversized effective delta): state untouched, resolver must scrap.
+    verdict = tl.where(stale, 0, tl.where(~seg_ok, 3, tl.where(hit, 2, 1)))
     tl.store(out_ptr + 0, verdict.to(tl.int64))
     tl.store(out_ptr + 1, case_c.to(tl.int64))
     tl.store(out_ptr + 2, f_found.to(tl.int64))
@@ -201,6 +217,7 @@ def commit_match(
     units_dev: torch.Tensor,  # [K+1, F, K+1] this seat's last block (contiguous)
     backbone_dev: torch.Tensor,  # [K] device backbone twin
     backbone_len: int,
+    base_out_len: int,
     num_steps: int,
     fanout: int,
 ) -> torch.Tensor:
@@ -214,6 +231,7 @@ def commit_match(
         mirror.generations,
         mirror.new_committed_lens,
         mirror.delta_lens,
+        mirror.pre_lens,
         mirror.tokens,
         units_dev,
         backbone_dev,
@@ -221,6 +239,7 @@ def commit_match(
         seat,
         expected_generation,
         backbone_len,
+        base_out_len,
         K=num_steps,
         F=fanout,
         W_MIRROR=mirror.width,
@@ -230,10 +249,76 @@ def commit_match(
 
 
 @triton.jit
+def _mirror_land_kernel(
+    tok_ptr,
+    new_len_ptr,
+    dlen_ptr,
+    pre_len_ptr,
+    gen_ptr,
+    seat,
+    t0,
+    t1,
+    t2,
+    t3,
+    new_total,
+    dlen,
+    pre_len,
+    generation,
+    W_MIRROR: tl.constexpr,
+):
+    # Values first; the generation store is a system-scope RELEASE so a
+    # concurrently EXECUTING consumer kernel (the gated scatter, enqueued
+    # long before this landing) can acquire it -- host-side event syncs
+    # order nothing for kernels already in flight.
+    if W_MIRROR >= 1:
+        tl.store(tok_ptr + seat * W_MIRROR + 0, t0)
+    if W_MIRROR >= 2:
+        tl.store(tok_ptr + seat * W_MIRROR + 1, t1)
+    if W_MIRROR >= 3:
+        tl.store(tok_ptr + seat * W_MIRROR + 2, t2)
+    if W_MIRROR >= 4:
+        tl.store(tok_ptr + seat * W_MIRROR + 3, t3)
+    tl.store(new_len_ptr + seat, new_total)
+    tl.store(dlen_ptr + seat, dlen)
+    tl.store(pre_len_ptr + seat, pre_len)
+    tl.atomic_xchg(gen_ptr + seat, generation, sem="release", scope="sys")
+
+
+def mirror_land(
+    *,
+    mirror,
+    seat: int,
+    delta: list,
+    new_total: int,
+    pre_len: int,
+    generation: int,
+) -> None:
+    toks = list(delta) + [0] * (mirror.width - len(delta))
+    _mirror_land_kernel[(1,)](
+        mirror.tokens,
+        mirror.new_committed_lens,
+        mirror.delta_lens,
+        mirror.pre_lens,
+        mirror.generations,
+        seat,
+        int(toks[0]),
+        int(toks[1]) if mirror.width >= 2 else 0,
+        int(toks[2]) if mirror.width >= 3 else 0,
+        int(toks[3]) if mirror.width >= 4 else 0,
+        int(new_total),
+        int(len(delta)),
+        int(pre_len),
+        int(generation),
+        W_MIRROR=mirror.width,
+    )
+
+
+@triton.jit
 def _commit_scatter_kernel(
     # mirror (seat-indexed)
     gen_ptr,
     dlen_ptr,
+    pre_len_ptr,
     tok_ptr,
     # last block
     units_ptr,
@@ -258,6 +343,7 @@ def _commit_scatter_kernel(
     expected_gen,
     backbone_len,
     base_len,
+    base_out_len,
     K: tl.constexpr,
     F: tl.constexpr,
     W_MIRROR: tl.constexpr,
@@ -272,41 +358,67 @@ def _commit_scatter_kernel(
     # the landing was ENQUEUED on the mirror stream; these re-reads absorb
     # the enqueue-to-execute microseconds. Exhausting them leaves
     # gen != expected -> the stale zero-scan junk lane.
-    gen = tl.load(gen_ptr + seat, volatile=True)
+    gen = tl.atomic_add(gen_ptr + seat, 0, sem="acquire", scope="sys")
     for _spin in tl.static_range(64):
-        fresh = tl.load(gen_ptr + seat, volatile=True)
+        fresh = tl.atomic_add(gen_ptr + seat, 0, sem="acquire", scope="sys")
         gen = tl.where(gen != expected_gen, fresh, gen)
-    dlen = tl.load(dlen_ptr + seat)
+    wire_len = tl.load(dlen_ptr + seat)
+    pre_len = tl.load(pre_len_ptr + seat)
+    # Re-base the absolute wire segment against the ARM-time committed
+    # total (see _commit_match_kernel): framing is host-identical.
+    skip = base_out_len - pre_len
+    dlen = pre_len + wire_len - base_out_len
+    seg_ok = (skip >= 0) & (dlen >= 1) & (dlen <= wire_len)
     case = dlen - 1
-    prefix_ok = (case >= 0) & (case <= K) & (case <= backbone_len)
+    prefix_ok = seg_ok & (case >= 0) & (case <= K) & (case <= backbone_len)
+    skip_c = tl.minimum(tl.maximum(skip, 0), W_MIRROR - 1)
     for i in tl.static_range(K):
-        d = tl.load(tok_ptr + seat * W_MIRROR + i)
+        d = tl.load(tok_ptr + seat * W_MIRROR + tl.minimum(skip_c + i, W_MIRROR - 1))
         b = tl.load(backbone_ptr + i)
         prefix_ok &= (i >= case) | (d == b)
     case_c = tl.minimum(tl.maximum(case, 0), K)
-    bonus = tl.load(tok_ptr + seat * W_MIRROR + tl.minimum(case_c, W_MIRROR - 1))
+    bonus = tl.load(
+        tok_ptr + seat * W_MIRROR + tl.minimum(skip_c + case_c, W_MIRROR - 1)
+    )
     f_found = -1
     for f in tl.static_range(F):
         g = tl.load(units_ptr + (case_c * F + f) * W_UNIT)
         f_found = tl.where((g == bonus) & (f_found < 0), f, f_found)
     hit = prefix_ok & (f_found >= 0)
     stale = gen != expected_gen
-    verdict = tl.where(stale, 0, tl.where(hit, 2, 1))
+    # 3 = landed but not re-basable (see _commit_match_kernel): the junk
+    # lane below (stale_row covers ~seg_ok) leaves the seat untouched.
+    verdict = tl.where(stale, 0, tl.where(~seg_ok, 3, tl.where(hit, 2, 1)))
     tl.store(verdict_ptr + 0, verdict.to(tl.int64))
     tl.store(verdict_ptr + 1, case_c.to(tl.int64))
     tl.store(verdict_ptr + 2, f_found.to(tl.int64))
     tl.store(verdict_ptr + 3, dlen.to(tl.int64))
-    stale_row = verdict == 0
+    # Debug taps (holo): what THIS execution actually loaded.
+    tl.store(verdict_ptr + 4, bonus.to(tl.int64))
+    g0_dbg = tl.load(units_ptr + (case_c * F + 0) * W_UNIT)
+    g1_dbg = tl.load(units_ptr + (case_c * F + tl.minimum(1, F - 1)) * W_UNIT)
+    tl.store(verdict_ptr + 5, g0_dbg.to(tl.int64))
+    tl.store(verdict_ptr + 6, g1_dbg.to(tl.int64))
+    tl.store(verdict_ptr + 7, gen.to(tl.int64))
+    tl.store(verdict_ptr + 8, pre_len.to(tl.int64))
+    tl.store(verdict_ptr + 9, wire_len.to(tl.int64))
+    # An overlap-truncated (empty) landing must leave the seat untouched
+    # exactly like a stale round: zero-length scan, zeroed inputs, masked
+    # pads. Its verdict stays 1 (miss) so the resolver knows it LANDED.
+    stale_row = (verdict == 0) | (verdict == 3)
     f_c = tl.maximum(f_found, 0)
     # E: winning chain (junk zeros on miss -- its cells are dead by theorem)
     for i in tl.static_range(K):
         c = tl.load(units_ptr + (case_c * F + f_c) * W_UNIT + 1 + i)
-        tl.store(chains_out_ptr + i, tl.where(hit & ~stale_row, c, 0))
+        # -1 on miss/stale: the guess-tail's dead-token exclusion COMPARES
+        # against these values, and no real token is -1 (0 would wrongly
+        # exclude a live vocab id from the node-0 top-F on miss rounds).
+        tl.store(chains_out_ptr + i, tl.where(hit & ~stale_row, c, -1))
     # A: input assembly out[j] = src[gather[case, j]], src = delta ++ chain
     for j in tl.static_range(ROWS_W):
         gidx = tl.load(gather_stack_ptr + case_c * ROWS_W + j)
         from_delta = gidx < dlen
-        didx = tl.minimum(gidx, W_MIRROR - 1)
+        didx = tl.minimum(skip_c + gidx, W_MIRROR - 1)
         dval = tl.load(tok_ptr + seat * W_MIRROR + didx)
         cidx = tl.minimum(tl.maximum(gidx - dlen, 0), K - 1)
         craw = tl.load(units_ptr + (case_c * F + f_c) * W_UNIT + 1 + cidx)
@@ -355,6 +467,7 @@ def commit_scatter(
     table_row: torch.Tensor,  # 1-D view of the seat row (real or shadow)
     table_col0: int,
     base_len: int,
+    base_out_len: int,
     num_steps: int,
     fanout: int,
     page_size: int,
@@ -372,6 +485,7 @@ def commit_scatter(
     _commit_scatter_kernel[(1,)](
         mirror.generations,
         mirror.delta_lens,
+        mirror.pre_lens,
         mirror.tokens,
         units_dev,
         backbone_dev,
@@ -392,6 +506,7 @@ def commit_scatter(
         expected_generation,
         backbone_len,
         base_len,
+        base_out_len,
         K=num_steps,
         F=fanout,
         W_MIRROR=mirror.width,

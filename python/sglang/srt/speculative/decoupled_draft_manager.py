@@ -305,6 +305,12 @@ class DecoupledDraftManager:
                 for c in commits
             ],
         )
+        if self.commit_mirror is not None:
+            for c in commits:
+                seat = int(c.req_pool_idx)
+                self.commit_arrival_board.record_generation(
+                    seat, self.commit_mirror.host_generation(seat)
+                )
 
     def run_loop(self, *, control_plane: DrafterControlPlane) -> None:
         """The drafter scheduler's event loop (never returns)."""
@@ -425,6 +431,7 @@ class DecoupledDraftManager:
             for segment in ready.ready_commit_segments:
                 if not self.engine.has(segment.draft_key):
                     continue
+                self.engine.note_commit_seen(segment.draft_key)
                 if not self.engine.commit_base_aligned(
                     segment.draft_key, int(segment.pre_verify_committed_len)
                 ):

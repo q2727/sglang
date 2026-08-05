@@ -318,6 +318,12 @@ class _DraftReqState:
         # engine's own scratch rows are unrelated and transient.
         self.req_pool_idx = req_pool_idx
         self.committed_tokens: list[int] = []
+        # Count of landed commits this HOST has processed (dispatch order).
+        # The pre-launch arms against THIS +1 -- never against the mirror's
+        # live landing counter, which runs ahead whenever a commit lands
+        # mid-round and would make the kernel judge a different commit than
+        # the host's next dispatch (the one-generation phase split).
+        self.applied_commit_ct = 0
         # Prompt prefix length inside committed_tokens: VerifyCommit bases
         # (pre_verify_committed_len) index OUTPUT tokens only, so alignment
         # checks compare against len(committed_tokens) - prompt_len.
@@ -1011,10 +1017,7 @@ class EnumDraftEngine:
         self._scatter_consume = envs.SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME.get()
         # Pre-launch (see pre_launch_extend): the extend half of the NEXT
         # fast round enqueued behind a commit gate at this round's tail.
-        self._prelaunch_enabled = (
-            envs.SGLANG_ENABLE_DECOUPLED_DRAFT_PRELAUNCH.get()
-            and envs.SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME.get()
-        )
+        self._prelaunch_enabled = envs.SGLANG_ENABLE_DECOUPLED_DRAFT_PRELAUNCH.get()
         self._prelaunch_gate = None
         if self._prelaunch_enabled:
             try:
@@ -1028,14 +1031,28 @@ class EnumDraftEngine:
         # node_logits_ready marker). Consumed or discarded by the next
         # draft_round dispatch.
         self._prelaunched: Optional[dict] = None
+        self._prelaunch_ct = 0
+        self._prelaunch_fast_ct = 0
+        self._prelaunch_case0_ct = 0
+        self._prelaunch_forced_ct = 0
+        self._prelaunch_junk_ct = 0
+        self._prelaunch_junk_why = {"closed": 0, "verdict": 0, "drop": 0}
+        self._prelaunch_absorb_ct = 0
+        self._prelaunch_absorb_why = {"burst": 0, "taint": 0, "carrier": 0, "dlen": 0}
+        self._prelaunch_gate_release_ct = 0
+        self._prelaunch_gate_timeout_ct = 0
+        self._prelaunch_forced_logged = 0
         # Scatter-consume scratch: verdict sink (never host-read on the hot
         # path) and the chains buffer the topk stage reuses.
-        self._scatter_verdict = torch.zeros(4, dtype=torch.int64, device=self.device)
+        self._scatter_verdict = torch.zeros(10, dtype=torch.int64, device=self.device)
         self._scatter_chains = torch.zeros(
             max(1, self.num_steps), dtype=torch.int64, device=self.device
         )
         self._scatter_node = torch.zeros(
             self.num_steps + 1, dtype=torch.int64, device=self.device
+        )
+        self._prelaunch_verdict_pin = torch.zeros(
+            10, dtype=torch.int64, pin_memory=True
         )
 
     # ------------------------------------------------------------------ #
@@ -1241,12 +1258,23 @@ class EnumDraftEngine:
         req_pool_idx: int,
         prompt_tokens: list[int],
         committed_outputs: list[int],
+        applied_commit_base: int = -1,
     ) -> None:
         # Re-open (retraction re-sync) drops the old prefix KV entirely.
         self.close(key)
         state = _DraftReqState(req_pool_idx=req_pool_idx, device=self.device)
         state.committed_tokens = list(prompt_tokens) + list(committed_outputs)
         state.prompt_len = len(prompt_tokens)
+        if self._commit_mirror is not None:
+            # Arrival-order base: the IPC thread stamps every sync with the
+            # seat's landing generation AT ITS STREAM POSITION -- reading the
+            # mirror's live counter here instead races in-flight landings and
+            # skews the processed count by one forever.
+            state.applied_commit_ct = (
+                applied_commit_base
+                if applied_commit_base >= 0
+                else self._commit_mirror.host_generation(req_pool_idx)
+            )
         if self._hybrid:
             # The seat slot must start ZEROED: the GDN extend kernel reads the
             # slot's ssm state as the initial state unconditionally, and an
@@ -1255,6 +1283,13 @@ class EnumDraftEngine:
             pool = self.model_runner.req_to_token_pool
             pool.mamba_pool.clear_slots(pool.translate_mamba_indices(state.mamba_slot))
         self._states[key] = state
+
+    def note_commit_seen(self, key: DraftReqKey) -> None:
+        """One landed commit entered this host's dispatch (applied, merged,
+        or dropped as misaligned) -- advance the seat's processed count."""
+        state = self._states.get(key)
+        if state is not None:
+            state.applied_commit_ct += 1
 
     def attach_commit_mirror(self, mirror, board) -> None:
         self._commit_mirror = mirror
@@ -1295,6 +1330,7 @@ class EnumDraftEngine:
             units_dev=state.last_units_dev.contiguous(),
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
+            base_out_len=state.committed_slots.numel() - state.prompt_len,
             num_steps=self.num_steps,
             fanout=self.fanout,
         ).tolist()
@@ -1306,6 +1342,8 @@ class EnumDraftEngine:
         ):
             return  # a new commit landed mid-probe: sample invalid, skip
         verdict, case, f, new_len = out
+        if verdict == 3:
+            return  # frame not re-basable at probe time: sample invalid
         want_hit = selection is not None
         ok = (verdict == 2) == want_hit and (not want_hit or (case, f) == selection)
         self._gpu_match_probe_ct += 1
@@ -1341,6 +1379,170 @@ class EnumDraftEngine:
             chains_in.copy_(chains_mat)
         graph.replay()
         return guesses_out, branch_out
+
+    def _resolve_prelaunched(
+        self,
+        *,
+        hit_keys: list[DraftReqKey],
+        selections: list[tuple[int, int]],
+        case0_keys: list[DraftReqKey],
+        f_live: int,
+        scratch_batches: list,
+        scratch_slots: list,
+        scratch_kv_pages: list,
+    ) -> tuple[str, Optional[dict]]:
+        """Decide the outstanding pre-launch's fate for THIS dispatch.
+
+        The one invariant everything below serves: once the gated scatter
+        consumed a landing (verdict 1/2), the extend REALLY advanced the
+        seat's KV + recurrent state -- it must be absorbed exactly once and
+        never redone by a host round. Only verdict 0 (the gate lost the
+        race / timed out: zero-length scan, zeroed inputs, masked pads)
+        leaves the seat untouched and is safe to scrap outright.
+
+        Returns (action, record): "keep" leaves the record armed (this
+        dispatch carries no commit for its seat); "scrapped" freed a junk
+        or orphaned round; "absorbed" folded a burst's first-commit advance
+        into committed_slots (host round extends by the remainder);
+        "fast" / "case0" hand the record to the matching round; and
+        "forced_case0" asks the caller to run the record's seat as its own
+        single-seat case-0 round (partition mismatch or host/kernel
+        disagreement -- state-safe for either verdict, since the advance
+        rows and node-0 logits are real in both).
+        """
+        rec = self._prelaunched
+        assert rec is not None
+        mirror = self._commit_mirror
+        rec_key = rec["keys"][0]
+        state = self._states.get(rec_key)
+        if state is None or mirror is None:
+            # Seat closed under the gate. Stream order keeps this safe: the
+            # gated round's writes were enqueued before any reuse of its
+            # slots can be, and a late REAL landing only advances a dead
+            # arena row.
+            self._prelaunched = None
+            if mirror is not None:
+                mirror.clear_scatter_fence()
+            self._scrap_prebuilt_into(
+                rec["pre"], scratch_batches, scratch_slots, scratch_kv_pages
+            )
+            self._prelaunch_junk_ct += 1
+            self._prelaunch_junk_why["closed"] += 1
+            return "scrapped", None
+        seat = int(state.req_pool_idx)
+        generation = mirror.host_generation(seat)
+        expected = rec["expected_generation"]
+        if generation < expected:
+            # No commit has landed for this seat (this dispatch is for other
+            # keys); the gate is still armed and may yet consume one. But the
+            # rounds this dispatch is about to run replay the same graphs,
+            # clobbering the record's static outputs: only absorption remains.
+            rec["tainted"] = True
+            return "keep", None
+        self._prelaunched = None
+        if generation > expected:
+            # Catch-up merge folded several landed commits into one host
+            # segment (the note hook counts segments, not commits): re-align
+            # the processed count so the next arm doesn't chase a landing
+            # whose mirror row is long overwritten.
+            state.applied_commit_ct = max(state.applied_commit_ct, generation)
+        # Bounded: a landing matched, so the gate released and the round is
+        # executing (or long done); this waits out kernel-tail microseconds.
+        # The scatter fence stays armed until AFTER this sync -- clearing it
+        # first opens a window where the next landing overwrites the mirror
+        # row while the scatter is still reading it (observed as torn
+        # (generation, delta_len) pairs: kernel and host each seeing the
+        # other commit's length).
+        rec["verdict_event"].synchronize()
+        mirror.clear_scatter_fence()
+        verdict = int(self._prelaunch_verdict_pin[0].item())
+        kernel_case = int(self._prelaunch_verdict_pin[1].item())
+        kernel_f = int(self._prelaunch_verdict_pin[2].item())
+        kernel_delta_len = int(self._prelaunch_verdict_pin[3].item())
+        rec["verdict"] = verdict
+        if verdict in (0, 3):
+            # 0 = stale (gate lost the race); 3 = landed but the frame could
+            # not be re-based (negative skip after an absorb-skipped round).
+            # Both ran the zero-scan junk lane: the seat is untouched.
+            self._scrap_prebuilt_into(
+                rec["pre"], scratch_batches, scratch_slots, scratch_kv_pages
+            )
+            self._prelaunch_junk_ct += 1
+            self._prelaunch_junk_why["verdict"] += 1
+            return "scrapped", None
+        host_delta_len = len(state.committed_tokens) - state.committed_slots.numel()
+        if (
+            generation > expected
+            or host_delta_len != kernel_delta_len
+            or host_delta_len == 0
+            or rec["tainted"]
+            or rec_key not in self._seat_carriers
+        ):
+            if host_delta_len == 0:
+                self._prelaunch_absorb_why["empty"] = (
+                    self._prelaunch_absorb_why.get("empty", 0) + 1
+                )
+            elif generation > expected:
+                self._prelaunch_absorb_why["burst"] += 1
+            elif rec["tainted"]:
+                self._prelaunch_absorb_why["taint"] += 1
+            elif rec_key not in self._seat_carriers:
+                self._prelaunch_absorb_why["carrier"] += 1
+            else:
+                self._prelaunch_absorb_why["dlen"] += 1
+            # Burst: 2+ commits merged into this dispatch, and the scatter
+            # consumed exactly the FIRST (the landing fence kept later
+            # landings from tearing its reads). Absorb that advance; the
+            # host round then extends by the remainder.
+            if host_delta_len < kernel_delta_len:
+                logger.error(
+                    "prelaunch absorb inconsistency: host delta %d < kernel %d",
+                    host_delta_len,
+                    kernel_delta_len,
+                )
+                kernel_delta_len = host_delta_len
+            pre = rec["pre"]
+            scratch_batches.append(pre.batch)
+            scratch_batches.extend(pre.scratch_batches)
+            scratch_slots.extend(pre.scratch_slots)
+            scratch_kv_pages.extend(pre.scratch_kv_pages)
+            kept = self._absorb_prelaunched(
+                pre,
+                states=[state],
+                base_lens=[pre.base_lens[0]],
+                delta_lens=[kernel_delta_len],
+                scratch_slots=scratch_slots,
+            )
+            state.committed_slots = torch.cat([state.committed_slots, kept])
+            self._prelaunch_absorb_ct += 1
+            return "absorbed", rec
+        if (
+            verdict == 2
+            and hit_keys == [rec_key]
+            and rec["f_live"] == f_live
+            and selections[0] == (kernel_case, kernel_f)
+        ):
+            self._prelaunch_fast_ct += 1
+            return "fast", rec
+        if verdict == 1 and case0_keys == [rec_key]:
+            self._prelaunch_case0_ct += 1
+            return "case0", rec
+        self._prelaunch_forced_ct += 1
+        if self._prelaunch_forced_logged < 3:
+            self._prelaunch_forced_logged += 1
+            logger.info(
+                "prelaunch forced_case0 detail: verdict=%d kernel=(%d,%d) "
+                "host_sel=%s hit=%s case0=%s f_live=%d/%d",
+                verdict,
+                kernel_case,
+                kernel_f,
+                selections[0] if selections else None,
+                hit_keys == [rec_key],
+                case0_keys == [rec_key],
+                rec["f_live"],
+                f_live,
+            )
+        return "forced_case0", rec
 
     def pre_launch_extend(self, keys: list[DraftReqKey]) -> bool:
         """Enqueue the NEXT fast round's extend half behind a commit gate,
@@ -1390,13 +1592,26 @@ class EnumDraftEngine:
             return False  # guess-tail graph not warm yet
         rows = self.num_steps + 1
         seat = int(state.req_pool_idx)
-        expected_generation = mirror.host_generation(seat) + 1
+        expected_generation = state.applied_commit_ct + 1
+        if mirror.host_generation(seat) >= expected_generation:
+            # The commit this pre-launch would consume ALREADY landed (it is
+            # sitting in the inbox waiting for the next dispatch): arming now
+            # would snapshot a stale base -- the host round that consumes it
+            # is about to run anyway, so pre-launching buys nothing.
+            return False
         if envs.SGLANG_DEBUG_DECOUPLED_PRELAUNCH_JUNK.get():
             # Validation mode: force every pre-launched round down the stale
             # junk lane (never consumes, never advances state); the host
             # round redoes everything, so correctness must be unchanged.
             expected_generation += 1_000_000
-        expected_stamp = (len(state.committed_tokens) - state.prompt_len) + 1
+        # The gate waits on the LANDING GENERATION, never on stamps: the
+        # generation is the same counter the gated scatter compares on the
+        # mirror, sampled ONCE here for both. (Stamp-based gating had an
+        # unclosable window -- a commit arriving between the loop's apply
+        # and this enqueue satisfied the stamp immediately while the kernel
+        # waited for the generation AFTER it, junking the round; observed as
+        # 198/200 stale under fallback-dense traffic, then as 100% gate
+        # timeouts when the stamp base was misread as absolute.)
         carrier = self._seat_carriers[keys[0]]
         # Take ownership of the skeleton (the host round must not consume it).
         self._prebuilt_fast = None
@@ -1413,8 +1628,11 @@ class EnumDraftEngine:
         gate = self._prelaunch_gate
         budget_s = 0.1
 
-        def gate_fn(seat=seat, stamp=expected_stamp, budget=budget_s):
-            board.wait_for({seat: stamp}, budget)
+        def gate_fn(seat=seat, generation=expected_generation, budget=budget_s):
+            if board.wait_for_generation(seat, generation, budget):
+                self._prelaunch_gate_release_ct += 1
+            else:
+                self._prelaunch_gate_timeout_ct += 1
 
         if not gate.enqueue(torch.cuda.current_stream(), gate_fn):
             # Driver refused the node; hand the skeleton back untouched.
@@ -1424,13 +1642,15 @@ class EnumDraftEngine:
 
         gather_stack, out_loc_stack, true_stack, node_stack = pre.scatter_stacks
         fb = pre.replay_fb
+        units_kernel = state.last_units_dev.contiguous()
         commit_scatter(
             mirror=mirror,
             seat=seat,
             expected_generation=expected_generation,
-            units_dev=state.last_units_dev.contiguous(),
+            units_dev=units_kernel,
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
+            base_out_len=state.committed_slots.numel() - state.prompt_len,
             gather_stack=gather_stack,
             out_loc_stack=out_loc_stack,
             true_stack=true_stack,
@@ -1454,6 +1674,11 @@ class EnumDraftEngine:
                 self._scatter_chains,
             ),
         )
+        scatter_done = torch.cuda.Event()
+        scatter_done.record()
+        mirror.set_scatter_fence(
+            seat=seat, after_generation=expected_generation, event=scatter_done
+        )
         fused_logits = self._extend_graph_execute(
             forward_batch=fb,
             rows=rows,
@@ -1469,17 +1694,49 @@ class EnumDraftEngine:
             chains_mat=self._scatter_chains.view(1, self.num_steps),
         )
         if topk_out is None:
-            self._prelaunched = None
-            return False
+            # Unreachable by the warm-graph guard above; the scatter/extend
+            # are already queued (a REAL advance if the commit lands), so
+            # continuing without a record would double-advance the seat.
+            raise RuntimeError("prelaunch guess-tail graph refused to replay")
+        # Zero-sync verdict readback for the dispatch: pinned copy + event
+        # enqueued behind the round's work; by dispatch time the event has
+        # long fired and the pinned read costs nothing.
+        self._prelaunch_verdict_pin.copy_(self._scatter_verdict, non_blocking=True)
+        verdict_event = torch.cuda.Event()
+        verdict_event.record()
         self._prelaunched = {
             "keys": tuple(keys),
             "expected_generation": expected_generation,
-            "expected_stamp": expected_stamp,
             "pre": pre,
             "f_live": f_live,
             "guesses_out": topk_out[0],
             "branch_out": topk_out[1],
+            "fused_logits": fused_logits,
+            "verdict_event": verdict_event,
+            "units_kernel": units_kernel,
+            "base_out_len": state.committed_slots.numel() - state.prompt_len,
+            # Set when a dispatch runs while this record is outstanding: the
+            # other seats' replays overwrite the extend/topk static outputs,
+            # so the record's guesses can no longer be consumed (the ADVANCE
+            # is still real -- resolution then absorbs instead).
+            "tainted": False,
         }
+        self._prelaunch_ct += 1
+        if self._prelaunch_ct % 50 == 0:
+            logger.info(
+                "decoupled prelaunch: enq=%d fast=%d case0=%d forced=%d "
+                "junk=%d(%s) absorb=%d why=%s gate_rel=%d gate_to=%d",
+                self._prelaunch_ct,
+                self._prelaunch_fast_ct,
+                self._prelaunch_case0_ct,
+                self._prelaunch_forced_ct,
+                self._prelaunch_junk_ct,
+                self._prelaunch_junk_why,
+                self._prelaunch_absorb_ct,
+                self._prelaunch_absorb_why,
+                self._prelaunch_gate_release_ct,
+                self._prelaunch_gate_timeout_ct,
+            )
         return True
 
     def _scatter_consume_commit(
@@ -1524,6 +1781,7 @@ class EnumDraftEngine:
             units_dev=state.last_units_dev.contiguous(),
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
+            base_out_len=base_len - state.prompt_len,
             gather_stack=gather_stack,
             out_loc_stack=out_loc_stack,
             true_stack=true_stack,
@@ -1597,6 +1855,7 @@ class EnumDraftEngine:
             units_dev=state.last_units_dev.contiguous(),
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
+            base_out_len=base_len - state.prompt_len,
             gather_stack=gather_stack,
             out_loc_stack=out_loc_stack,
             true_stack=true_stack,
@@ -1897,16 +2156,6 @@ class EnumDraftEngine:
         scratch_kv_pages: list[torch.Tensor] = []
         self.profiler.start_round()
         try:
-            if self._prelaunched is not None:
-                # Stage-(i) discipline: an outstanding pre-launch that no
-                # dispatch consumed is scrap -- its skeleton's resources ride
-                # this round's frees (record_stream marks were placed at
-                # enqueue; the junk round's writes hit owned slots only).
-                stale_pre = self._prelaunched["pre"]
-                self._prelaunched = None
-                self._scrap_prebuilt_into(
-                    stale_pre, scratch_batches, scratch_slots, scratch_kv_pages
-                )
             hit_keys: list[DraftReqKey] = []
             hit_states: list[_DraftReqState] = []
             selections: list[tuple[int, int]] = []
@@ -1930,6 +2179,63 @@ class EnumDraftEngine:
                     slow_keys.append(key)
                     slow_states.append(state)
             f_live = max(1, min(int(self.effective_fanout), self.fanout))
+            pl_fast: Optional[dict] = None
+            pl_case0: Optional[dict] = None
+            forced_case0: Optional[tuple[DraftReqKey, _DraftReqState, dict]] = None
+            if self._prelaunched is not None:
+                action, rec = self._resolve_prelaunched(
+                    hit_keys=hit_keys,
+                    selections=selections,
+                    case0_keys=case0_keys,
+                    f_live=f_live,
+                    scratch_batches=scratch_batches,
+                    scratch_slots=scratch_slots,
+                    scratch_kv_pages=scratch_kv_pages,
+                )
+                if action == "fast":
+                    pl_fast = rec
+                elif action == "case0":
+                    pl_case0 = rec
+                elif action == "forced_case0":
+                    # Pull the record's seat out of its partition; it runs
+                    # below as its own single-seat case-0 consume (the only
+                    # route that is state-safe for either verdict).
+                    rec_key = rec["keys"][0]
+                    rec_state = self._states[rec_key]
+                    if rec_key in hit_keys:
+                        i = hit_keys.index(rec_key)
+                        hit_keys.pop(i)
+                        hit_states.pop(i)
+                        selections.pop(i)
+                    elif rec_key in case0_keys:
+                        i = case0_keys.index(rec_key)
+                        case0_keys.pop(i)
+                        case0_states.pop(i)
+                    forced_case0 = (rec_key, rec_state, rec)
+                elif action == "absorbed":
+                    rec_key = rec["keys"][0]
+                    rec_state = self._states.get(rec_key)
+                    if (
+                        rec_state is not None
+                        and len(rec_state.committed_tokens)
+                        == rec_state.committed_slots.numel()
+                    ):
+                        # The absorbed advance covered the seat's whole delta:
+                        # nothing to extend this round, so skip the seat (the
+                        # verifier misses once on the stale block and falls
+                        # back; the next commit re-enters normally).
+                        for lst_keys, lst_states, extra in (
+                            (hit_keys, hit_states, selections),
+                            (case0_keys, case0_states, None),
+                            (slow_keys, slow_states, None),
+                        ):
+                            if rec_key in lst_keys:
+                                i = lst_keys.index(rec_key)
+                                lst_keys.pop(i)
+                                lst_states.pop(i)
+                                if extra is not None:
+                                    extra.pop(i)
+                                break
             if self._prebuilt_fast is not None and not hit_states:
                 # A miss/bootstrap round for these seats invalidates the
                 # hypothesized skeleton (committed lengths move); fold it in
@@ -1953,10 +2259,24 @@ class EnumDraftEngine:
                         scratch_slots,
                         scratch_kv_pages,
                         f_live=f_live,
+                        prelaunched=pl_fast,
                     )
                 )
-            if case0_states or slow_states:
+            if case0_states or slow_states or forced_case0 is not None:
                 self.miss_ct += 1
+            if forced_case0 is not None:
+                rec_key, rec_state, rec = forced_case0
+                parts.append(
+                    self._case0_round(
+                        [rec_key],
+                        [rec_state],
+                        scratch_batches,
+                        scratch_slots,
+                        scratch_kv_pages,
+                        f_live=f_live,
+                        prelaunched=rec,
+                    )
+                )
             if case0_states:
                 parts.append(
                     self._case0_round(
@@ -1966,6 +2286,7 @@ class EnumDraftEngine:
                         scratch_slots,
                         scratch_kv_pages,
                         f_live=f_live,
+                        prelaunched=pl_case0,
                     )
                 )
             if slow_states:
@@ -1979,6 +2300,8 @@ class EnumDraftEngine:
                         scratch_kv_pages,
                     )
                 )
+            if not parts:
+                return None
             if len(parts) == 1:
                 return parts[0]
             return {
@@ -2120,6 +2443,7 @@ class EnumDraftEngine:
         scratch_kv_pages: list[torch.Tensor],
         *,
         f_live: int,
+        prelaunched: Optional[dict] = None,
     ) -> dict:
         num_steps = self.num_steps
         bs = len(states)
@@ -2164,9 +2488,25 @@ class EnumDraftEngine:
         prestaged_values_ready = False
         prestaged_fb: Optional[ForwardBatch] = None
         with self.profiler.stage("alloc-seat"):
-            prebuilt = self._prebuilt_fast
-            if (
-                prebuilt is not None
+            if prelaunched is not None:
+                # The pre-launched round already ran the extend half on GPU;
+                # this host half only does the slot bookkeeping.
+                pre = prelaunched["pre"]
+                glue_preseeded = True
+                graph_round = pre.graph_round
+                advance_batch = pre.batch
+                scratch_batches.extend(pre.scratch_batches)
+                scratch_slots.extend(pre.scratch_slots)
+                scratch_kv_pages.extend(pre.scratch_kv_pages)
+                advance_slots = self._absorb_prelaunched(
+                    pre,
+                    states=states,
+                    base_lens=base_lens,
+                    delta_lens=delta_lens,
+                    scratch_slots=scratch_slots,
+                )
+            elif (
+                (prebuilt := self._prebuilt_fast) is not None
                 and prebuilt.keys == tuple(keys)
                 and prebuilt.base_lens == base_lens
                 and self._enable_fused_extend
@@ -2261,15 +2601,21 @@ class EnumDraftEngine:
         # (page_size > 1 dispatches to the private-page rebind instead and
         # returns None -- backbone KV then lives per row, never shared.)
         with self.profiler.stage("page-table-sync"):
-            backbone_slots = self._sync_carrier_rows(
-                states=states,
-                carriers=carriers,
-                base_lens=base_lens,
-                variant=variant,
-                f_live=f_live,
-                scratch_slots=scratch_slots,
-                graph_round=graph_round,
-            )
+            if prelaunched is not None:
+                # The carrier rebind is value-independent of the commit, so
+                # pre_launch_extend ran it at enqueue (paged mode: no shared
+                # backbone slots exist).
+                backbone_slots = None
+            else:
+                backbone_slots = self._sync_carrier_rows(
+                    states=states,
+                    carriers=carriers,
+                    base_lens=base_lens,
+                    variant=variant,
+                    f_live=f_live,
+                    scratch_slots=scratch_slots,
+                    graph_round=graph_round,
+                )
         if self._paged and not glue_preseeded:
             # Seed the glue rows' private heads before the forward reads them.
             with self.profiler.stage("cow-glue-heads"):
@@ -2309,7 +2655,13 @@ class EnumDraftEngine:
         hoist_cow: Optional[tuple[list, list]] = None
         hoist_fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         branch_guesses: Optional[torch.Tensor] = None
-        if self._enable_fused_extend:
+        if prelaunched is not None:
+            # Extend + guess-tail already ran on GPU behind the commit gate;
+            # their static outputs are live until the next extend replay
+            # (none before this round's tail).
+            guesses_stack = prelaunched["guesses_out"]
+            branch_guesses = prelaunched["branch_out"]
+        elif self._enable_fused_extend:
             # -- Fused extend: seat + glue rows in ONE forward. The glue chain
             # tokens are the matched commit's winning unit -- KNOWN values,
             # never derived from the advance's logits -- so the two phases
@@ -4315,6 +4667,25 @@ class EnumDraftEngine:
 
     def drop_prebuilt_for(self, key: DraftReqKey) -> None:
         """Seat close/reopen invalidation: release the prebuilt round now."""
+        rec = self._prelaunched
+        if rec is not None and key in rec["keys"]:
+            # Stream-fenced at enqueue; a late REAL landing only advances a
+            # dead arena row before any reuse's writes (same-stream order).
+            self._prelaunched = None
+            if self._commit_mirror is not None:
+                self._commit_mirror.clear_scatter_fence()
+            rec_pre = rec["pre"]
+            tracked: list = []
+            self._track_scratch_slots(
+                tracked, slots=rec_pre.slots, positions=rec_pre.slot_positions
+            )
+            self._scrap_lists(
+                [rec_pre.batch] + rec_pre.scratch_batches,
+                rec_pre.scratch_slots + tracked,
+                rec_pre.scratch_kv_pages,
+            )
+            self._prelaunch_junk_ct += 1
+            self._prelaunch_junk_why["drop"] += 1
         pre = self._prebuilt_fast
         if pre is None or key not in pre.keys:
             return
@@ -4416,6 +4787,34 @@ class EnumDraftEngine:
         advance_slots = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         seat_input_ids = self._h2d.to_device(delta_tokens, dtype=torch.int64)
         return advance_slots, seat_input_ids
+
+    def _absorb_prelaunched(
+        self,
+        pre: _PrebuiltFastRound,
+        *,
+        states: list[_DraftReqState],
+        base_lens: list[int],
+        delta_lens: list[int],
+        scratch_slots: list,
+    ) -> torch.Tensor:
+        """The slot bookkeeping half of _consume_prebuilt (the pre-launched
+        round already staged the token VALUES in-kernel): split the
+        hypothesized-max allocation into the absorbed delta prefix and the
+        leftover scratch."""
+        width = self.num_steps + 1
+        chunks = pre.slots.view(len(states), width)
+        pieces: list[torch.Tensor] = []
+        for i, delta_len in enumerate(delta_lens):
+            pieces.append(chunks[i, :delta_len])
+            if delta_len < width:
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=chunks[i, delta_len:],
+                    positions=list(
+                        range(base_lens[i] + delta_len, base_lens[i] + width)
+                    ),
+                )
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
     def _absorb_advance_slots(
         self, states: list[_DraftReqState], advance_slots: torch.Tensor
@@ -4732,6 +5131,7 @@ class EnumDraftEngine:
         scratch_kv_pages: list[torch.Tensor],
         *,
         f_live: int,
+        prelaunched: Optional[dict] = None,
     ) -> dict:
         """Miss round collapsed to case 0 (the dead-cell theorem).
 
@@ -4758,16 +5158,42 @@ class EnumDraftEngine:
         # No dead-guess exclusion here: the fallback round this block serves
         # commits a freely decoded bonus (no rejection constrains it).
         base_lens = [state.committed_slots.numel() for state in states]
-        node0_logits, advance_slots = self._advance_forward(
-            states=states,
-            base_lens=base_lens,
-            scratch_batches=scratch_batches,
-            scratch_slots=scratch_slots,
-            scratch_kv_pages=scratch_kv_pages,
-        )
-        # Consume the graph runner's static logits buffer before the next
-        # forward overwrites it.
-        node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices  # [bs, f]
+        if prelaunched is not None:
+            # The pre-launched extend already advanced the seat by the REAL
+            # delta (the scatter's input assembly reads mirror values); only
+            # absorb the slots. Node-0 guesses re-rank from the extend's
+            # static logits (still live until the next extend replay) with a
+            # plain top-F -- exactly this path's semantics (no dead-guess
+            # exclusion, any f_live).
+            pre = prelaunched["pre"]
+            scratch_batches.append(pre.batch)
+            scratch_batches.extend(pre.scratch_batches)
+            scratch_slots.extend(pre.scratch_slots)
+            scratch_kv_pages.extend(pre.scratch_kv_pages)
+            delta_lens = [
+                len(state.committed_tokens) - base_lens[i]
+                for i, state in enumerate(states)
+            ]
+            advance_slots = self._absorb_prelaunched(
+                pre,
+                states=states,
+                base_lens=base_lens,
+                delta_lens=delta_lens,
+                scratch_slots=scratch_slots,
+            )
+            node0_logits = prelaunched["fused_logits"].view(bs, num_steps + 1, -1)[:, 0]
+            node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices
+        else:
+            node0_logits, advance_slots = self._advance_forward(
+                states=states,
+                base_lens=base_lens,
+                scratch_batches=scratch_batches,
+                scratch_slots=scratch_slots,
+                scratch_kv_pages=scratch_kv_pages,
+            )
+            # Consume the graph runner's static logits buffer before the next
+            # forward overwrites it.
+            node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices
         self._absorb_advance_slots(states, advance_slots)
 
         # -- Carrier rows only need the committed delta (no backbone) --------

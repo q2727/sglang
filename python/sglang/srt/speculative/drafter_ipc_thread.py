@@ -212,11 +212,24 @@ class DrafterIpcThread:
             if control_batch is None:
                 continue
             if self._commit_mirror is not None and control_batch.verify_commit_messages:
+                # Land -> sync -> publish, ONE COMMIT AT A TIME. The publish
+                # releases the pre-launch gate (a host-func on the drafter's
+                # forward stream), but the generation values are ASYNC copies
+                # on the mirror stream: publishing before they execute lets
+                # the gated scatter race ahead, read the stale generation and
+                # junk the whole pre-launched round (observed: 195/200
+                # junked). The sync must be PER COMMIT, not per batch: a
+                # burst's second landing waits on the gated scatter's fence,
+                # which only fires after the FIRST landing's publish releases
+                # the gate -- a batch-level sync before any publish would
+                # deadlock that chain until the gate's timeout.
                 for commit in control_batch.verify_commit_messages:
-                    self._commit_mirror.land(commit)
+                    landed_event = self._commit_mirror.land(commit)
+                    if landed_event is not None:
+                        landed_event.synchronize()
+                    if self._on_commits_landed is not None:
+                        self._on_commits_landed([commit])
                 self._commit_mirror.record_landing()
-                if self._on_commits_landed is not None:
-                    self._on_commits_landed(control_batch.verify_commit_messages)
             with self._inbox_lock:
                 self._control_inbox.add_control_batch_locked(control_batch)
         return did_work
