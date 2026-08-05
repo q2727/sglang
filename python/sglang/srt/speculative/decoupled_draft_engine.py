@@ -815,7 +815,18 @@ class EnumDraftEngine:
             # page-table write binds to arena slots each round. Decode-step
             # page crossings past this span take throwaway allocator pages,
             # so the arena never needs to cover them.
-            span_max = (self._page_size - 1) + (self.num_steps + 1) + self.num_steps
+            # The extra + K: an ARMED chain (pre-launched behind the commit
+            # gate) writes its K decode steps into the branch rows' private
+            # slots at dlen-shifted offsets -- up to tail + (K+1) + K + K --
+            # instead of taking throwaway allocator pages mid-chain (there is
+            # no host between its steps to allocate them). For P = 64 this
+            # deepening changes no page count until K > 21.
+            span_max = (
+                (self._page_size - 1)
+                + (self.num_steps + 1)
+                + self.num_steps
+                + self.num_steps
+            )
             self._pages_per_carrier_row = (
                 span_max + self._page_size - 1
             ) // self._page_size
@@ -1054,6 +1065,17 @@ class EnumDraftEngine:
             "landed": 0,
             "gate": 0,
         }
+        # Chain pre-queueing (the chain replay joining the gate sequence):
+        # separate counters -- an extend-only pre-launch still proceeds when
+        # the chain half cannot arm (cold bucket / missing carrier tables).
+        self._prelaunch_chain_ct = 0
+        self._prelaunch_chain_skip_why = {"off": 0, "cold": 0, "shape": 0}
+        self._prelaunch_chain_enabled = (
+            envs.SGLANG_ENABLE_DECOUPLED_CHAIN_PRELAUNCH.get()
+        )
+        # Arm-static chain metadata, rebuilt when (f_live, tail, base) moves:
+        # base+case vector, off0 = tail+case+step, and the COW piece lists.
+        self._chain_arm_cache: Optional[dict] = None
         # Scatter-consume scratch: verdict sink (never host-read on the hot
         # path) and the chains buffer the topk stage reuses.
         self._scatter_verdict = torch.zeros(10, dtype=torch.int64, device=self.device)
@@ -1369,6 +1391,171 @@ class EnumDraftEngine:
             chains_in.copy_(chains_mat)
         graph.replay()
         return guesses_out, branch_out
+
+    def _pre_launch_chain_armed(
+        self,
+        *,
+        keys: list[DraftReqKey],
+        state,
+        carrier,
+        pre,
+        f_live: int,
+        branch_out: torch.Tensor,
+    ) -> Optional[tuple[list[torch.Tensor], tuple]]:
+        """Enqueue the branch-chain replay INSIDE the gate sequence (after
+        the guess-tail graph), before the commit exists. Everything host-side
+        here is value-free; the dlen-dependent chain metadata is completed ON
+        STREAM by the chain-meta kernel from the scatter's dlen tap:
+
+          seq/pos/mrope = (base + case) + dlen        (arithmetic shift)
+          out_locs[s]   = private_slots[row, tail + case + s + dlen]
+
+        The branch-head COW copies a dlen-SUPERSET (tail + K+1 [+ case]):
+        the advance writes all K+1 enumerated delta slots, so the extra
+        source KV is real, and the copied excess sits past the rows' read
+        horizon (seq_lens) -- harmless by layout. Junk verdicts degrade to
+        dlen = 0 (reads inside the pre-commit base, writes into private
+        scratch rows). Returns the K chain-step token tensors (bucket
+        static buffers), or None when the chain half cannot arm (the extend-only
+        pre-launch then proceeds unchanged)."""
+        if not self._prelaunch_chain_enabled or self._chain_graph is None:
+            return None
+        if (
+            not self._paged
+            or carrier.branch_private_slots is None
+            or carrier.glue_private_slots is None
+        ):
+            self._prelaunch_chain_skip_why["shape"] += 1
+            return None
+        variant = self._fanout_variant(f_live)
+        rows_sel = len(variant.sel_rows_pool)
+        forked = self._hybrid
+        if not self._chain_graph.can_arm(rows_sel, forked=forked):
+            self._prelaunch_chain_skip_why["cold"] += 1
+            return None
+        num_steps = self.num_steps
+        base_len = pre.base_lens[0]
+        anchor = self._page_floor(base_len)
+        tail = base_len - anchor
+        span_sup = tail + num_steps + 1
+        if span_sup + num_steps > carrier.glue_private_slots.shape[1]:
+            self._prelaunch_chain_skip_why["shape"] += 1
+            return None
+        # Arm-static metadata: base+case and off0 = tail+case+step (host
+        # ints, tiny pinned H2Ds on the prep ring).
+        case_vec = torch.tensor(variant.case_of_row, dtype=torch.int64)
+        base_plus_case = self._h2d.to_device(base_len + case_vec, dtype=torch.int64)
+        off0_host = (
+            tail
+            + case_vec.unsqueeze(0)
+            + torch.arange(num_steps, dtype=torch.int64).unsqueeze(1)
+        )
+        off0 = self._h2d.to_device(off0_host.reshape(-1), dtype=torch.int64).view(
+            num_steps, rows_sel
+        )
+        # Branch-head COW superset (see docstring): ONE copy kernel, fixed
+        # indices. Case 0 sources the seat tail + ALL K+1 enumerated delta
+        # slots; case c >= 1 sources glue row c-1's private head.
+        committed_ref = state.committed_slots
+        seat_sup = torch.cat([committed_ref[anchor:], pre.slots.view(num_steps + 1)])
+        src_pieces: list[torch.Tensor] = []
+        dst_pieces: list[torch.Tensor] = []
+        for row, case in zip(variant.sel_rows_pool, variant.case_of_row):
+            span = span_sup + case
+            src_pieces.append(
+                seat_sup if case == 0 else carrier.glue_private_slots[case - 1, :span]
+            )
+            dst_pieces.append(carrier.branch_private_slots[row, :span])
+        self._cow_kv(
+            src_pieces=[torch.cat(src_pieces)],
+            dst_pieces=[torch.cat(dst_pieces)],
+            tag="prelaunch_branch_head",
+        )
+        # GDN branch fork rides the chain graph's prologue; same cached
+        # indices as the host fast round (pure function of seat x width).
+        fork = None
+        if self._hybrid:
+            fork_key = (tuple(keys), f_live)
+            fork = self._branch_fork_cache.get(fork_key)
+            if fork is None:
+                fork = self._build_mamba_fork(
+                    src_slots=torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
+                        variant.case_of_row_dev
+                    ],
+                    dst_slots=carrier.branch_mamba_slots[variant.sel_rows_dev],
+                )
+                self._branch_fork_cache[fork_key] = fork
+        _, branch_rows = carrier.branch_sel_for(variant=variant)
+        self._chain_graph.stage_armed(rows=rows_sel, req_rows=branch_rows, fork=fork)
+        self._chain_graph.prep_replay_armed(rows=rows_sel, forked=forked)
+        seq_lens_out, positions_out, mrope_out, out_locs_out = (
+            self._chain_graph.armed_buffers(rows=rows_sel, forked=forked)
+        )
+        from sglang.srt.speculative.decoupled_fused_ops import chain_meta_fill
+
+        chain_meta_fill(
+            verdict=self._scatter_verdict,
+            base_plus_case=base_plus_case,
+            sel_rows=variant.sel_rows_dev.to(torch.int64),
+            off0=off0,
+            flats=carrier.branch_private_slots,
+            seq_lens_out=seq_lens_out,
+            positions_out=positions_out,
+            mrope_out=mrope_out,
+            out_locs_out=out_locs_out,
+            num_steps=num_steps,
+        )
+        if envs.SGLANG_DEBUG_DECOUPLED_GPU_MATCH.get() and self._prelaunch_chain_ct < 8:
+            # Diagnostic (junk/blocking runs): everything queued before the
+            # replay has executed once this sync returns; dump the static
+            # buffers' value ranges to catch the out-of-range feeder.
+            torch.cuda.synchronize()
+            sl, po, mr, ol = self._chain_graph.armed_buffers(
+                rows=rows_sel, forked=forked
+            )
+            bo = branch_out.reshape(-1)
+            logger.info(
+                "chain-armed dbg: input=[%d,%d] seq=[%d,%d] pos=[%d,%d] "
+                "out_locs=[%d,%d] flatsW=%d base=%d tail=%d",
+                int(bo.min()),
+                int(bo.max()),
+                int(sl.min()),
+                int(sl.max()),
+                int(po.min()),
+                int(po.max()),
+                int(ol.min()),
+                int(ol.max()),
+                carrier.branch_private_slots.shape[1],
+                base_len,
+                tail,
+            )
+            if fork is not None:
+                logger.info(
+                    "chain-armed dbg fork: src=[%d,%d] dst=[%d,%d] n=%d",
+                    int(fork[0].min()),
+                    int(fork[0].max()),
+                    int(fork[1].min()),
+                    int(fork[1].max()),
+                    int(fork[0].numel()),
+                )
+        tokens = self._chain_graph.fire_armed(
+            rows=rows_sel,
+            first_tokens=branch_out.reshape(-1),
+            forked=forked,
+        )
+        self._prelaunch_chain_ct += 1
+        # Keepalive: every enqueued kernel above (cat / COW / meta / replay)
+        # executes only after the gate releases -- up to the gate budget
+        # later. The committed-slots tensor this round's cat reads is
+        # REBOUND by any interleaved host round (junk-mode redo, absorb),
+        # and a garbage-collected input's memory can be reused by the
+        # prebuild stream's allocations with no fence. Holding the refs on
+        # the record pins the memory until resolution drops it.
+        # committed_ref matters most: the seat REBINDS committed_slots on
+        # any interleaved host round, and the cat above only EXECUTES after
+        # the gate -- without a live reference its freed storage can be
+        # reused (prebuild stream, no fence) before the cat reads it.
+        return tokens, (committed_ref, seat_sup, base_plus_case, off0)
 
     def _resolve_prelaunched(
         self,
@@ -1727,11 +1914,29 @@ class EnumDraftEngine:
             _arm_cm.__exit__(None, None, None)
             raise RuntimeError("prelaunch guess-tail graph refused to replay")
         # Zero-sync verdict readback for the dispatch: pinned copy + event
-        # enqueued behind the round's work; by dispatch time the event has
-        # long fired and the pinned read costs nothing.
+        # recorded BEFORE the armed chain joins the queue -- the resolve
+        # only needs the verdict, and waiting out the chain's GPU segment
+        # here put ~1.5ms back on the round-serial path (397B: 400 -> 362).
+        # The chain's out_tokens need no host wait at all: their only
+        # consumer is the pack kernel, ordered behind the replay on stream.
         self._prelaunch_verdict_pin.copy_(self._scatter_verdict, non_blocking=True)
         verdict_event = torch.cuda.Event()
         verdict_event.record()
+        # Chain pre-queueing: the whole next-round chain replay joins the
+        # gate sequence right here (still value-free -- its dlen-dependent
+        # metadata is completed on stream from the scatter's tap). An
+        # extend-only pre-launch proceeds when the chain half cannot arm.
+        chain_armed = self._pre_launch_chain_armed(
+            keys=keys,
+            state=state,
+            carrier=carrier,
+            pre=pre,
+            f_live=f_live,
+            branch_out=topk_out[1],
+        )
+        chain_tokens, chain_keepalive = (
+            chain_armed if chain_armed is not None else (None, None)
+        )
         self._prelaunched = {
             "keys": tuple(keys),
             "pre": pre,
@@ -1742,6 +1947,12 @@ class EnumDraftEngine:
             "verdict_event": verdict_event,
             "units_kernel": units_kernel,
             "base_out_len": state.committed_slots.numel() - state.prompt_len,
+            # K chain-step token tensors (bucket static buffers), or None when the
+            # chain half did not arm this round.
+            "chain_tokens": chain_tokens,
+            # Pins the armed chain's gate-deferred kernel inputs (see
+            # _pre_launch_chain_armed) until this record resolves.
+            "chain_keepalive": chain_keepalive,
             # Set when a dispatch runs while this record is outstanding: the
             # other seats' replays overwrite the extend/topk static outputs,
             # so the record's guesses can no longer be consumed (the ADVANCE
@@ -1753,7 +1964,8 @@ class EnumDraftEngine:
         if self._prelaunch_ct % 50 == 0:
             logger.info(
                 "decoupled prelaunch: enq=%d fast=%d case0=%d forced=%d "
-                "junk=%d(%s) absorb=%d why=%s gate_rel=%d gate_to=%d",
+                "junk=%d(%s) absorb=%d why=%s gate_rel=%d gate_to=%d "
+                "chain=%d(%s)",
                 self._prelaunch_ct,
                 self._prelaunch_fast_ct,
                 self._prelaunch_case0_ct,
@@ -1764,6 +1976,8 @@ class EnumDraftEngine:
                 self._prelaunch_absorb_why,
                 self._prelaunch_gate_release_ct,
                 self._prelaunch_gate_timeout_ct,
+                self._prelaunch_chain_ct,
+                self._prelaunch_chain_skip_why,
             )
             logger.info("prelaunch skips: %s", self._prelaunch_skip_why)
         return True
@@ -2695,6 +2909,11 @@ class EnumDraftEngine:
         hoist_cow: Optional[tuple[list, list]] = None
         hoist_fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         branch_guesses: Optional[torch.Tensor] = None
+        # Chain tokens the pre-launch already produced behind the gate: the
+        # whole branch phase below (plan / COW / fork / chain) is then done.
+        armed_chain: Optional[list[torch.Tensor]] = (
+            prelaunched["chain_tokens"] if prelaunched is not None else None
+        )
         if prelaunched is not None:
             # Extend + guess-tail already ran on GPU behind the commit gate;
             # their static outputs are live until the next extend replay
@@ -2800,7 +3019,7 @@ class EnumDraftEngine:
         # GPU. (Building this BEFORE the extend launch was tried and lost
         # the overlap with the extend's GPU segment: the drafter round grew
         # ~0.7ms and the 397B good window dropped ~6%.)
-        if self._enable_fused_extend and self._chain_plan:
+        if self._enable_fused_extend and self._chain_plan and armed_chain is None:
             with self.profiler.stage("branch-build"):
                 if self._paged:
                     hoist_cow = self._build_branch_head_cow(
@@ -2839,7 +3058,7 @@ class EnumDraftEngine:
                 fork=hoist_fork,
             )
 
-        if self._paged:
+        if self._paged and armed_chain is None:
             # Branch prefixes (boundary tail + delta + case backbone) now
             # exist only in the seat's partial page and the glue rows'
             # private pages -- copy each selected row's head into its own
@@ -2860,7 +3079,7 @@ class EnumDraftEngine:
                     )
 
         # -- Branch chains: K decode replays on the assembled carrier rows.
-        if self._hybrid:
+        if self._hybrid and armed_chain is None:
             # Branch case a's rows start from node-a state: the seat slot for
             # a == 0, glue row (a-1)'s slot otherwise (its re-scan ended
             # exactly at node a). One batched fork for all selected rows; the
@@ -2890,7 +3109,10 @@ class EnumDraftEngine:
                         ),
                     )
         with self.profiler.stage("branch-chain"):
-            if hoist_plan is not None:
+            if armed_chain is not None:
+                # Ran behind the gate; final by the record's verdict event.
+                chain_steps = armed_chain
+            elif hoist_plan is not None:
                 chain_steps = self._run_branch_chain(
                     hoist_plan, branch_guesses.reshape(-1)
                 )
@@ -3122,7 +3344,12 @@ class EnumDraftEngine:
             ].to(torch.int32)
             carrier.synced_len = anchor
             if bind_graph_width:
-                width = (base_lens[i] - anchor) + self._extend_graph_width
+                # + K so the binding also covers an ARMED chain's deepest
+                # write column (tail + (K+1) + K + K; see span_max) -- the
+                # armed replay has no host between steps to bind them later.
+                width = (
+                    (base_lens[i] - anchor) + self._extend_graph_width + self.num_steps
+                )
             else:
                 width = new_len - anchor + self.num_steps
             pool.req_to_token[carrier.all_rows, anchor : anchor + width] = (

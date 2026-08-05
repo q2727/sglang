@@ -483,3 +483,80 @@ def commit_scatter(
         SLOTS=2,
         W_PAD=triton.next_power_of_2(mirror.width),
     )
+
+
+@triton.jit
+def _chain_meta_kernel(
+    verdict_ptr,  # [>=4] int64 from commit_scatter: [0]=verdict, [3]=dlen
+    base_plus_case_ptr,  # [ROWS_SEL] int64 (arm-static: pre-commit base + case)
+    sel_rows_ptr,  # [ROWS_SEL] int64 (selected row -> carrier pool row)
+    off0_ptr,  # [K, ROWS_SEL] int64 (arm-static: tail + case + step)
+    flats_ptr,  # [ROWS_POOL, FLATS_W] int64 (branch rows' private flat slots)
+    seq_lens_ptr,  # [ROWS_SEL] int64 (chain bucket static)
+    positions_ptr,  # [ROWS_SEL] int64 (chain bucket static)
+    mrope_ptr,  # [3, ROWS_SEL] int64 (chain bucket static)
+    out_locs_ptr,  # [K, ROWS_SEL] int64 (chain bucket static)
+    FLATS_W: tl.constexpr,
+    K: tl.constexpr,
+    ROWS_SEL: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+):
+    """Arithmetic completion of the pre-launched chain's metadata: everything
+    per-dlen about the chain is a +dlen shift (seq/pos/mrope) or a +dlen
+    offset into the rows' private flat-slot table (out_locs), so ONE kernel
+    reading the scatter's dlen tap finishes what the arm staged. Junk verdict
+    (0) degrades to dlen=0: reads stay inside the pre-commit base, writes
+    stay inside the rows' private scratch slots -- harmless by layout."""
+    lanes = tl.arange(0, ROWS_PAD)
+    mask = lanes < ROWS_SEL
+    verdict = tl.load(verdict_ptr + 0)
+    dlen = tl.load(verdict_ptr + 3)
+    dlen = tl.where(verdict == 0, 0, dlen)
+    dlen = tl.minimum(tl.maximum(dlen, 0), K + 1)
+    base_case = tl.load(base_plus_case_ptr + lanes, mask=mask, other=0)
+    seq = base_case + dlen
+    tl.store(seq_lens_ptr + lanes, seq, mask=mask)
+    tl.store(positions_ptr + lanes, seq - 1, mask=mask)
+    for d in tl.static_range(3):
+        tl.store(mrope_ptr + d * ROWS_SEL + lanes, seq - 1, mask=mask)
+    pool_row = tl.load(sel_rows_ptr + lanes, mask=mask, other=0)
+    for s in tl.static_range(K):
+        off = tl.load(off0_ptr + s * ROWS_SEL + lanes, mask=mask, other=0) + dlen
+        off = tl.minimum(tl.maximum(off, 0), FLATS_W - 1)
+        loc = tl.load(flats_ptr + pool_row * FLATS_W + off, mask=mask, other=0)
+        tl.store(out_locs_ptr + s * ROWS_SEL + lanes, loc, mask=mask)
+
+
+def chain_meta_fill(
+    *,
+    verdict: torch.Tensor,
+    base_plus_case: torch.Tensor,
+    sel_rows: torch.Tensor,
+    off0: torch.Tensor,
+    flats: torch.Tensor,
+    seq_lens_out: torch.Tensor,
+    positions_out: torch.Tensor,
+    mrope_out: torch.Tensor,
+    out_locs_out: torch.Tensor,
+    num_steps: int,
+) -> None:
+    """Finish the armed chain's static buffers from the scatter's dlen tap
+    (see _chain_meta_kernel). Enqueue AFTER commit_scatter on the same
+    stream; every output is a chain-bucket static buffer the queued replay
+    reads."""
+    rows_sel = base_plus_case.numel()
+    _chain_meta_kernel[(1,)](
+        verdict,
+        base_plus_case,
+        sel_rows,
+        off0,
+        flats,
+        seq_lens_out,
+        positions_out,
+        mrope_out,
+        out_locs_out,
+        FLATS_W=flats.shape[1],
+        K=num_steps,
+        ROWS_SEL=rows_sel,
+        ROWS_PAD=triton.next_power_of_2(rows_sel),
+    )

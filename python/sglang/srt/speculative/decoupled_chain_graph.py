@@ -32,6 +32,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
@@ -71,6 +72,10 @@ class _ChainBucket:
         self.mrope_positions = torch.zeros(3, rows, dtype=torch.int64, device=device)
         self.out_locs = torch.zeros(num_steps, rows, dtype=torch.int64, device=device)
         self.out_tokens = torch.zeros(num_steps, rows, dtype=torch.int64, device=device)
+        # Capture-round ForwardBatch, kept after a successful capture: its
+        # tensor fields are rebound to the static buffers above, so it serves
+        # as the armed (pre-launch) path's replay-prep shell.
+        self.fb0 = None
 
 
 class ChainGraphRunner:
@@ -219,6 +224,10 @@ class ChainGraphRunner:
                                 bucket.mrope_positions += 1
             torch.cuda.current_stream().wait_stream(stream)
             bucket.graph = graph
+            # Keep the capture ForwardBatch: its tensor fields are rebound to
+            # the bucket's static buffers above, so it doubles as the armed
+            # path's replay-prep shell (prep_replay_armed) with no plan.
+            bucket.fb0 = fb0
         except Exception:
             logger.exception(
                 "chain-graph capture failed for rows=%d; falling back to the "
@@ -259,19 +268,115 @@ class ChainGraphRunner:
         if fb0.mrope_positions is not None:
             fb0.mrope_positions = bucket.mrope_positions
 
+    def prep_replay(self, *, plan_steps) -> None:
+        """Replay-prep backend metadata, split out of fire() so the
+        pre-launch path can hoist it to arm time (before the commit
+        exists). Sound for the chain's decode replays on this stack: the
+        trtllm half is a pointer swap onto the per-bs static metadata (the
+        in-graph fused rebuild re-derives the page table from the DEVICE
+        req/seq tensors at replay), and the GDN half's staging is a device
+        gather driven by the static req-rows buffer (state_indices), with
+        seq_lens_cpu feeding only padding counts (always 0 here) and the
+        replayssm ring (drafter runs without it). CAVEAT: the per-bs static
+        metadata is backend-shared -- with ONE armed chain per seat and bs1
+        this is value-equal across the arm..replay window; a multi-seat
+        arm pipeline must re-audit the clobber window."""
+        self.model_runner.attn_backend.init_forward_metadata_out_graph(
+            plan_steps[0][0], in_capture=False
+        )
+
+    def can_arm(self, rows: int, *, forked: bool = False) -> bool:
+        """True when the pre-launch path can enqueue this bucket's replay
+        with no plan: captured, and the capture's ForwardBatch shell was
+        retained for the armed replay-prep."""
+        bucket = self._buckets.get((rows, forked))
+        return (
+            bucket is not None and bucket.graph is not None and bucket.fb0 is not None
+        )
+
+    def stage_armed(
+        self,
+        *,
+        rows: int,
+        req_rows: torch.Tensor,
+        fork: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> None:
+        """Plan-free stage for the pre-launch path: refresh the dlen-free
+        static inputs (pool rows, GDN fork indices). The dlen-dependent
+        buffers (seq/pos/mrope/out_locs) are filled ON STREAM by the
+        chain-meta kernel after the gate; input_ids by fire_armed."""
+        bucket = self._buckets[(rows, fork is not None)]
+        bucket.req_rows.copy_(req_rows.to(torch.int64))
+        if fork is not None:
+            bucket.fork_src.copy_(fork[0])
+            bucket.fork_dst.copy_(fork[1])
+        # The capture round's stale CPU seq_lens must not feed the padding
+        # count in the armed replay-prep; None makes it resolve to 0 padding
+        # (correct: armed chains never pad).
+        bucket.fb0.seq_lens_cpu = None
+
+    def prep_replay_armed(self, *, rows: int, forked: bool = False) -> None:
+        """Armed replay-prep: same backend metadata staging as prep_replay,
+        driven by the retained capture shell (whose tensor fields alias the
+        bucket's static buffers)."""
+        bucket = self._buckets[(rows, forked)]
+        self.model_runner.attn_backend.init_forward_metadata_out_graph(
+            bucket.fb0, in_capture=False
+        )
+
+    def armed_buffers(
+        self, *, rows: int, forked: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The bucket's dlen-dependent static buffers (seq_lens, positions,
+        mrope_positions, out_locs) for the armed path's on-stream fill."""
+        bucket = self._buckets[(rows, forked)]
+        return (
+            bucket.seq_lens,
+            bucket.positions,
+            bucket.mrope_positions,
+            bucket.out_locs,
+        )
+
+    def bucket_outputs(self, *, rows: int, forked: bool = False) -> list[torch.Tensor]:
+        """The bucket's static chain-token outputs (one [rows] tensor per
+        step). Valid to READ once the enqueued replay is known complete
+        (the caller's verdict event covers it)."""
+        bucket = self._buckets[(rows, forked)]
+        return [bucket.out_tokens[s] for s in range(self.num_steps)]
+
+    def fire_armed(
+        self, *, rows: int, first_tokens: torch.Tensor, forked: bool = False
+    ) -> list[torch.Tensor]:
+        """Launch-only tail after stage() + prep_replay(): feed the first
+        tokens (a device-to-device copy, no host read) and replay. Safe to
+        enqueue behind a gate before the tokens' producer has run -- both
+        calls are stream-ordered."""
+        bucket = self._buckets[(rows, forked)]
+        bucket.input_ids.copy_(first_tokens.to(torch.int64))
+        # The armed chain replays UNCONDITIONALLY -- junk / miss verdicts
+        # included -- while the guess tail poisons dead cells with -1. The
+        # host paths never feed those rows to a forward; here they would hit
+        # the embedding gather (device assert). Clamp to a harmless token:
+        # poisoned rows' outputs are discarded by layout.
+        bucket.input_ids.clamp_(min=0)
+        if envs.SGLANG_DEBUG_DECOUPLED_GPU_MATCH.get():
+            torch.cuda.synchronize()
+            logger.info(
+                "fire_armed post-clamp input=[%d,%d]",
+                int(bucket.input_ids.min()),
+                int(bucket.input_ids.max()),
+            )
+        bucket.graph.replay()
+        return [bucket.out_tokens[s] for s in range(self.num_steps)]
+
     def fire(
         self, *, rows: int, plan_steps, first_tokens: torch.Tensor, forked: bool = False
     ) -> list[torch.Tensor]:
         """Hoisted-replay second half: replay-prep backend metadata, feed
-        the extend's first tokens (a device-to-device copy, no host read)
-        and replay. Only valid after stage() for the same rows this round."""
-        bucket = self._buckets[(rows, forked)]
-        self.model_runner.attn_backend.init_forward_metadata_out_graph(
-            plan_steps[0][0], in_capture=False
-        )
-        bucket.input_ids.copy_(first_tokens.to(torch.int64))
-        bucket.graph.replay()
-        return [bucket.out_tokens[s] for s in range(self.num_steps)]
+        the extend's first tokens and replay. Only valid after stage() for
+        the same rows this round."""
+        self.prep_replay(plan_steps=plan_steps)
+        return self.fire_armed(rows=rows, first_tokens=first_tokens, forked=forked)
 
     def replay(
         self, *, rows: int, plan_steps, first_tokens: torch.Tensor, fork=None

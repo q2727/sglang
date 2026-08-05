@@ -490,6 +490,14 @@ class Envs:
     # Decoupled spec: also run case-0 (miss) rounds' K-step chains through
     # the captured chain graph. Requires the chain graph itself.
     SGLANG_ENABLE_DECOUPLED_CASE0_CHAIN_GRAPH = EnvBool(True)
+    # Decoupled spec drafter: enqueue the branch-chain replay INSIDE the
+    # pre-launch gate sequence (gate -> scatter -> extend -> topk -> chain
+    # meta -> COW -> chain replay), so a landed commit runs the whole next
+    # round with no host on the path. Everything per-dlen about the chain is
+    # completed on stream by the chain-meta kernel from the scatter's dlen
+    # tap. Requires the chain graph + the draft pre-launch; junk verdicts
+    # degrade to a harmless dlen=0 replay into private scratch rows.
+    SGLANG_ENABLE_DECOUPLED_CHAIN_PRELAUNCH = EnvBool(False)
     # Decoupled spec: build the verify round's block-INDEPENDENT half (tree
     # buffers, cache-loc assignment, ForwardBatch) BEFORE the C6 gate wait, so
     # the block's arrival only pays select + one device copy + launch. At
