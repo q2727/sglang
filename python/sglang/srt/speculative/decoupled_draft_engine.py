@@ -1685,7 +1685,7 @@ class EnumDraftEngine:
             "tainted": False,
         }
         self._prelaunch_ct += 1
-        if True:
+        if self._prelaunch_ct % 50 == 0:
             logger.info(
                 "decoupled prelaunch: enq=%d fast=%d case0=%d forced=%d "
                 "junk=%d(%s) absorb=%d why=%s gate_rel=%d gate_to=%d",
