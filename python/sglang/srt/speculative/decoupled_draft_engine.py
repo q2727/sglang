@@ -1582,6 +1582,15 @@ class EnumDraftEngine:
             # BEST case for consumption -- the gate releases instantly and
             # the scatter reads a long-visible slot. Count it, don't skip.
             self._prelaunch_skip_why["landed"] += 1
+            if self._prelaunch_skip_why["landed"] <= 5:
+                logger.info(
+                    "prelaunch landed-at-arm sample: stamp=%d base_out=%d "
+                    "committed=%d slots=%d",
+                    landed_stamp,
+                    base_out_len,
+                    len(state.committed_tokens),
+                    state.committed_slots.numel(),
+                )
         if envs.SGLANG_DEBUG_DECOUPLED_PRELAUNCH_JUNK.get():
             # Validation mode: force every pre-launched round down the junk
             # lane (no segment can ever straddle this base, so nothing is
