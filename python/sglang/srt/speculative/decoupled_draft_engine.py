@@ -1839,7 +1839,11 @@ class EnumDraftEngine:
         width = self._extend_graph_width
         dev = self.device
         outs = (
-            torch.zeros(4, dtype=torch.int64, device=dev),
+            # Must match the scatter kernel's verdict write width (it also
+            # stores debug taps at [4:8]) -- a 4-wide buffer here is a
+            # 32-byte out-of-bounds write into whatever the allocator placed
+            # next (observed as nondeterministic gather asserts elsewhere).
+            torch.zeros(8, dtype=torch.int64, device=dev),
             torch.zeros(rows_w, dtype=torch.int64, device=dev),
             torch.zeros(rows_w, dtype=torch.int64, device=dev),
             torch.zeros(rows, dtype=true_stack.dtype, device=dev),
@@ -1882,7 +1886,7 @@ class EnumDraftEngine:
             or mirror.host_generation(seat) != expected_generation
         ):
             return  # a new commit landed mid-probe
-        verdict, case, f, dlen = outs[0].tolist()
+        verdict, case, f, dlen = outs[0][:4].tolist()
         want_input = torch.cat([seat_input_ids, chain])[prestaged.gather]
         want_pads = self._extend_graph_seat_pads(
             seat=0,
