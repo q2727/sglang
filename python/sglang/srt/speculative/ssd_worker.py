@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -22,8 +23,13 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.ssd_draft_client import (
     DraftCandidate,
     OutcomeCache,
+    OutcomeCacheHandle,
     OutcomeKey,
     SSDDraftClient,
+)
+from sglang.srt.speculative.ssd_official_client import (
+    OfficialOutcomeReady,
+    OfficialSSDDraftClient,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +47,7 @@ class _RequestState:
     accepted_draft_tokens: int = 0
     draft_wait_ms: float = 0.0
     target_verify_ms: float = 0.0
+    outcome_select_ms: float = 0.0
     outcome_counts: List[int] = field(default_factory=list)
     cacheable_outcome_counts: List[int] = field(default_factory=list)
     recovery_rank_counts: Dict[int, int] = field(default_factory=dict)
@@ -81,13 +88,24 @@ class SSDWorker:
         self.fan_outs = tuple(server_args.speculative_ssd_fan_outs)
         self.branch_budget = sum(self.fan_outs)
         self.request_timeout = server_args.speculative_ssd_request_timeout
+        self.official_draft_backend = OfficialSSDDraftClient.is_official_url(
+            server_args.speculative_ssd_draft_server_url
+        )
+        self.use_draft_side_cache = not self.official_draft_backend and (
+            os.environ.get("SGLANG_SSD_DRAFT_SIDE_CACHE", "1") != "0"
+        )
         if self.draft_token_num != self.draft_length + 1:
             raise ValueError(
                 "SSD requires speculative_num_draft_tokens == "
                 "speculative_num_steps + 1."
             )
 
-        self.client = SSDDraftClient(
+        client_cls = (
+            OfficialSSDDraftClient
+            if self.official_draft_backend
+            else SSDDraftClient
+        )
+        self.client = client_cls(
             server_args.speculative_ssd_draft_server_url,
             timeout=self.request_timeout,
         )
@@ -99,12 +117,14 @@ class SSDWorker:
 
         logger.info(
             "Initialized SSD worker: draft_server=%s K=%d fan_outs=%s "
-            "branch_budget=%d verify_tokens=%d",
+            "branch_budget=%d verify_tokens=%d backend=%s draft_side_cache=%s",
             server_args.speculative_ssd_draft_server_url,
             self.draft_length,
             self.fan_outs,
             self.branch_budget,
             self.draft_token_num,
+            "official" if self.official_draft_backend else "sglang-http",
+            self.use_draft_side_cache,
         )
 
     def _new_request_state(self, *, jit_drafts: int = 0) -> _RequestState:
@@ -113,6 +133,116 @@ class SSDWorker:
             outcome_counts=[0] * (self.draft_length + 1),
             cacheable_outcome_counts=[0] * (self.draft_length + 1),
         )
+
+    def _timed_jit_draft(
+        self, rid: str, prefix: List[int], kind: str
+    ) -> DraftCandidate:
+        begin = time.perf_counter()
+        success = False
+        try:
+            if self.official_draft_backend:
+                if kind == "initial":
+                    result = self.client.init_draft(
+                        rid, prefix, self.draft_length, self.fan_outs
+                    )
+                else:
+                    result = self.client.jit_draft(
+                        rid, prefix, self.draft_length, self.fan_outs
+                    )
+            else:
+                result = self.client.jit_draft(
+                    prefix, self.draft_length, self.fan_outs
+                )
+            success = True
+            return result
+        finally:
+            logger.info(
+                "SSD draft-timing request=%s kind=%s branches=1 "
+                "elapsed_ms=%.3f success=%s",
+                rid,
+                kind,
+                (time.perf_counter() - begin) * 1e3,
+                success,
+            )
+
+    def _timed_build_outcome_cache(
+        self,
+        rid: str,
+        prefix: List[int],
+        candidate: DraftCandidate,
+    ) -> Union[OutcomeCache, OutcomeCacheHandle, OfficialOutcomeReady]:
+        begin = time.perf_counter()
+        success = False
+        result: Union[
+            OutcomeCache, OutcomeCacheHandle, OfficialOutcomeReady, None
+        ] = None
+        try:
+            if self.official_draft_backend:
+                result = self.client.build_outcome_cache(
+                    rid,
+                    prefix,
+                    candidate,
+                    self.draft_length,
+                    self.fan_outs,
+                )
+            elif self.use_draft_side_cache:
+                result = self.client.prepare_outcome_cache(
+                    prefix,
+                    candidate,
+                    self.draft_length,
+                    self.fan_outs,
+                )
+            else:
+                result = self.client.build_outcome_cache(
+                    prefix,
+                    candidate,
+                    self.draft_length,
+                    self.fan_outs,
+                )
+            success = True
+            return result
+        finally:
+            elapsed_ms = (time.perf_counter() - begin) * 1e3
+            if isinstance(result, OfficialOutcomeReady):
+                logger.info(
+                    "SSD draft-timing request=%s kind=outcome_cache branches=%d "
+                    "protocol=official glue_ms=%.3f tree_ms=%.3f "
+                    "populate_ms=%.3f server_total_ms=%.3f transport_ms=%.3f "
+                    "success=%s",
+                    rid,
+                    result.branches,
+                    result.glue_ms,
+                    result.tree_ms,
+                    result.populate_ms,
+                    result.total_ms,
+                    max(0.0, elapsed_ms - result.total_ms),
+                    success,
+                )
+            elif isinstance(result, OutcomeCacheHandle):
+                logger.info(
+                    "SSD draft-timing request=%s kind=outcome_cache branches=%d "
+                    "protocol=draft_side elapsed_ms=%.3f server_prepare_ms=%.3f "
+                    "server_generate_ms=%.3f server_parse_ms=%.3f "
+                    "server_total_ms=%.3f transport_ms=%.3f success=%s",
+                    rid,
+                    self.branch_budget,
+                    elapsed_ms,
+                    result.server_prepare_ms,
+                    result.server_generate_ms,
+                    result.server_parse_ms,
+                    result.server_total_ms,
+                    max(0.0, elapsed_ms - result.server_total_ms),
+                    success,
+                )
+            else:
+                logger.info(
+                    "SSD draft-timing request=%s kind=outcome_cache branches=%d "
+                    "protocol=legacy elapsed_ms=%.3f success=%s",
+                    rid,
+                    self.branch_budget,
+                    elapsed_ms,
+                    success,
+                )
 
     def _init_verify_tensors(self) -> None:
         width = self.draft_token_num
@@ -138,6 +268,11 @@ class SSDWorker:
             if state.pending is not None:
                 state.pending.cancel()
         self.states.clear()
+        if self.official_draft_backend:
+            try:
+                self.client.reset()
+            except Exception:
+                logger.exception("Failed to reset the official SSD draft session.")
 
     @staticmethod
     def _canonical_prefix(batch: ScheduleBatch) -> List[int]:
@@ -159,19 +294,17 @@ class SSDWorker:
         self.clear_cache_pool()
         state = self._new_request_state(jit_drafts=1)
         state.pending = self.executor.submit(
-            self.client.jit_draft, prefix, self.draft_length, self.fan_outs
+            self._timed_jit_draft, req.rid, prefix, "initial"
         )
         state.pending_kind = "initial"
         self.states[req.rid] = state
 
     def _jit_draft(
-        self, prefix: List[int], state: _RequestState
+        self, rid: str, prefix: List[int], state: _RequestState
     ) -> DraftCandidate:
         state.jit_drafts += 1
         with torch.cuda.nvtx.range("ssd_jit_draft_wait"):
-            return self.client.jit_draft(
-                prefix, self.draft_length, self.fan_outs
-            )
+            return self._timed_jit_draft(rid, prefix, "jit")
 
     def _resolve_draft(
         self, rid: str, prefix: List[int], state: _RequestState
@@ -183,18 +316,23 @@ class SSDWorker:
 
         if pending is None:
             state.misses += 1
-            return self._jit_draft(prefix, state)
+            return self._jit_draft(rid, prefix, state)
 
         begin = time.perf_counter()
         try:
             with torch.cuda.nvtx.range("ssd_wait_outcome_cache"):
-                result: Union[DraftCandidate, OutcomeCache] = pending.result(
+                result: Union[
+                    DraftCandidate,
+                    OutcomeCache,
+                    OutcomeCacheHandle,
+                    OfficialOutcomeReady,
+                ] = pending.result(
                     timeout=self.request_timeout + 5.0
                 )
         except Exception:
             state.misses += 1
             logger.exception("SSD draft task failed; falling back to JIT drafting.")
-            return self._jit_draft(prefix, state)
+            return self._jit_draft(rid, prefix, state)
 
         wait_ms = (time.perf_counter() - begin) * 1e3
         if pending_kind == "initial":
@@ -204,29 +342,100 @@ class SSDWorker:
                 logger.error(
                     "SSD received an invalid initial draft; using JIT drafting."
                 )
-                return self._jit_draft(prefix, state)
+                return self._jit_draft(rid, prefix, state)
             return result
 
-        if pending_kind != "outcomes" or not isinstance(result, dict):
+        if pending_kind != "outcomes":
             state.misses += 1
             logger.error("SSD received an invalid pending result; using JIT drafting.")
-            return self._jit_draft(prefix, state)
+            return self._jit_draft(rid, prefix, state)
 
-        cached = result.get(state.outcome_key)
+        select_ms = 0.0
+        if isinstance(result, OfficialOutcomeReady):
+            if state.outcome_key is None:
+                state.misses += 1
+                logger.error("SSD has no target outcome key; using JIT drafting.")
+                return self._jit_draft(rid, prefix, state)
+            select_begin = time.perf_counter()
+            try:
+                with torch.cuda.nvtx.range("ssd_select_outcome"):
+                    cached = self.client.select_outcome(
+                        result,
+                        rid,
+                        prefix,
+                        state.outcome_key,
+                        self.draft_length,
+                        self.fan_outs,
+                    )
+            except Exception:
+                state.misses += 1
+                logger.exception(
+                    "Official SSD selection failed; falling back to JIT drafting."
+                )
+                return self._jit_draft(rid, prefix, state)
+            select_ms = (time.perf_counter() - select_begin) * 1e3
+            state.outcome_select_ms += select_ms
+            if cached.cache_hit:
+                state.hits += 1
+            else:
+                # Official hit_cache_and_respond performs JIT inside SELECT on
+                # a miss, using the same canonical paged KV state.
+                state.misses += 1
+                state.jit_drafts += 1
+            logger.debug(
+                "Official SSD outcome selection: key=%s hit=%s "
+                "wait_ms=%.3f select_ms=%.3f",
+                state.outcome_key,
+                cached.cache_hit,
+                wait_ms,
+                select_ms,
+            )
+            return cached
+        if isinstance(result, OutcomeCacheHandle):
+            if state.outcome_key is None:
+                state.misses += 1
+                logger.error("SSD has no target outcome key; using JIT drafting.")
+                return self._jit_draft(rid, prefix, state)
+            select_begin = time.perf_counter()
+            try:
+                with torch.cuda.nvtx.range("ssd_select_outcome"):
+                    cached = self.client.select_outcome(
+                        result,
+                        state.outcome_key,
+                        self.draft_length,
+                        self.fan_outs,
+                    )
+            except Exception:
+                state.misses += 1
+                logger.exception(
+                    "SSD outcome selection failed; falling back to JIT drafting."
+                )
+                return self._jit_draft(rid, prefix, state)
+            select_ms = (time.perf_counter() - select_begin) * 1e3
+            state.outcome_select_ms += select_ms
+        elif isinstance(result, dict):
+            cached = result.get(state.outcome_key)
+        else:
+            state.misses += 1
+            logger.error("SSD received an invalid outcome cache; using JIT drafting.")
+            return self._jit_draft(rid, prefix, state)
+
         if cached is None:
             state.misses += 1
             logger.debug(
-                "SSD outcome-cache miss: key=%s wait_ms=%.3f",
+                "SSD outcome-cache miss: key=%s wait_ms=%.3f select_ms=%.3f",
                 state.outcome_key,
                 wait_ms,
+                select_ms,
             )
-            return self._jit_draft(prefix, state)
+            return self._jit_draft(rid, prefix, state)
 
         state.hits += 1
         logger.debug(
-            "SSD outcome-cache hit: key=%s wait_ms=%.3f",
+            "SSD outcome-cache hit: key=%s wait_ms=%.3f select_ms=%.3f",
             state.outcome_key,
             wait_ms,
+            select_ms,
         )
         return cached
 
@@ -322,11 +531,10 @@ class SSDWorker:
         # before launching target verification on the separately partitioned
         # CUDA client.
         state.pending = self.executor.submit(
-            self.client.build_outcome_cache,
+            self._timed_build_outcome_cache,
+            req.rid,
             list(prefix),
             candidate,
-            self.draft_length,
-            self.fan_outs,
         )
         state.pending_kind = "outcomes"
 
@@ -348,11 +556,16 @@ class SSDWorker:
         accepted_length = int(verify_input.accept_length[0].item())
         state.target_verify_ms += (time.perf_counter() - target_begin) * 1e3
         recovery_token = int(req.output_ids[-1])
-        recovery_guesses = candidate.recovery_tokens[accepted_length]
-        try:
-            recovery_rank = recovery_guesses.index(recovery_token) + 1
-        except ValueError:
-            recovery_rank = 0
+        if self.official_draft_backend:
+            # Official recovery alternatives deliberately remain GPU-side;
+            # the next SELECT's cache_hit bit is the authoritative statistic.
+            recovery_rank = -1
+        else:
+            recovery_guesses = candidate.recovery_tokens[accepted_length]
+            try:
+                recovery_rank = recovery_guesses.index(recovery_token) + 1
+            except ValueError:
+                recovery_rank = 0
         state.outcome_counts[accepted_length] += 1
         if recovery_rank > 0:
             state.cacheable_outcome_counts[accepted_length] += 1
@@ -365,7 +578,8 @@ class SSDWorker:
         if req.finished() or state.rounds % 20 == 0:
             logger.info(
                 "SSD request=%s finished=%s rounds=%d hits=%d misses=%d "
-                "jit=%d accepted_draft=%d draft_wait_ms=%.3f target_verify_ms=%.3f",
+                "jit=%d accepted_draft=%d draft_wait_ms=%.3f "
+                "outcome_select_ms=%.3f target_verify_ms=%.3f",
                 req.rid,
                 req.finished(),
                 state.rounds,
@@ -374,6 +588,7 @@ class SSDWorker:
                 state.jit_drafts,
                 state.accepted_draft_tokens,
                 state.draft_wait_ms,
+                state.outcome_select_ms,
                 state.target_verify_ms,
             )
             logger.info(

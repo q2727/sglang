@@ -1137,6 +1137,28 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+
+                # A latency-oriented draft server often owns one homogeneous
+                # decode batch that must advance several autoregressive steps
+                # before any caller can use its result.  Keep that batch in
+                # this scheduler turn instead of re-entering recv/admission
+                # and batch selection for every token.  This restores the
+                # behavior exposed by --num-continuous-decode-steps, whose CLI
+                # option remained after the old loop implementation vanished.
+                if batch.forward_mode.is_decode():
+                    for _ in range(
+                        self.server_args.num_continuous_decode_steps - 1
+                    ):
+                        if self.running_batch.is_empty():
+                            break
+                        batch = self.update_running_batch(self.running_batch)
+                        self.running_batch = batch
+                        if batch is None or batch.is_empty():
+                            break
+                        self.cur_batch = batch
+                        set_schedule_time_batch(batch)
+                        result = self.run_batch(batch)
+                        self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()

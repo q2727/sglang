@@ -392,8 +392,10 @@ app.add_middleware(
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+from sglang.srt.speculative.ssd_server import register_ssd_routes
 
 app.include_router(v1_loads_router)
+register_ssd_routes(app, lambda: _global_state.tokenizer_manager)
 
 
 @app.exception_handler(HTTPException)
