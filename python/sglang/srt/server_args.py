@@ -652,6 +652,12 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
 
+    # Speculative decoding (Saguaro / SSD with an external draft server)
+    speculative_ssd_draft_server_url: Optional[str] = None
+    speculative_ssd_fan_out: int = 1
+    speculative_ssd_fan_outs: Optional[List[int]] = None
+    speculative_ssd_request_timeout: float = 600.0
+
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -1264,7 +1270,7 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
+                elif self.speculative_algorithm not in ("NGRAM", "SSD"):
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
@@ -2960,6 +2966,76 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "SSD":
+            if not self.device.startswith("cuda"):
+                raise ValueError("SSD speculative decoding only supports CUDA device.")
+            if not self.speculative_ssd_draft_server_url:
+                raise ValueError(
+                    "--speculative-ssd-draft-server-url is required for SSD."
+                )
+            if self.speculative_ssd_fan_out < 1:
+                raise ValueError("--speculative-ssd-fan-out must be at least 1.")
+            if self.speculative_ssd_request_timeout <= 0:
+                raise ValueError(
+                    "--speculative-ssd-request-timeout must be positive."
+                )
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "SSD speculative decoding does not support DP attention yet."
+                )
+
+            if self.max_running_requests is None:
+                # KTransformers reserves one request-pool slot internally, so
+                # two slots are the minimum even though SSD admits one active
+                # request in this initial implementation.
+                self.max_running_requests = 2
+            elif self.max_running_requests < 2:
+                raise ValueError(
+                    "SSD on KTransformers requires --max-running-requests >= 2."
+                )
+
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 8
+            if self.speculative_ssd_fan_outs is None:
+                self.speculative_ssd_fan_outs = [
+                    self.speculative_ssd_fan_out
+                ] * (self.speculative_num_steps + 1)
+            elif len(self.speculative_ssd_fan_outs) != self.speculative_num_steps + 1:
+                raise ValueError(
+                    "--speculative-ssd-fan-outs must contain exactly "
+                    f"K+1={self.speculative_num_steps + 1} integers."
+                )
+            elif any(value < 0 for value in self.speculative_ssd_fan_outs):
+                raise ValueError(
+                    "--speculative-ssd-fan-outs values must be non-negative."
+                )
+            elif sum(self.speculative_ssd_fan_outs) == 0:
+                raise ValueError(
+                    "--speculative-ssd-fan-outs must contain at least one branch."
+                )
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "The SSD target verification tree is linear; "
+                    "--speculative-eagle-topk must be 1."
+                )
+            if self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
+                raise ValueError(
+                    "SSD requires --speculative-num-draft-tokens to equal "
+                    "--speculative-num-steps + 1."
+                )
+
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            logger.warning(
+                "The built-in overlap scheduler and mixed chunked prefill are disabled "
+                "for SSD; target/draft overlap is provided by the external "
+                "draft process."
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -4409,7 +4485,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SSD"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4504,6 +4580,40 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+
+        # Speculative decoding (Saguaro / SSD)
+        parser.add_argument(
+            "--speculative-ssd-draft-server-url",
+            type=str,
+            default=ServerArgs.speculative_ssd_draft_server_url,
+            help="Base URL of the independent SGLang draft-model server used by SSD.",
+        )
+        parser.add_argument(
+            "--speculative-ssd-fan-out",
+            type=int,
+            default=ServerArgs.speculative_ssd_fan_out,
+            help=(
+                "Number of alternate recovery tokens precomputed at each SSD "
+                "endpoint."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ssd-fan-outs",
+            type=int,
+            nargs="+",
+            default=ServerArgs.speculative_ssd_fan_outs,
+            help=(
+                "Per-endpoint SSD recovery fan-outs F_0 ... F_K. This overrides "
+                "the uniform --speculative-ssd-fan-out value; zero disables an "
+                "endpoint while preserving a fixed total branch budget."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-ssd-request-timeout",
+            type=float,
+            default=ServerArgs.speculative_ssd_request_timeout,
+            help="Timeout in seconds for one request to the SSD draft server.",
         )
 
         # Speculative decoding (ngram)
