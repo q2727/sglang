@@ -430,6 +430,15 @@ class DraftControlInbox:
             self.add_close_key_locked(message.draft_key)
         for message in batch.sync_messages:
             if message.draft_key not in self.close_keys:
+                # A sync re-roots the request at its snapshot. The wire is
+                # FIFO, so any pending commit segment holds only commits
+                # SENT BEFORE this sync -- all of whose tokens are already
+                # inside the snapshot's committed_outputs (a desync re-seed
+                # additionally re-bases the first post-sync commit at the
+                # snapshot edge). Keeping the stale segment would splice
+                # post-sync commits onto a pre-snapshot base and trip the
+                # contiguity guard; dropping it is exact deduplication.
+                self.verifier_commit_segments.pop(message.draft_key, None)
                 self.sync_messages.append(message)
         for message in batch.verify_commit_messages:
             self.add_verify_commit_locked(message)

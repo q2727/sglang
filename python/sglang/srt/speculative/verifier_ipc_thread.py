@@ -301,10 +301,23 @@ class VerifierIpcThread:
             self._sent_committed_lens[rid] = pre_len + len(tokens)
             floor = self._resync_floors.get(rid)
             if floor is not None:
-                if pre_len < floor:
+                if pre_len + len(tokens) <= floor:
                     # This round predates the desync re-seed: its tokens are
-                    # already inside the snapshot's committed_outputs.
+                    # all inside the snapshot's committed_outputs. (The
+                    # ledger advance above already moved the cursor, so
+                    # later bases stay right.)
                     continue
+                if pre_len < floor:
+                    # The round STRADDLES the snapshot edge: its head is in
+                    # the snapshot, its tail is NEW. Send exactly the tail
+                    # (the wire complement of the snapshot) -- skipping the
+                    # whole round loses the tail forever, leaving the
+                    # drafter one permanent gap behind: every later commit
+                    # then drops as misaligned and the seat never recovers
+                    # (each 5s re-seed just re-rolls whether the next
+                    # snapshot lands on a round boundary).
+                    tokens = tokens[floor - pre_len :]
+                    pre_len = floor
                 self._resync_floors.pop(rid, None)
             if any(token < 0 for token in tokens):
                 # A negative id is the verify output's not-accepted padding:
