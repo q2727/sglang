@@ -274,11 +274,15 @@ class DecoupledDraftManager:
         if latest != new_len or len(segment.round_lens) != 1:
             return  # merged/lagged segment: the mirror holds a newer commit
         torch.cuda.synchronize()
-        got_len = int(self.commit_mirror.new_committed_lens[seat].item())
-        got_delta = int(self.commit_mirror.delta_lens[seat].item())
-        got_tokens = self.commit_mirror.tokens[seat, :got_delta].tolist()
+        mirror = self.commit_mirror
+        gen = mirror.host_generation(seat)
+        row = mirror.rows[seat, gen % 2].tolist()
+        seq0, got_pre, got_delta = row[0], row[1], row[2]
+        seq1 = row[mirror.row_words - 1]
+        got_tokens = row[3 : 3 + got_delta]
+        got_len = got_pre + got_delta
         want = [int(t) for t in segment.committed_tokens]
-        ok = got_len == new_len and got_tokens == want
+        ok = seq0 == seq1 == gen and got_len == new_len and got_tokens == want
         self._mirror_probe_ct += 1
         if not ok or self._mirror_probe_ct <= 3 or self._mirror_probe_ct % 200 == 0:
             log = logger.info if ok else logger.error
@@ -305,12 +309,6 @@ class DecoupledDraftManager:
                 for c in commits
             ],
         )
-        if self.commit_mirror is not None:
-            for c in commits:
-                seat = int(c.req_pool_idx)
-                self.commit_arrival_board.record_generation(
-                    seat, self.commit_mirror.host_generation(seat)
-                )
 
     def run_loop(self, *, control_plane: DrafterControlPlane) -> None:
         """The drafter scheduler's event loop (never returns)."""
@@ -431,7 +429,6 @@ class DecoupledDraftManager:
             for segment in ready.ready_commit_segments:
                 if not self.engine.has(segment.draft_key):
                     continue
-                self.engine.note_commit_seen(segment.draft_key)
                 if not self.engine.commit_base_aligned(
                     segment.draft_key, int(segment.pre_verify_committed_len)
                 ):

@@ -318,12 +318,6 @@ class _DraftReqState:
         # engine's own scratch rows are unrelated and transient.
         self.req_pool_idx = req_pool_idx
         self.committed_tokens: list[int] = []
-        # Count of landed commits this HOST has processed (dispatch order).
-        # The pre-launch arms against THIS +1 -- never against the mirror's
-        # live landing counter, which runs ahead whenever a commit lands
-        # mid-round and would make the kernel judge a different commit than
-        # the host's next dispatch (the one-generation phase split).
-        self.applied_commit_ct = 0
         # Prompt prefix length inside committed_tokens: VerifyCommit bases
         # (pre_verify_committed_len) index OUTPUT tokens only, so alignment
         # checks compare against len(committed_tokens) - prompt_len.
@@ -1027,7 +1021,7 @@ class EnumDraftEngine:
             except Exception:
                 logger.exception("drafter stream gate unavailable; prelaunch off")
                 self._prelaunch_enabled = False
-        # Outstanding pre-launch: (keys tuple, expected_generation, prebuilt,
+        # Outstanding pre-launch: (keys tuple, prebuilt,
         # node_logits_ready marker). Consumed or discarded by the next
         # draft_round dispatch.
         self._prelaunched: Optional[dict] = None
@@ -1042,6 +1036,16 @@ class EnumDraftEngine:
         self._prelaunch_gate_release_ct = 0
         self._prelaunch_gate_timeout_ct = 0
         self._prelaunch_forced_logged = 0
+        self._align_drop_logged = 0
+        self._prelaunch_skip_why = {
+            "off": 0,
+            "outstanding": 0,
+            "shape": 0,
+            "state": 0,
+            "warm": 0,
+            "landed": 0,
+            "gate": 0,
+        }
         # Scatter-consume scratch: verdict sink (never host-read on the hot
         # path) and the chains buffer the topk stage reuses.
         self._scatter_verdict = torch.zeros(10, dtype=torch.int64, device=self.device)
@@ -1258,23 +1262,12 @@ class EnumDraftEngine:
         req_pool_idx: int,
         prompt_tokens: list[int],
         committed_outputs: list[int],
-        applied_commit_base: int = -1,
     ) -> None:
         # Re-open (retraction re-sync) drops the old prefix KV entirely.
         self.close(key)
         state = _DraftReqState(req_pool_idx=req_pool_idx, device=self.device)
         state.committed_tokens = list(prompt_tokens) + list(committed_outputs)
         state.prompt_len = len(prompt_tokens)
-        if self._commit_mirror is not None:
-            # Arrival-order base: the IPC thread stamps every sync with the
-            # seat's landing generation AT ITS STREAM POSITION -- reading the
-            # mirror's live counter here instead races in-flight landings and
-            # skews the processed count by one forever.
-            state.applied_commit_ct = (
-                applied_commit_base
-                if applied_commit_base >= 0
-                else self._commit_mirror.host_generation(req_pool_idx)
-            )
         if self._hybrid:
             # The seat slot must start ZEROED: the GDN extend kernel reads the
             # slot's ssm state as the initial state unconditionally, and an
@@ -1283,13 +1276,6 @@ class EnumDraftEngine:
             pool = self.model_runner.req_to_token_pool
             pool.mamba_pool.clear_slots(pool.translate_mamba_indices(state.mamba_slot))
         self._states[key] = state
-
-    def note_commit_seen(self, key: DraftReqKey) -> None:
-        """One landed commit entered this host's dispatch (applied, merged,
-        or dropped as misaligned) -- advance the seat's processed count."""
-        state = self._states.get(key)
-        if state is not None:
-            state.applied_commit_ct += 1
 
     def attach_commit_mirror(self, mirror, board) -> None:
         self._commit_mirror = mirror
@@ -1314,7 +1300,7 @@ class EnumDraftEngine:
             latest = board._stamps.get(seat)
         if latest is None or latest + state.prompt_len != len(state.committed_tokens):
             return  # mirror holds a newer/older commit than this round's delta
-        expected_generation = self._commit_mirror.host_generation(seat)
+        probe_generation = self._commit_mirror.host_generation(seat)
         from sglang.srt.speculative.decoupled_fused_ops import commit_match
 
         # Cross-stream order: the landing copies ride the mirror's own
@@ -1326,7 +1312,6 @@ class EnumDraftEngine:
         out = commit_match(
             mirror=mirror,
             seat=seat,
-            expected_generation=expected_generation,
             units_dev=state.last_units_dev.contiguous(),
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
@@ -1336,10 +1321,7 @@ class EnumDraftEngine:
         ).tolist()
         with board._cond:
             latest_after = board._stamps.get(seat)
-        if (
-            latest_after != latest
-            or mirror.host_generation(seat) != expected_generation
-        ):
+        if latest_after != latest or mirror.host_generation(seat) != probe_generation:
             return  # a new commit landed mid-probe: sample invalid, skip
         verdict, case, f, new_len = out
         if verdict == 3:
@@ -1394,16 +1376,17 @@ class EnumDraftEngine:
         """Decide the outstanding pre-launch's fate for THIS dispatch.
 
         The one invariant everything below serves: once the gated scatter
-        consumed a landing (verdict 1/2), the extend REALLY advanced the
+        consumed a segment (verdict 1/2), the extend REALLY advanced the
         seat's KV + recurrent state -- it must be absorbed exactly once and
-        never redone by a host round. Only verdict 0 (the gate lost the
-        race / timed out: zero-length scan, zeroed inputs, masked pads)
-        leaves the seat untouched and is safe to scrap outright.
+        never redone by a host round. Verdict 0 (no slot straddled the
+        armed base: nothing landed in time, an old/re-sent/later segment,
+        or a torn snapshot) ran the zero-scan junk lane and is safe to
+        scrap outright.
 
         Returns (action, record): "keep" leaves the record armed (this
         dispatch carries no commit for its seat); "scrapped" freed a junk
-        or orphaned round; "absorbed" folded a burst's first-commit advance
-        into committed_slots (host round extends by the remainder);
+        or orphaned round; "absorbed" folded the consumed segment's advance
+        into committed_slots (the host round extends by the remainder);
         "fast" / "case0" hand the record to the matching round; and
         "forced_case0" asks the caller to run the record's seat as its own
         single-seat case-0 round (partition mismatch or host/kernel
@@ -1412,17 +1395,15 @@ class EnumDraftEngine:
         """
         rec = self._prelaunched
         assert rec is not None
-        mirror = self._commit_mirror
+        mirror, board = self._commit_mirror, self._commit_board
         rec_key = rec["keys"][0]
         state = self._states.get(rec_key)
-        if state is None or mirror is None:
+        if state is None or mirror is None or board is None:
             # Seat closed under the gate. Stream order keeps this safe: the
             # gated round's writes were enqueued before any reuse of its
             # slots can be, and a late REAL landing only advances a dead
             # arena row.
             self._prelaunched = None
-            if mirror is not None:
-                mirror.clear_scatter_fence()
             self._scrap_prebuilt_into(
                 rec["pre"], scratch_batches, scratch_slots, scratch_kv_pages
             )
@@ -1430,9 +1411,9 @@ class EnumDraftEngine:
             self._prelaunch_junk_why["closed"] += 1
             return "scrapped", None
         seat = int(state.req_pool_idx)
-        generation = mirror.host_generation(seat)
-        expected = rec["expected_generation"]
-        if generation < expected:
+        with board._cond:
+            landed_stamp = board._stamps.get(seat, 0)
+        if landed_stamp <= rec["base_out_len"]:
             # No commit has landed for this seat (this dispatch is for other
             # keys); the gate is still armed and may yet consume one. But the
             # rounds this dispatch is about to run replay the same graphs,
@@ -1440,21 +1421,10 @@ class EnumDraftEngine:
             rec["tainted"] = True
             return "keep", None
         self._prelaunched = None
-        if generation > expected:
-            # Catch-up merge folded several landed commits into one host
-            # segment (the note hook counts segments, not commits): re-align
-            # the processed count so the next arm doesn't chase a landing
-            # whose mirror row is long overwritten.
-            state.applied_commit_ct = max(state.applied_commit_ct, generation)
-        # Bounded: a landing matched, so the gate released and the round is
-        # executing (or long done); this waits out kernel-tail microseconds.
-        # The scatter fence stays armed until AFTER this sync -- clearing it
-        # first opens a window where the next landing overwrites the mirror
-        # row while the scatter is still reading it (observed as torn
-        # (generation, delta_len) pairs: kernel and host each seeing the
-        # other commit's length).
+        # Bounded: a commit landed for this seat, so the gate released and
+        # the gated round is executing (or long done); this waits out the
+        # kernel-tail microseconds before the pinned verdict read.
         rec["verdict_event"].synchronize()
-        mirror.clear_scatter_fence()
         verdict = int(self._prelaunch_verdict_pin[0].item())
         kernel_case = int(self._prelaunch_verdict_pin[1].item())
         kernel_f = int(self._prelaunch_verdict_pin[2].item())
@@ -1472,8 +1442,7 @@ class EnumDraftEngine:
             return "scrapped", None
         host_delta_len = len(state.committed_tokens) - state.committed_slots.numel()
         if (
-            generation > expected
-            or host_delta_len != kernel_delta_len
+            host_delta_len != kernel_delta_len
             or host_delta_len == 0
             or rec["tainted"]
             or rec_key not in self._seat_carriers
@@ -1482,18 +1451,15 @@ class EnumDraftEngine:
                 self._prelaunch_absorb_why["empty"] = (
                     self._prelaunch_absorb_why.get("empty", 0) + 1
                 )
-            elif generation > expected:
-                self._prelaunch_absorb_why["burst"] += 1
             elif rec["tainted"]:
                 self._prelaunch_absorb_why["taint"] += 1
             elif rec_key not in self._seat_carriers:
                 self._prelaunch_absorb_why["carrier"] += 1
             else:
                 self._prelaunch_absorb_why["dlen"] += 1
-            # Burst: 2+ commits merged into this dispatch, and the scatter
-            # consumed exactly the FIRST (the landing fence kept later
-            # landings from tearing its reads). Absorb that advance; the
-            # host round then extends by the remainder.
+            # Burst / partial: the host merged more commits than the kernel
+            # consumed (its segment covered only the first). Absorb that
+            # advance; the host round then extends by the remainder.
             if host_delta_len < kernel_delta_len:
                 logger.error(
                     "prelaunch absorb inconsistency: host delta %d < kernel %d",
@@ -1556,7 +1522,10 @@ class EnumDraftEngine:
         Call at round tail AFTER prebuild_fast_round. Returns False when any
         precondition fails (no prebuilt skeleton, cold graphs, non-bs1...);
         nothing is enqueued in that case."""
-        if not self._prelaunch_enabled or self._prelaunched is not None:
+        if not self._prelaunch_enabled:
+            return False
+        if self._prelaunched is not None:
+            self._prelaunch_skip_why["outstanding"] += 1
             return False
         pre = self._prebuilt_fast
         mirror, board = self._commit_mirror, self._commit_board
@@ -1570,6 +1539,7 @@ class EnumDraftEngine:
             or pre.replay_fb is None
             or not self._paged
         ):
+            self._prelaunch_skip_why["shape"] += 1
             return False
         state = self._states.get(keys[0])
         if (
@@ -1577,6 +1547,7 @@ class EnumDraftEngine:
             or state.last_units_dev is None
             or state.last_backbone_dev is None
         ):
+            self._prelaunch_skip_why["state"] += 1
             return False
         f_live = max(1, min(int(self.effective_fanout), self.fanout))
         variant = self._fanout_variant(f_live)
@@ -1589,29 +1560,25 @@ class EnumDraftEngine:
             variant.guess_dead_mask is not None,
         )
         if not self._fused_topk or topk_key not in self._topk_graphs:
+            self._prelaunch_skip_why["warm"] += 1
             return False  # guess-tail graph not warm yet
         rows = self.num_steps + 1
         seat = int(state.req_pool_idx)
-        expected_generation = state.applied_commit_ct + 1
-        if mirror.host_generation(seat) >= expected_generation:
-            # The commit this pre-launch would consume ALREADY landed (it is
-            # sitting in the inbox waiting for the next dispatch): arming now
-            # would snapshot a stale base -- the host round that consumes it
-            # is about to run anyway, so pre-launching buys nothing.
-            return False
+        base_out_len = state.committed_slots.numel() - state.prompt_len
+        with board._cond:
+            landed_stamp = board._stamps.get(seat, 0)
+        if landed_stamp > base_out_len:
+            # The commit already landed (s1's verifier outruns the idle
+            # tick): with the self-consistent slot judgement this is the
+            # BEST case for consumption -- the gate releases instantly and
+            # the scatter reads a long-visible slot. Count it, don't skip.
+            self._prelaunch_skip_why["landed"] += 1
         if envs.SGLANG_DEBUG_DECOUPLED_PRELAUNCH_JUNK.get():
-            # Validation mode: force every pre-launched round down the stale
-            # junk lane (never consumes, never advances state); the host
-            # round redoes everything, so correctness must be unchanged.
-            expected_generation += 1_000_000
-        # The gate waits on the LANDING GENERATION, never on stamps: the
-        # generation is the same counter the gated scatter compares on the
-        # mirror, sampled ONCE here for both. (Stamp-based gating had an
-        # unclosable window -- a commit arriving between the loop's apply
-        # and this enqueue satisfied the stamp immediately while the kernel
-        # waited for the generation AFTER it, junking the round; observed as
-        # 198/200 stale under fallback-dense traffic, then as 100% gate
-        # timeouts when the stamp base was misread as absolute.)
+            # Validation mode: force every pre-launched round down the junk
+            # lane (no segment can ever straddle this base, so nothing is
+            # consumed and no state advances); the host round redoes
+            # everything, so correctness must be unchanged.
+            base_out_len += 1_000_000
         carrier = self._seat_carriers[keys[0]]
         # Take ownership of the skeleton (the host round must not consume it).
         self._prebuilt_fast = None
@@ -1628,14 +1595,17 @@ class EnumDraftEngine:
         gate = self._prelaunch_gate
         budget_s = 0.1
 
-        def gate_fn(seat=seat, generation=expected_generation, budget=budget_s):
-            if board.wait_for_generation(seat, generation, budget):
+        def gate_fn(seat=seat, stamp=base_out_len + 1, budget=budget_s):
+            # Pure wakeup, GEQ: the kernel's own slot-vs-base arithmetic is
+            # the sole consumption judge, so releasing early/late is safe.
+            if board.wait_for({seat: stamp}, budget):
                 self._prelaunch_gate_release_ct += 1
             else:
                 self._prelaunch_gate_timeout_ct += 1
 
         if not gate.enqueue(torch.cuda.current_stream(), gate_fn):
             # Driver refused the node; hand the skeleton back untouched.
+            self._prelaunch_skip_why["gate"] += 1
             self._prebuilt_fast = pre
             return False
         from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
@@ -1646,11 +1616,10 @@ class EnumDraftEngine:
         commit_scatter(
             mirror=mirror,
             seat=seat,
-            expected_generation=expected_generation,
             units_dev=units_kernel,
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
-            base_out_len=state.committed_slots.numel() - state.prompt_len,
+            base_out_len=base_out_len,
             gather_stack=gather_stack,
             out_loc_stack=out_loc_stack,
             true_stack=true_stack,
@@ -1673,11 +1642,6 @@ class EnumDraftEngine:
                 self._scatter_node,
                 self._scatter_chains,
             ),
-        )
-        scatter_done = torch.cuda.Event()
-        scatter_done.record()
-        mirror.set_scatter_fence(
-            seat=seat, after_generation=expected_generation, event=scatter_done
         )
         fused_logits = self._extend_graph_execute(
             forward_batch=fb,
@@ -1706,7 +1670,6 @@ class EnumDraftEngine:
         verdict_event.record()
         self._prelaunched = {
             "keys": tuple(keys),
-            "expected_generation": expected_generation,
             "pre": pre,
             "f_live": f_live,
             "guesses_out": topk_out[0],
@@ -1722,7 +1685,7 @@ class EnumDraftEngine:
             "tainted": False,
         }
         self._prelaunch_ct += 1
-        if self._prelaunch_ct % 50 == 0:
+        if True:
             logger.info(
                 "decoupled prelaunch: enq=%d fast=%d case0=%d forced=%d "
                 "junk=%d(%s) absorb=%d why=%s gate_rel=%d gate_to=%d",
@@ -1737,6 +1700,7 @@ class EnumDraftEngine:
                 self._prelaunch_gate_release_ct,
                 self._prelaunch_gate_timeout_ct,
             )
+            logger.info("prelaunch skips: %s", self._prelaunch_skip_why)
         return True
 
     def _scatter_consume_commit(
@@ -1777,7 +1741,6 @@ class EnumDraftEngine:
         commit_scatter(
             mirror=mirror,
             seat=seat,
-            expected_generation=mirror.host_generation(seat),
             units_dev=state.last_units_dev.contiguous(),
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
@@ -1830,7 +1793,7 @@ class EnumDraftEngine:
             latest = board._stamps.get(seat)
         if latest is None or latest + state.prompt_len != len(state.committed_tokens):
             return
-        expected_generation = mirror.host_generation(seat)
+        probe_generation2 = mirror.host_generation(seat)
         from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
 
         gather_stack, out_loc_stack, true_stack, node_stack = prebuilt.scatter_stacks
@@ -1855,7 +1818,6 @@ class EnumDraftEngine:
         commit_scatter(
             mirror=mirror,
             seat=seat,
-            expected_generation=expected_generation,
             units_dev=state.last_units_dev.contiguous(),
             backbone_dev=state.last_backbone_dev,
             backbone_len=state.last_backbone_len,
@@ -1881,10 +1843,7 @@ class EnumDraftEngine:
         torch.cuda.synchronize()
         with board._cond:
             latest_after = board._stamps.get(seat)
-        if (
-            latest_after != latest
-            or mirror.host_generation(seat) != expected_generation
-        ):
+        if latest_after != latest or mirror.host_generation(seat) != probe_generation2:
             return  # a new commit landed mid-probe
         verdict, case, f, dlen = outs[0][:4].tolist()
         want_input = torch.cat([seat_input_ids, chain])[prestaged.gather]
@@ -1954,7 +1913,19 @@ class EnumDraftEngine:
         if state is None:
             return False
         true_len = len(state.committed_tokens) - state.prerun_len
-        return true_len == state.prompt_len + int(pre_verify_committed_len)
+        aligned = true_len == state.prompt_len + int(pre_verify_committed_len)
+        if not aligned and self._align_drop_logged < 8:
+            self._align_drop_logged += 1
+            logger.warning(
+                "commit base misaligned detail: rid=%s base=%d drafter_out=%d "
+                "slots_out=%d prerun=%d",
+                key.request_id,
+                int(pre_verify_committed_len),
+                true_len - state.prompt_len,
+                state.committed_slots.numel() - state.prompt_len,
+                state.prerun_len,
+            )
+        return aligned
 
     def apply_commit(self, key: DraftReqKey, committed_tokens: list[int]) -> bool:
         """Apply a real commit; returns True when an active top-1 prerun bet
@@ -4676,8 +4647,6 @@ class EnumDraftEngine:
             # Stream-fenced at enqueue; a late REAL landing only advances a
             # dead arena row before any reuse's writes (same-stream order).
             self._prelaunched = None
-            if self._commit_mirror is not None:
-                self._commit_mirror.clear_scatter_fence()
             rec_pre = rec["pre"]
             tracked: list = []
             self._track_scratch_slots(
