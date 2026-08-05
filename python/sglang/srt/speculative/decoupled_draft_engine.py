@@ -957,6 +957,13 @@ class EnumDraftEngine:
             enabled=envs.SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE.get()
         )
         self._h2d = _PinnedH2D(device=self.device)
+        # Dedicated staging ring for the prep path (restage + pre-launch
+        # arm). Sharing the main ring couples the two paths' slot-reuse
+        # clocks: prep would land on a slot whose event sits BEHIND the
+        # round's still-queued forward work and eat a ~0.7ms per-round
+        # cudaEventSynchronize waiting for it (profiled). Prep's own ring
+        # cycles ~8 rounds per slot, so its events are long fired.
+        self._prep_h2d = _PinnedH2D(device=self.device)
         self._pending_scratch_frees: list[torch.Tensor] = []
         self._fused_topk = envs.SGLANG_ENABLE_DECOUPLED_FUSED_TOPK.get()
         self._prep_ahead = envs.SGLANG_ENABLE_DECOUPLED_PREP_AHEAD.get()
@@ -1598,18 +1605,55 @@ class EnumDraftEngine:
             # everything, so correctness must be unchanged.
             base_out_len += 1_000_000
         carrier = self._seat_carriers[keys[0]]
+        prev_h2d = self._h2d
+        self._h2d = self._prep_h2d
+        try:
+            return self._pre_launch_extend_armed(
+                keys=keys,
+                pre=pre,
+                mirror=mirror,
+                board=board,
+                state=state,
+                carrier=carrier,
+                f_live=f_live,
+                topk_key=topk_key,
+                rows=rows,
+                seat=seat,
+                base_out_len=base_out_len,
+            )
+        finally:
+            self._h2d = prev_h2d
+
+    def _pre_launch_extend_armed(
+        self,
+        *,
+        keys: list[DraftReqKey],
+        pre,
+        mirror,
+        board,
+        state,
+        carrier,
+        f_live: int,
+        topk_key,
+        rows: int,
+        seat: int,
+        base_out_len: int,
+    ) -> bool:
         # Take ownership of the skeleton (the host round must not consume it).
         self._prebuilt_fast = None
         self._fence_prebuilt(pre)
         self._record_prebuilt_streams(pre)
         # Carrier-row private rebind: value-independent of the commit (the
         # whole hypothesized window), so it runs at enqueue time.
-        self._sync_carrier_rows_paged(
-            states=[state],
-            carriers=[carrier],
-            base_lens=list(pre.base_lens),
-            bind_graph_width=True,
-        )
+        with self.profiler.stage("arm_rebind"):
+            self._sync_carrier_rows_paged(
+                states=[state],
+                carriers=[carrier],
+                base_lens=list(pre.base_lens),
+                bind_graph_width=True,
+            )
+        _arm_cm = self.profiler.stage("arm_enqueue")
+        _arm_cm.__enter__()
         gate = self._prelaunch_gate
         budget_s = 0.1
 
@@ -1625,6 +1669,7 @@ class EnumDraftEngine:
             # Driver refused the node; hand the skeleton back untouched.
             self._prelaunch_skip_why["gate"] += 1
             self._prebuilt_fast = pre
+            _arm_cm.__exit__(None, None, None)
             return False
         from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
 
@@ -1679,6 +1724,7 @@ class EnumDraftEngine:
             # Unreachable by the warm-graph guard above; the scatter/extend
             # are already queued (a REAL advance if the commit lands), so
             # continuing without a record would double-advance the seat.
+            _arm_cm.__exit__(None, None, None)
             raise RuntimeError("prelaunch guess-tail graph refused to replay")
         # Zero-sync verdict readback for the dispatch: pinned copy + event
         # enqueued behind the round's work; by dispatch time the event has
@@ -1702,6 +1748,7 @@ class EnumDraftEngine:
             # is still real -- resolution then absorbs instead).
             "tainted": False,
         }
+        _arm_cm.__exit__(None, None, None)
         self._prelaunch_ct += 1
         if self._prelaunch_ct % 50 == 0:
             logger.info(
@@ -4426,6 +4473,14 @@ class EnumDraftEngine:
             self._prebuild_fast_round(keys)
 
     def _prebuild_fast_round(self, keys: list[DraftReqKey]) -> None:
+        prev_h2d = self._h2d
+        self._h2d = self._prep_h2d
+        try:
+            self._prebuild_fast_round_inner(keys)
+        finally:
+            self._h2d = prev_h2d
+
+    def _prebuild_fast_round_inner(self, keys: list[DraftReqKey]) -> None:
         states = [self._states[k] for k in keys]
         bs = len(states)
         width = self.num_steps + 1
@@ -4440,6 +4495,8 @@ class EnumDraftEngine:
         stream_cm = torch.cuda.stream(self._prebuild_stream)
         stream_cm.__enter__()
         try:
+            _stage_cm = self.profiler.stage("restage_alloc")
+            _stage_cm.__enter__()
             graph_round = self._stage_extend_graph_round(
                 bs=bs,
                 delta_lens=[width] * bs,
@@ -4463,11 +4520,14 @@ class EnumDraftEngine:
             logger.exception("decoupled prep-ahead build failed; falling back inline")
             self._scrap_lists(pre_batches, pre_slots, pre_pages)
             return
+        finally:
+            _stage_cm.__exit__(None, None, None)
         carriers = [self._seat_carriers[k] for k in keys]
         if self._paged:
-            self._cow_carrier_glue_heads(
-                states=states, carriers=carriers, base_lens=base_lens
-            )
+            with self.profiler.stage("restage_glue"):
+                self._cow_carrier_glue_heads(
+                    states=states, carriers=carriers, base_lens=base_lens
+                )
         if self._hybrid:
             self._fork_mamba_states(
                 src_slots=torch.cat(
@@ -4476,6 +4536,8 @@ class EnumDraftEngine:
                 dst_slots=torch.cat([carrier.glue_mamba_slots for carrier in carriers]),
             )
         case_staging = None
+        _cs_cm = self.profiler.stage("restage_case_staging")
+        _cs_cm.__enter__()
         if bs == 1:
             # The gather / true-lens / node-gather tensors are ROUND-INVARIANT
             # (pure functions of delta_len and the static graph shape): built
@@ -4521,6 +4583,7 @@ class EnumDraftEngine:
                         node_offsets=node_off,
                     )
                 )
+        _cs_cm.__exit__(None, None, None)
         replay_fb = None
         if (
             case_staging is not None
@@ -4531,12 +4594,13 @@ class EnumDraftEngine:
             # the bulk of the extend replay-prep the consume path used to pay
             # in front of the graph launch.
             try:
-                replay_fb = self._prebuild_replay_fb(
-                    batch=batch,
-                    carriers=carriers,
-                    base_lens=base_lens,
-                    case_staging=case_staging,
-                )
+                with self.profiler.stage("restage_replay_fb"):
+                    replay_fb = self._prebuild_replay_fb(
+                        batch=batch,
+                        carriers=carriers,
+                        base_lens=base_lens,
+                        case_staging=case_staging,
+                    )
             except Exception:
                 logger.exception(
                     "decoupled restage: replay-fb prebuild failed; the round "
@@ -4544,12 +4608,15 @@ class EnumDraftEngine:
                 )
         scatter_stacks = None
         if case_staging is not None:
+            _st_cm = self.profiler.stage("restage_stacks")
+            _st_cm.__enter__()
             scatter_stacks = (
                 torch.stack([cs.gather for cs in case_staging]).contiguous(),
                 torch.stack([cs.out_cache_loc for cs in case_staging]).contiguous(),
                 torch.stack([cs.true_lens for cs in case_staging]).contiguous(),
                 torch.stack([cs.node_gather for cs in case_staging]).contiguous(),
             )
+            _st_cm.__exit__(None, None, None)
         positions: list[int] = []
         for base in base_lens:
             positions.extend(range(base, base + width))

@@ -1341,10 +1341,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mamba_ping_pong_track_buffers
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        # A python-list index on a device tensor makes torch route the
+        # index_put_ through a blocking D2H of the value -- one
+        # cudaStreamSynchronize (a full pipeline drain) per alloc call, ~2ms
+        # mid-build on a busy stream. Stage the indices as a device tensor
+        # instead: a pageable-src H2D of a tiny index tensor is async (the
+        # driver stages the bytes before returning).
+        select_index_dev = torch.tensor(select_index, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        self.req_index_to_mamba_index_mapping[select_index_dev] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index_dev] = (
                 ping_pong_tensor
             )
         return select_index

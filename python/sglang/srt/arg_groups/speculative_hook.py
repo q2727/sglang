@@ -170,6 +170,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         # never runs target-verify. The enumeration engine sizes itself from
         # speculative_num_steps / speculative_fanout, which survive.
         server_args.speculative_num_draft_tokens = None
+        # The drafter serves no user requests and the enumeration engine
+        # owns its KV / mamba state outright (page arena + explicit state
+        # forks), so radix prefix caching is meaningless here -- and its
+        # mamba extra-buffer sibling is actively harmful: the ping-pong
+        # track bookkeeping in prepare_for_extend reads a GPU tensor with
+        # .item() whenever an extend crosses a chunk boundary, a ~2ms
+        # pipeline drain every other prep-ahead build (profiled on the
+        # 397B pair).
+        server_args.disable_radix_cache = True
 
 
 def _handle_decoupled_spec(server_args: ServerArgs) -> None:
