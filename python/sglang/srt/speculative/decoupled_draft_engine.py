@@ -1037,6 +1037,7 @@ class EnumDraftEngine:
         self._prelaunch_gate_timeout_ct = 0
         self._prelaunch_forced_logged = 0
         self._align_drop_logged = 0
+        self._prelaunch_attempt_ct = 0
         self._prelaunch_skip_why = {
             "off": 0,
             "outstanding": 0,
@@ -1524,6 +1525,14 @@ class EnumDraftEngine:
         nothing is enqueued in that case."""
         if not self._prelaunch_enabled:
             return False
+        self._prelaunch_attempt_ct += 1
+        if self._prelaunch_attempt_ct % 200 == 0:
+            logger.info(
+                "prelaunch attempts=%d enq=%d skips=%s",
+                self._prelaunch_attempt_ct,
+                self._prelaunch_ct,
+                self._prelaunch_skip_why,
+            )
         if self._prelaunched is not None:
             self._prelaunch_skip_why["outstanding"] += 1
             return False
