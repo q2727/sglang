@@ -68,6 +68,11 @@ class NgramVerifyInput(SpecInput):
         self.retrive_next_token = retrive_next_token
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
+        # Hybrid linear-attention backends share their verify path with EAGLE
+        # and use ``topk`` to decide whether recurrent state must follow a
+        # branching tree. N-gram/SSD target verification is always a linear
+        # path, so expose the same interface with its semantic value.
+        self.topk = 1
         self.device = self.custom_mask.device
         self.grammar = grammar
 
