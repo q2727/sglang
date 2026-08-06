@@ -91,6 +91,14 @@ class SSDWorker:
         self.official_draft_backend = OfficialSSDDraftClient.is_official_url(
             server_args.speculative_ssd_draft_server_url
         )
+        self.disable_outcome_cache = (
+            os.environ.get("SGLANG_SSD_DISABLE_OUTCOME_CACHE", "0") == "1"
+        )
+        if self.disable_outcome_cache and not self.official_draft_backend:
+            raise ValueError(
+                "SGLANG_SSD_DISABLE_OUTCOME_CACHE currently requires the "
+                "official SSD draft backend."
+            )
         self.use_draft_side_cache = not self.official_draft_backend and (
             os.environ.get("SGLANG_SSD_DRAFT_SIDE_CACHE", "1") != "0"
         )
@@ -117,7 +125,8 @@ class SSDWorker:
 
         logger.info(
             "Initialized SSD worker: draft_server=%s K=%d fan_outs=%s "
-            "branch_budget=%d verify_tokens=%d backend=%s draft_side_cache=%s",
+            "branch_budget=%d verify_tokens=%d backend=%s draft_side_cache=%s "
+            "outcome_cache=%s",
             server_args.speculative_ssd_draft_server_url,
             self.draft_length,
             self.fan_outs,
@@ -125,6 +134,7 @@ class SSDWorker:
             self.draft_token_num,
             "official" if self.official_draft_backend else "sglang-http",
             self.use_draft_side_cache,
+            "disabled" if self.disable_outcome_cache else "enabled",
         )
 
     def _new_request_state(self, *, jit_drafts: int = 0) -> _RequestState:
@@ -206,11 +216,12 @@ class SSDWorker:
             if isinstance(result, OfficialOutcomeReady):
                 logger.info(
                     "SSD draft-timing request=%s kind=outcome_cache branches=%d "
-                    "protocol=official glue_ms=%.3f tree_ms=%.3f "
+                    "protocol=official elapsed_ms=%.3f glue_ms=%.3f tree_ms=%.3f "
                     "populate_ms=%.3f server_total_ms=%.3f transport_ms=%.3f "
                     "success=%s",
                     rid,
                     result.branches,
+                    elapsed_ms,
                     result.glue_ms,
                     result.tree_ms,
                     result.populate_ms,
@@ -306,6 +317,34 @@ class SSDWorker:
         with torch.cuda.nvtx.range("ssd_jit_draft_wait"):
             return self._timed_jit_draft(rid, prefix, "jit")
 
+    def _advance_jit_draft(
+        self, rid: str, prefix: List[int], state: _RequestState
+    ) -> DraftCandidate:
+        if state.outcome_key is None:
+            return self._jit_draft(rid, prefix, state)
+        state.jit_drafts += 1
+        begin = time.perf_counter()
+        success = False
+        try:
+            with torch.cuda.nvtx.range("ssd_advance_jit_wait"):
+                result = self.client.advance_jit(
+                    rid,
+                    prefix,
+                    state.outcome_key,
+                    self.draft_length,
+                    self.fan_outs,
+                )
+            success = True
+            return result
+        finally:
+            logger.info(
+                "SSD draft-timing request=%s kind=jit branches=1 "
+                "elapsed_ms=%.3f success=%s",
+                rid,
+                (time.perf_counter() - begin) * 1e3,
+                success,
+            )
+
     def _resolve_draft(
         self, rid: str, prefix: List[int], state: _RequestState
     ) -> DraftCandidate:
@@ -316,6 +355,8 @@ class SSDWorker:
 
         if pending is None:
             state.misses += 1
+            if self.disable_outcome_cache:
+                return self._advance_jit_draft(rid, prefix, state)
             return self._jit_draft(rid, prefix, state)
 
         begin = time.perf_counter()
@@ -530,13 +571,17 @@ class SSDWorker:
         # This is the central SSD overlap: enqueue all next-outcome draft work
         # before launching target verification on the separately partitioned
         # CUDA client.
-        state.pending = self.executor.submit(
-            self._timed_build_outcome_cache,
-            req.rid,
-            list(prefix),
-            candidate,
-        )
-        state.pending_kind = "outcomes"
+        if self.disable_outcome_cache:
+            state.pending = None
+            state.pending_kind = None
+        else:
+            state.pending = self.executor.submit(
+                self._timed_build_outcome_cache,
+                req.rid,
+                list(prefix),
+                candidate,
+            )
+            state.pending_kind = "outcomes"
 
         self._prepare_verify(batch, prefix, candidate)
         model_worker_batch = batch.get_model_worker_batch()

@@ -30,6 +30,7 @@ class OfficialSSDOp(IntEnum):
     JIT = 5
     RESET = 6
     SHUTDOWN = 7
+    ADVANCE_JIT = 8
 
 
 class OfficialSSDProtocolError(RuntimeError):

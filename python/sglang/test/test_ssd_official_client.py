@@ -64,6 +64,8 @@ class FakeOfficialSSDServer:
                         )
                     elif op == OfficialSSDOp.SELECT:
                         response = self._candidate([9, 10], True)
+                    elif op == OfficialSSDOp.ADVANCE_JIT:
+                        response = self._candidate([11, 12], False)
                     else:
                         raise AssertionError(f"unexpected op {op}")
                     send_frame(conn, op, response, flags=FLAG_RESPONSE)
@@ -107,6 +109,15 @@ class TestOfficialSSDDraftClient(unittest.TestCase):
             )
             self.assertEqual(selected.tokens, [9, 10])
             self.assertTrue(selected.cache_hit)
+            advanced = client.advance_jit(
+                "req-1",
+                [1, 2, 3, 7, 4, 9, 5],
+                (1, 5),
+                2,
+                (1, 1, 1),
+            )
+            self.assertEqual(advanced.tokens, [11, 12])
+            self.assertFalse(advanced.cache_hit)
             client.close()
 
             ops = [op for op, _ in server.calls]
@@ -117,6 +128,7 @@ class TestOfficialSSDDraftClient(unittest.TestCase):
                     OfficialSSDOp.INIT,
                     OfficialSSDOp.BUILD,
                     OfficialSSDOp.SELECT,
+                    OfficialSSDOp.ADVANCE_JIT,
                 ],
             )
 
@@ -127,6 +139,13 @@ class TestOfficialSSDDraftClient(unittest.TestCase):
             self.assertFalse(build_reader.u8())
             self.assertEqual(build_reader.int_list(), [7, 8])
             build_reader.finish()
+
+            advance_reader = BufferReader(server.calls[4][1])
+            self.assertEqual(advance_reader.text(), "req-1")
+            self.assertEqual(advance_reader.i64(), 7)
+            self.assertEqual(advance_reader.i32(), 1)
+            self.assertEqual(advance_reader.i32(), 5)
+            advance_reader.finish()
 
 
 if __name__ == "__main__":

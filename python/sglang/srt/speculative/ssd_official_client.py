@@ -250,3 +250,33 @@ class OfficialSSDDraftClient:
         return self._candidate_from_response(
             self._request(OfficialSSDOp.SELECT, payload), draft_length, fan_out
         )
+
+    def advance_jit(
+        self,
+        rid: str,
+        canonical_prefix: Sequence[int],
+        outcome_key: OutcomeKey,
+        draft_length: int,
+        fan_out: FanOutSpec,
+    ) -> DraftCandidate:
+        """Advance persistent draft KV and force an ordinary sequential draft.
+
+        This is the no-outcome-cache baseline: it consumes the verified target
+        outcome exactly like SELECT, but clears speculative outcomes before the
+        lookup so the official runner must execute its canonical miss/JIT path.
+        """
+        if not canonical_prefix:
+            raise ValueError("SSD cannot advance from an empty prefix.")
+        payload = (
+            BufferWriter()
+            .text(rid)
+            .i64(len(canonical_prefix))
+            .i32(int(outcome_key[0]))
+            .i32(int(outcome_key[1]))
+            .finish()
+        )
+        return self._candidate_from_response(
+            self._request(OfficialSSDOp.ADVANCE_JIT, payload),
+            draft_length,
+            fan_out,
+        )
