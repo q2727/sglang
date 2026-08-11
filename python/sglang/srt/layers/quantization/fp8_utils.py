@@ -792,7 +792,27 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    if input_scale is not None:
+        # Pre-quantized (fp8, scale) tuple from a fused act+quant producer
+        # (see Qwen2MoeMLP): the producer used the same quant entry and
+        # scale layout the unfused branch below builds, and arms itself
+        # only when this deepgemm lane is guaranteed (the shape/dtype
+        # guards are mirrored at its init), so there is no fallback here.
+        assert input.dtype == fp8_dtype
+        assert weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+        q_input = input.view(-1, input.shape[-1])
+        output_dtype = torch.bfloat16
+        output = w8a8_block_fp8_matmul_deepgemm(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            block_size,
+            output_dtype=output_dtype,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16

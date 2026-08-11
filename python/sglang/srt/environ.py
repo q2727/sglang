@@ -1228,6 +1228,11 @@ class Envs:
     SGLANG_OPT_USE_FUSED_COMPRESS_TRITON = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
     SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
+    # Dense/shared-expert MLP: fuse silu_and_mul with the down_proj's
+    # per-token-group fp8 quant (one kernel, fp8 intermediate write) when
+    # the down_proj rides the deepgemm w8a8-block lane on UE8M0-scale
+    # hardware (SM100). False restores act -> separate quant.
+    SGLANG_OPT_USE_FUSED_SILU_MUL_QUANT = EnvBool(True)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================

@@ -168,6 +168,55 @@ def can_fuse_shared_expert(
     return True
 
 
+_fused_silu_quant_logged = False
+
+
+def _fused_silu_mul_quant_group(down_proj: RowParallelLinear) -> Optional[int]:
+    """Quant group size for the fused silu_and_mul + per-token-group fp8
+    quant producer, or None when the down_proj is not guaranteed to ride
+    the deepgemm w8a8-block lane with UE8M0 scales (SM100).
+
+    The guards mirror deepgemm_w8a8_block_fp8_linear_with_fallback's own
+    dtype/shape fallback conditions: the producer must never hand a
+    pre-quantized tuple to a lane that would route it to triton/cutlass.
+    """
+    from sglang.srt.layers import deep_gemm_wrapper
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8_utils import (
+        deepgemm_w8a8_block_fp8_linear_with_fallback,
+    )
+
+    if not envs.SGLANG_OPT_USE_FUSED_SILU_MUL_QUANT.get():
+        return None
+    quant_method = down_proj.quant_method
+    if not isinstance(quant_method, Fp8LinearMethod) or not quant_method.block_quant:
+        return None
+    if (
+        quant_method.w8a8_block_fp8_linear
+        is not deepgemm_w8a8_block_fp8_linear_with_fallback
+    ):
+        return None
+    # The fused-silu quant kernel is only instantiated for column-major
+    # UE8M0 scales (the deepgemm SM100 recipe).
+    if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return None
+    weight = down_proj.weight
+    if weight.shape[0] % 64 != 0 or weight.shape[1] % 128 != 0:
+        return None
+    group_size = quant_method.weight_block_size[1]
+    if group_size not in (16, 32, 64, 128):
+        return None
+    global _fused_silu_quant_logged
+    if not _fused_silu_quant_logged:
+        _fused_silu_quant_logged = True
+        logger.info(
+            "fused silu_and_mul + fp8 group quant armed for dense/shared-expert "
+            "MLP down_proj (deepgemm lane, group=%d)",
+            group_size,
+        )
+    return group_size
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -205,12 +254,30 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # Fused silu_and_mul + per-token-group fp8 quant feeding the
+        # down_proj's deepgemm lane as a pre-quantized (fp8, scale) tuple
+        # (the same pattern the routed experts already use); None when the
+        # lane is not guaranteed and the plain act -> quant pair stays.
+        self._fused_silu_quant_group = _fused_silu_mul_quant_group(self.down_proj)
 
     def forward(
         self,
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if self._fused_silu_quant_group is not None and gate_up.dtype == torch.bfloat16:
+            # Bit-faithful fused act+quant (see its kernel docstring: the
+            # stock fused kernels drift numerically, and the decoupled-spec
+            # ring turns verifier drift into accept-length loss).
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                silu_and_mul_group_quant_fp8_ue8m0,
+            )
+
+            q, s = silu_and_mul_group_quant_fp8_ue8m0(
+                gate_up, self._fused_silu_quant_group
+            )
+            x, _ = self.down_proj((q, s))
+            return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x

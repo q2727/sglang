@@ -619,6 +619,98 @@ def _run_per_token_group_quant_8bit_kernel(
         )
 
 
+@triton.jit
+def _silu_and_mul_group_quant_ue8m0_kernel(
+    x_ptr,  # [T, 2H] bf16, gate | up halves
+    y_q_ptr,  # [T, H] fp8_e4m3
+    y_s_u8_ptr,  # uint8 alias of the packed int32 col-major UE8M0 storage
+    H,
+    num_groups,  # H // group_size
+    aligned_mn,  # token dim of the packed storage, ceil_align(T, 4)
+    eps,
+    fp8_max,
+    GROUP_SIZE: tl.constexpr,
+):
+    """Fused silu_and_mul + per-token-group UE8M0 fp8 quant, BIT-IDENTICAL
+    to the unfused (act_and_mul kernel -> v2 group-quant kernel) pair on
+    SM100: silu in accurate fp32 (x / (1 + exp(-x))), fp32 multiply, ONE
+    explicit bf16 rounding of the activation (the pair's intermediate
+    tensor), then the exact v2 quant arithmetic -- bit-manipulated
+    ceil-log2 for the power-of-two scale, whose division is a lossless
+    exponent shift. The existing fused kernels are NOT faithful (the v2
+    fused branch multiplies in bf16; the dsv4 one diverges further) and
+    the decoupled-spec ring turns that drift into accept-length loss.
+
+    Scale packing mirrors the v2 kernel's col-major UE8M0 layout: byte =
+    float_bits(scale) >> 23 at byte offset (g//4)*aligned_mn*4 + t*4 +
+    g%4; a partial final pack zero-fills its tail bytes."""
+    t = tl.program_id(0)
+    g = tl.program_id(1)
+    cols = tl.arange(0, GROUP_SIZE)
+    gate = tl.load(x_ptr + t * 2 * H + g * GROUP_SIZE + cols).to(tl.float32)
+    up = tl.load(x_ptr + t * 2 * H + H + g * GROUP_SIZE + cols).to(tl.float32)
+    act = gate / (1.0 + tl.exp(-gate)) * up
+    y = act.to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(y)), eps)
+    # v2's fast_log2_ceil / fast_pow2: exact bit arithmetic, no libm.
+    bits = (amax / fp8_max).to(tl.int32, bitcast=True)
+    exp_ceil = ((bits >> 23) & 0xFF) - 127 + tl.where((bits & 0x7FFFFF) != 0, 1, 0)
+    scale = (((exp_ceil + 127) << 23)).to(tl.float32, bitcast=True)
+    y_q = tl.clamp(y / scale, -fp8_max, fp8_max).to(y_q_ptr.dtype.element_ty)
+    tl.store(y_q_ptr + t * H + g * GROUP_SIZE + cols, y_q)
+    s_off = (g // 4) * aligned_mn * 4 + t * 4 + (g % 4)
+    tl.store(y_s_u8_ptr + s_off, (exp_ceil + 127).to(tl.uint8))
+    # Partial final pack: zero the tail bytes (v2 kernel parity).
+    if g == num_groups - 1:
+        rem = num_groups % 4
+        if rem != 0:
+            pad = tl.arange(0, 4)
+            tl.store(
+                y_s_u8_ptr + (g // 4) * aligned_mn * 4 + t * 4 + pad,
+                tl.zeros((4,), dtype=tl.uint8),
+                mask=pad >= rem,
+            )
+
+
+def silu_and_mul_group_quant_fp8_ue8m0(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Bit-faithful fused silu_and_mul + per-token-group fp8 quant with
+    packed col-major UE8M0 scales (the deepgemm SM100 recipe). Drop-in
+    producer for the (q, s) tuple the w8a8-block deepgemm lane consumes;
+    output layouts match sglang_per_token_group_quant_fp8(
+    column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True)
+    exactly (see _silu_and_mul_group_quant_ue8m0_kernel for the
+    bit-identity contract)."""
+    assert x.dim() == 2 and x.is_contiguous()
+    num_tokens, two_h = x.shape
+    hidden = two_h // 2
+    assert hidden % group_size == 0
+    num_groups = hidden // group_size
+    x_q = torch.empty((num_tokens, hidden), device=x.device, dtype=fp8_dtype)
+    aligned_mn = ceil_align(num_tokens, 4)
+    aligned_k = ceil_align(num_groups, 4)
+    storage = torch.empty(
+        (aligned_k // 4, aligned_mn), device=x.device, dtype=torch.int32
+    )
+    x_s = storage.transpose(-1, -2)[:num_tokens, :]
+    if num_tokens > 0:
+        _silu_and_mul_group_quant_ue8m0_kernel[(num_tokens, num_groups)](
+            x,
+            x_q,
+            storage.view(torch.uint8),
+            hidden,
+            num_groups,
+            aligned_mn,
+            eps,
+            fp8_max,
+            GROUP_SIZE=group_size,
+        )
+    return x_q, x_s
+
+
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
