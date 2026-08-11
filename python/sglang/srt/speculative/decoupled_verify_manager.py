@@ -245,11 +245,22 @@ class DecoupledVerifyManager:
         # counters it touches are GIL-guarded primitives and their readers
         # tolerate one-round staleness.
         self._stream_gate = None
+        self._gate_cb_bands = None
         if envs.SGLANG_ENABLE_DECOUPLED_STREAM_GATE.get() and self.arrival_wait_s > 0:
             try:
                 from sglang.srt.speculative.decoupled_stream_gate import StreamGate
+                from sglang.srt.utils.thread_band_recorder import (
+                    register_thread_band_recorder,
+                )
 
                 self._stream_gate = StreamGate()
+                # The gate's park runs on the driver's host-func callback
+                # thread, which kineto cannot see (thread-local callbacks);
+                # a side-band recorder puts its true park span into exported
+                # traces (tid stamps on first use, i.e. the callback thread).
+                self._gate_cb_bands = register_thread_band_recorder(
+                    "sgl-c6-gate-callback"
+                )
                 logger.info("decoupled C6 gate: host-func stream gate enabled")
             except Exception:
                 logger.exception(
@@ -351,36 +362,46 @@ class DecoupledVerifyManager:
             return
         logger.info("decoupled enum IPC pool attached (cuda_ipc data plane)")
         enum_buffer = self.verify_worker.enum_buffer
+        landed_ct = 0
         while not self._ipc_poll_closed.is_set():
-            polled = reader.poll()
+            try:
+                polled = reader.poll()
+            except Exception:
+                # A dead poll loop silently starves every seat (landed=None
+                # forever); log loudly and keep polling.
+                logger.exception("decoupled enum IPC poll failed; retrying")
+                time.sleep(0.01)
+                continue
             if polled is None:
                 time.sleep(0.0002)
                 continue
             slot, rows = polled
             try:
-                meta = rows[:, :2].to("cpu")  # small D2H: [B, 2]
-                pool_indices = meta[:, 0].tolist()
-                stamps = meta[:, 1].tolist()
+                # Landing-stream pinned read: a plain .cpu() here rides the
+                # legacy default stream and inherits the forward stream's
+                # parked C6 gate (implicit blocking-stream barrier).
+                pool_indices, stamps = enum_buffer.read_row_meta(rows)
                 if any(p < 1 or p >= enum_buffer.seats for p in pool_indices):
                     logger.error(
                         "decoupled enum IPC block has out-of-range seats; dropped"
                     )
                 else:
-                    if self.land_stream is not None:
-                        # Stream-scoped sync: a device-wide sync would park
-                        # this poll thread behind the compute stream's
-                        # pending doorbell wait for the whole verify round.
-                        with torch.cuda.stream(self.land_stream):
-                            enum_buffer.land_rows_device(
-                                rows[:, 0], rows[:, 1], rows[:, 2:]
-                            )
-                        self.land_stream.synchronize()
-                    else:
-                        enum_buffer.land_rows_device(
-                            rows[:, 0], rows[:, 1], rows[:, 2:]
-                        )
-                        torch.cuda.synchronize(self.verify_worker.device)
+                    # Stream discipline lives inside land_rows_device (the
+                    # buffer's private landing stream + event sync): a
+                    # device-wide sync here parked this thread behind the
+                    # forward stream's C6 gate, which waits for the very
+                    # arrival marking below -- a deadlock loop that made
+                    # every block one gate budget late (hit 5/3400).
+                    enum_buffer.land_rows_device(rows[:, 0], rows[:, 1], rows[:, 2:])
                     self.arrival_board.record_pairs(pool_indices, stamps)
+                    landed_ct += 1
+                    if landed_ct <= 3 or landed_ct % 200 == 0:
+                        logger.info(
+                            "decoupled enum IPC landed #%d: seats=%s stamps=%s",
+                            landed_ct,
+                            pool_indices,
+                            stamps,
+                        )
             except Exception:
                 logger.exception("decoupled enum IPC landing failed; block dropped")
             finally:
@@ -642,7 +663,13 @@ class DecoupledVerifyManager:
         stamp is there -- the natural fallback. No CUDA API in here (spec
         requirement for host funcs)."""
         t_gate = time.monotonic()
-        with profile_range("verifier.c6_stream_gate"):
+        bands = self._gate_cb_bands
+        park_cm = (
+            bands.band("verifier.c6_stream_gate_park")
+            if bands is not None
+            else profile_range("verifier.c6_stream_gate")
+        )
+        with park_cm:
             arrived = self.arrival_board.wait_for(expected, budget_s)
         if arrived:
             self._observe_gate_arrival(time.monotonic() - t_gate)

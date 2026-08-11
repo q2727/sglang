@@ -38,6 +38,8 @@ concurrently, because the stamp discipline already provides versioning:
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 import torch
 
@@ -104,6 +106,7 @@ class DecoupledEnumBuffer:
         # returned land as GPU-visible.
         self._land_stream = torch.cuda.Stream(device=device)
         self._land_event = torch.cuda.Event()
+        self._meta_pin: Optional[torch.Tensor] = None
         self._land_staging: torch.Tensor = torch.empty(
             (0,), dtype=torch.int64, pin_memory=True
         )
@@ -251,17 +254,46 @@ class DecoupledEnumBuffer:
         lives on this GPU (mapped from the drafter's pool), so this is only the
         seat-range guard + the generation scatter. The caller (the IPC poll
         loop) validated shapes from its small host mirror.
+
+        Same stream discipline as ``land``: the scatter rides the private
+        landing stream and this returns only after it completed, so the
+        caller's arrival marking is the only fence the gather side needs.
+        A device-wide sync here instead deadlock-looped with the C6 stream
+        gate (poll thread waits the forward stream -> the parked gate waits
+        the arrival board -> the board waits this thread's marking): every
+        block arrived one full gate budget late, select hit 5/3400.
         """
         if pool_indices.numel() == 0:
             return
         # The CUDA IPC row header carries no speculative flag yet; preruns are
         # ZMQ-only for now (flag word in the row header when needed).
-        self._scatter_generation(
-            pool_indices.to(torch.int64),
-            rows.to(torch.int64),
-            base_committed_lens.to(torch.int64),
-            speculative=False,
-        )
+        with torch.cuda.stream(self._land_stream):
+            self._scatter_generation(
+                pool_indices.to(torch.int64),
+                rows.to(torch.int64),
+                base_committed_lens.to(torch.int64),
+                speculative=False,
+            )
+            self._land_event.record()
+        self._land_event.synchronize()
+
+    def read_row_meta(self, rows: torch.Tensor) -> tuple[list[int], list[int]]:
+        """Pinned, landing-stream read of IPC rows' [pool_idx, stamp] header
+        columns. A plain ``.cpu()`` would ride the legacy default stream and
+        inherit the forward stream's parked C6 gate through the implicit
+        blocking-stream barrier -- the same deadlock loop as the device-wide
+        landing sync, one call earlier."""
+        batch_size = rows.shape[0]
+        if self._meta_pin is None or self._meta_pin.shape[0] < batch_size:
+            self._meta_pin = torch.empty(
+                (max(batch_size, 64), 2), dtype=torch.int64, pin_memory=True
+            )
+        with torch.cuda.stream(self._land_stream):
+            self._meta_pin[:batch_size].copy_(rows[:, :2], non_blocking=True)
+            self._land_event.record()
+        self._land_event.synchronize()
+        meta = self._meta_pin[:batch_size]
+        return meta[:, 0].tolist(), meta[:, 1].tolist()
 
     def _scatter_generation(
         self,

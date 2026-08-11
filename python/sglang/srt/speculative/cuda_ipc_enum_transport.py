@@ -119,6 +119,13 @@ class CudaIpcEnumBlockPool:
         # Magic last: a reader that sees the magic sees a complete header.
         header[0] = _MAGIC
         self._next_slot = 0
+        # Private push stream + event: the producer-side visibility fence must
+        # wait for the SLOT COPY alone. A device-wide sync here waited out the
+        # drafter's own pre-queued gate sequence (parked on the NEXT commit),
+        # taxing every push with half a verify round trip (push_ms 3.77 vs
+        # the evented ZMQ path's 0.05).
+        self._push_stream = torch.cuda.Stream(device=device)
+        self._push_event = torch.cuda.Event()
 
     def push(
         self,
@@ -126,10 +133,15 @@ class CudaIpcEnumBlockPool:
         pool_indices: list[int],
         base_committed_lens: list[int],
         units: torch.Tensor,
+        ready_event: Optional[torch.cuda.Event] = None,
     ) -> bool:
         """Write one block into the next free slot; False if the ring is full
         (the verifier then simply falls back that round) or the block exceeds
         the slot capacity.
+
+        ``ready_event`` is the producing pack's completion event: the slot
+        copy waits on it (not on the whole stream, which may hold a parked
+        gate) so the copied values are the finished block.
         """
         batch_size = len(pool_indices)
         if batch_size == 0:
@@ -147,14 +159,18 @@ class CudaIpcEnumBlockPool:
             # ahead means at most one block in flight, so this is exceptional.
             logger.warning("decoupled enum IPC ring full; block dropped")
             return False
-        meta = torch.tensor(
-            [pool_indices, base_committed_lens], dtype=torch.int64
-        ).T.to(self.device, non_blocking=True)
-        rows = torch.cat([meta, units.view(batch_size, -1)], dim=1)
-        self.pool[slot, :batch_size] = rows
+        with torch.cuda.stream(self._push_stream):
+            if ready_event is not None:
+                self._push_stream.wait_event(ready_event)
+            meta = torch.tensor(
+                [pool_indices, base_committed_lens], dtype=torch.int64
+            ).T.to(self.device, non_blocking=True)
+            rows = torch.cat([meta, units.view(batch_size, -1)], dim=1)
+            self.pool[slot, :batch_size] = rows
+            self._push_event.record()
         # The producer-side order guarantee: the block is fully visible on the
         # device before ready_seq becomes visible on the host.
-        torch.cuda.synchronize(self.device)
+        self._push_event.synchronize()
         self.flags[slot, 2] = batch_size
         self.flags[slot, 0] += 1
         self._next_slot = (slot + 1) % self.num_slots

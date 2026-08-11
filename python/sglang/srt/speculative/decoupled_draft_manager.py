@@ -617,13 +617,15 @@ class DecoupledDraftManager:
             return
         push_start = time.monotonic()
         if self.ipc_block_pool is not None:
-            # CUDA IPC data plane: D2D into the shared pool; the shm flag
-            # bump after the device sync is the arrival signal. (Preruns are
-            # ZMQ-only and gated off for this plane.)
+            # CUDA IPC data plane: D2D into the shared pool on the pool's
+            # private push stream (waiting the block's own ready event, not
+            # the whole stream); the shm flag bump after the event sync is
+            # the arrival signal. (Preruns are ZMQ-only for this plane.)
             self.ipc_block_pool.push(
                 pool_indices=packed["pool_indices"],
                 base_committed_lens=packed["base_committed_lens"],
                 units=packed["units_device"],
+                ready_event=packed["ready_event"],
             )
             self._push_time_s += time.monotonic() - push_start
             return

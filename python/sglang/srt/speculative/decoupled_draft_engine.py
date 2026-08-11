@@ -2337,6 +2337,15 @@ class EnumDraftEngine:
             # guard in resolve already rerouted the account). Count it.
             self._judge_opt_bad_ct += 1
 
+    @staticmethod
+    def _record_units_ready() -> torch.cuda.Event:
+        """Event pinning a units tensor just produced on the current stream
+        (the merge path's cat): the CUDA IPC push stream waits on it instead
+        of the whole stream, which may hold a parked commit gate."""
+        ready = torch.cuda.Event()
+        ready.record()
+        return ready
+
     def _rowmap_for(self, f_live: int) -> torch.Tensor:
         """Full-grid position -> chain output row (-1 dead) for a live
         fanout; device-cached per width (see pack_units)."""
@@ -3615,6 +3624,7 @@ class EnumDraftEngine:
                     for base_len in part["base_committed_lens"]
                 ],
                 "units_device": torch.cat([part["units_device"] for part in parts]),
+                "ready_event": self._record_units_ready(),
             }
         finally:
             with self.profiler.stage("free-scratch"):
@@ -4240,6 +4250,7 @@ class EnumDraftEngine:
                     "pool_indices": [s.req_pool_idx for s in states],
                     "base_committed_lens": [len(s.committed_tokens) for s in states],
                     "units_device": states[0].last_units_dev.unsqueeze(0),
+                    "ready_event": states[0].mirror_event,
                 }
             return self._pack_and_mirror(
                 states=states,
@@ -6745,6 +6756,7 @@ class EnumDraftEngine:
                     "pool_indices": [s.req_pool_idx for s in states],
                     "base_committed_lens": [len(s.committed_tokens) for s in states],
                     "units_device": states[0].last_units_dev.unsqueeze(0),
+                    "ready_event": states[0].mirror_event,
                 }
             node0_logits = prelaunched["fused_logits"].view(bs, num_steps + 1, -1)[:, 0]
             node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices
@@ -7221,6 +7233,7 @@ class EnumDraftEngine:
             "pool_indices": [state.req_pool_idx for state in states],
             "base_committed_lens": [len(state.committed_tokens) for state in states],
             "units_device": units_device,
+            "ready_event": mirror_event,
         }
 
     def _expand_units(
