@@ -1875,8 +1875,11 @@ class EnumDraftEngine:
                 )
                 self._branch_fork_cache[fork_key] = fork
         _, branch_rows = carrier.branch_sel_for(variant=variant)
-        self._chain_graph.stage_armed(rows=rows_sel, req_rows=branch_rows, fork=fork)
-        self._chain_graph.prep_replay_armed(rows=rows_sel, forked=forked)
+        with self.profiler.stage("arm_chain_prep"):
+            self._chain_graph.stage_armed(
+                rows=rows_sel, req_rows=branch_rows, fork=fork
+            )
+            self._chain_graph.prep_replay_armed(rows=rows_sel, forked=forked)
         seq_lens_out, positions_out, mrope_out, out_locs_out = (
             self._chain_graph.armed_buffers(rows=rows_sel, forked=forked)
         )
@@ -3907,6 +3910,11 @@ class EnumDraftEngine:
             case0_states: list[_DraftReqState] = []
             slow_keys: list[DraftReqKey] = []
             slow_states: list[_DraftReqState] = []
+            # Its own band: audit + per-key match routing (judge pin reads /
+            # host mirror matches) is round glue the coarser round band
+            # cannot attribute.
+            _route_cm = self.profiler.stage("round_route")
+            _route_cm.__enter__()
             self._audit_judge()
             rec0 = self._prelaunched
             judged_key = (
@@ -3944,19 +3952,21 @@ class EnumDraftEngine:
                     selections=selections,
                     f_live=f_live,
                 )
+            _route_cm.__exit__(None, None, None)
             pl_fast: Optional[dict] = None
             pl_case0: Optional[dict] = None
             forced_case0: Optional[tuple[DraftReqKey, _DraftReqState, dict]] = None
             if self._prelaunched is not None:
-                action, rec = self._resolve_prelaunched(
-                    hit_keys=hit_keys,
-                    selections=selections,
-                    case0_keys=case0_keys,
-                    f_live=f_live,
-                    scratch_batches=scratch_batches,
-                    scratch_slots=scratch_slots,
-                    scratch_kv_pages=scratch_kv_pages,
-                )
+                with self.profiler.stage("round_resolve"):
+                    action, rec = self._resolve_prelaunched(
+                        hit_keys=hit_keys,
+                        selections=selections,
+                        case0_keys=case0_keys,
+                        f_live=f_live,
+                        scratch_batches=scratch_batches,
+                        scratch_slots=scratch_slots,
+                        scratch_kv_pages=scratch_kv_pages,
+                    )
                 # Defect-localization buckets: the verdict judges the block
                 # the PREVIOUS armed round computed (backbone + units), so
                 # correlate this action with THAT round's shift/crossing.
@@ -4285,6 +4295,8 @@ class EnumDraftEngine:
         # backbone is deferred (backbone_host_lazy) and the values below are
         # only materialized on the paths that truly read them.
         judged = prelaunched is not None and prelaunched.get("judge_verdict")
+        _prologue_cm = self.profiler.stage("fast_prologue")
+        _prologue_cm.__enter__()
         chains: list[torch.Tensor] = []
         new_backbones: list[Optional[list[int]]] = []
         for state, (case, f) in zip(states, selections):
@@ -4302,6 +4314,7 @@ class EnumDraftEngine:
         # case's bonus -- mask it before top-F so a live candidate gets the
         # slot instead.
         chains_mat = torch.stack(chains) if self._exclude_dead_guess else None
+        _prologue_cm.__exit__(None, None, None)
 
         # -- Seat (advance) rows: one fresh pool row per seat extending the
         # committed delta; the only phase that ever runs IN PLACE on the
