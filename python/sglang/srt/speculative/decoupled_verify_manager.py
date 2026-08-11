@@ -87,8 +87,26 @@ class EnumArrivalBoard:
     def __init__(self) -> None:
         self._cond = threading.Condition()
         self._stamps: dict[int, int] = {}
+        # Speculative (bet) arrivals live on their own EXACT-match lane: a
+        # bet's stamp is the FULL-ACCEPT hypothesis (base + K + 1), which is
+        # >= every possible expected base -- fed into the GEQ lane it would
+        # release every future gate wait unconditionally (one bet landing
+        # per seat would free-run the verify loop into permanent staleness
+        # fallbacks). Exact-match wakes the gate only when the hypothesis is
+        # RIGHT (the select will find the fresh gen-2 block); a wrong bet
+        # never wakes anything and the gate waits for the real block as
+        # before.
+        self._spec_stamps: dict[int, int] = {}
 
     def record(self, block: DraftEnumerationBufferBatch) -> None:
+        if block.speculative:
+            with self._cond:
+                for pool_idx, stamp in zip(
+                    block.pool_indices, block.base_committed_lens
+                ):
+                    self._spec_stamps[int(pool_idx)] = int(stamp)
+                self._cond.notify_all()
+            return
         self.record_pairs(block.pool_indices, block.base_committed_lens)
 
     def record_pairs(self, pool_indices: list[int], stamps: list[int]) -> None:
@@ -106,6 +124,7 @@ class EnumArrivalBoard:
         # block arrived -- nobody force-releases.
         with self._cond:
             self._stamps.pop(int(pool_idx), None)
+            self._spec_stamps.pop(int(pool_idx), None)
 
     def wait_for(self, expected: dict[int, int], timeout_s: float) -> bool:
         """Wait until every seat's landed stamp equals its expected base.
@@ -118,9 +137,11 @@ class EnumArrivalBoard:
             # ">=", not "==": stamps advance monotonically per seat, and a
             # commit merge on the drafter can skip a generation entirely --
             # once the seat moved PAST the expected stamp, waiting longer can
-            # never help (the select falls back either way).
+            # never help (the select falls back either way). The speculative
+            # lane is exact-match only (see __init__).
             return all(
                 self._stamps.get(pool_idx, -1) >= stamp
+                or self._spec_stamps.get(pool_idx) == stamp
                 for pool_idx, stamp in expected.items()
             )
 

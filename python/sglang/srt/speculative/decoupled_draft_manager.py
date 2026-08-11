@@ -224,24 +224,26 @@ class DecoupledDraftManager:
         self._round_ewma_ms: float | None = None
         self._rounds_since_fanout_change = 0
         # Evented push (ZMQ data plane): pinned staging ring + CUDA event
-        # consumed on the IPC thread, instead of a blocking D2H here.
+        # consumed on the IPC thread, instead of a blocking D2H here. 16
+        # slots (~1KB each): the bet prebuild doubles the pushes per round
+        # AND its slot's event only fires when the idle-window pack executes,
+        # so the old 4-slot ring exhausted and every overflow fell back to a
+        # synchronous D2H behind the whole queued bet production (~5ms host
+        # per round, measured push_ms 0.05 -> 5.12).
         self._push_ring = (
-            PushStagingRing(num_slots=4)
+            PushStagingRing(num_slots=16)
             if envs.SGLANG_ENABLE_DECOUPLED_EVENTED_PUSH.get()
             and data_transport == "zmq"
             else None
         )
-        # Half-bet early push (see engine._bet_enqueue_armed): the confirmed
-        # bet block's wire copy must NOT ride the main stream -- at dispatch
-        # time that stream still holds the armed sequence's ~a-block tail,
-        # which is exactly the wait the bet exists to remove. A dedicated
-        # stream gated on the block's own ready event starts the copy
-        # immediately (same no-barrier pattern as the engine's prebuild
-        # stream).
-        self._bet_push_stream: Optional[torch.cuda.Stream] = None
-        if envs.SGLANG_ENABLE_DECOUPLED_BET_PREBUILD.get():
-            self._bet_push_stream = torch.cuda.Stream(priority=0)
-            self.engine.early_push_block = self._early_push_bet_block
+        # Bet prebuild sink (see engine._bet_enqueue_armed): the bet block
+        # ships SPECULATIVELY at arm time into the verifier's dedicated
+        # generation slot, riding the normal push path with the speculative
+        # flag -- the same lane the top-1 prerun used. ZMQ plane only: the
+        # CUDA IPC row header has no speculative flag word yet, and without
+        # it a bet would land as a REAL block and clobber the gen rotation.
+        if envs.SGLANG_ENABLE_DECOUPLED_BET_PREBUILD.get() and data_transport == "zmq":
+            self.engine.push_speculative_block = self._push_speculative_bet_block
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -625,21 +627,21 @@ class DecoupledDraftManager:
                 verifier_rank=verifier_rank, packed=packed, speculative=True
             )
 
-    def _early_push_bet_block(self, verifier_rank: int, packed: dict) -> None:
-        """Engine hook: push a confirmed bet block at dispatch head. The
-        dedicated stream + the block's own ready event (long fired -- the
-        pack ran in the idle window) start the wire copy immediately instead
-        of queuing it behind the armed sequence still draining on the main
-        stream."""
-        with torch.cuda.stream(self._bet_push_stream):
-            torch.cuda.current_stream().wait_event(packed["ready_event"])
-            with self.engine.profiler.stage("bet-early-push"):
-                self._push_block(verifier_rank=verifier_rank, packed=packed)
+    def _push_speculative_bet_block(self, verifier_rank: int, packed: dict) -> None:
+        """Engine hook: ship a just-packed bet block into the verifier's
+        speculative generation. Called at arm time on the manager thread;
+        the evented D2H is enqueued right behind the bet pack on the main
+        stream (it executes in the idle window) and the IPC thread sends
+        once its event fires."""
+        with self.engine.profiler.stage("bet-spec-push"):
+            self._push_block(
+                verifier_rank=verifier_rank, packed=packed, speculative=True
+            )
 
     def _push_block(
         self, *, verifier_rank: int, packed, speculative: bool = False
     ) -> None:
-        if packed is None or packed.get("skip_push"):
+        if packed is None:
             return
         push_start = time.monotonic()
         if envs.SGLANG_DEBUG_DECOUPLED_BET.get() and (

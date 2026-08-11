@@ -1120,18 +1120,22 @@ class EnumDraftEngine:
         )
         self._preadv_tmpl: Optional[dict] = None
         self._preadv_fast_ct = 0
-        # "Half bet" (see _bet_enqueue_armed): one outstanding pre-produced
-        # next block per engine (bs == 1 scope), enqueued INSIDE the arm's
-        # gate sequence BEFORE the gate -- the same skeleton / carrier rows /
-        # graphs as the armed round, with the commit_scatter replaced by a
-        # constant full-accept hypothesis fill. Injected by the manager:
-        # early_push_block pushes a confirmed bet immediately at dispatch.
+        # Bet prebuild (see _bet_enqueue_armed): one full-accept next block
+        # per arm (bs == 1 scope), enqueued INSIDE the arm's gate sequence
+        # BEFORE the gate -- the same skeleton / carrier rows / graphs as
+        # the armed round, with the commit_scatter replaced by a constant
+        # full-accept hypothesis fill. The block ships SPECULATIVELY into
+        # the verifier's dedicated generation slot the moment it is packed
+        # (push_speculative_block, injected by the manager; ZMQ plane only):
+        # the verifier's stamp-matching select is the hit arbiter, so a
+        # wrong bet is simply never selected and the next bet overwrites
+        # it -- the real-block path is untouched. The dispatch-side check
+        # is accounting only.
         self._bet_prebuild_enabled = envs.SGLANG_ENABLE_DECOUPLED_BET_PREBUILD.get()
         self._bet: Optional[dict] = None
         self.bet_armed_ct = 0
         self.bet_hit_ct = 0
         self.bet_miss_ct = 0
-        self._bet_pushed_this_round = False
         self._bet_skip_why: Counter = Counter()
         self._bet_miss_why: Counter = Counter()
         # Ping-pong wire buffers: the early push's D2H/D2D may still read
@@ -1149,7 +1153,7 @@ class EnumDraftEngine:
         # Keepalive of the PREVIOUS bet's enqueued-kernel inputs, released
         # one arm later (same one-dispatch gap contract as pending/adopt).
         self._bet_keepalive_prev: Optional[tuple] = None
-        self.early_push_block: Optional[Callable[[int, dict], None]] = None
+        self.push_speculative_block: Optional[Callable[[int, dict], None]] = None
         # Dedicated staging ring for the prep path (restage + pre-launch
         # arm). Sharing the main ring couples the two paths' slot-reuse
         # clocks: prep would land on a slot whose event sits BEHIND the
@@ -1287,14 +1291,21 @@ class EnumDraftEngine:
         self._early_judge_enabled = (
             envs.SGLANG_ENABLE_DECOUPLED_EARLY_JUDGE.get() and self._device_pack_enabled
         )
+        # HIGH priority (CUDA: lower = higher): the judge's correctness
+        # window is "execute before the per-seat buffers' next-generation
+        # overwrite", which used to hold by GPU idleness alone. Any bulk
+        # concurrent work (the bet prebuild's replay group saturating the
+        # SMs) starves a default-priority judge past that window -- audit
+        # match_lag 70us -> 2557us, the v19 'input-overwrite territory'
+        # signature (D23). Priority makes the window structural.
         self._judge_stream = (
-            torch.cuda.Stream(priority=0) if self._early_judge_enabled else None
+            torch.cuda.Stream(priority=-1) if self._early_judge_enabled else None
         )
         # The match half waits on previous-generation pack events; on the
         # same stream those waits would park the NEXT round's seg kernel
         # (host syncs seg -> inherits the whole chain, measured 9ms rounds).
         self._judge_match_stream = (
-            torch.cuda.Stream(priority=0) if self._early_judge_enabled else None
+            torch.cuda.Stream(priority=-1) if self._early_judge_enabled else None
         )
         # Ping-pong (parity = arm counter & 1): the audit reads a record's
         # pin one dispatch AFTER the next judge may already be rewriting the
@@ -3117,6 +3128,11 @@ class EnumDraftEngine:
         a hit, overwritten-before-read on a miss (the junk-round layout
         discipline)."""
         num_steps = self.num_steps
+        if self.push_speculative_block is None:
+            # No speculative sink (cuda_ipc plane, or the manager did not
+            # inject): producing an unshippable bet is pure waste.
+            self._bet_skip_why["no_sink"] += 1
+            return
         if not self._early_judge_enabled:
             # The delta source below is _scatter_chains; only judge mode
             # keeps it current across slow-path production (_pack_and_mirror).
@@ -3309,15 +3325,8 @@ class EnumDraftEngine:
         self._retire_bet()
         self._bet = {
             "key": key,
-            "verifier_rank": key.src_verifier_rank,
             "base_plus": base_plus,
             "f_live": f_live,
-            "packed": {
-                "pool_indices": [state.req_pool_idx],
-                "base_committed_lens": [base_plus],
-                "units_device": self._bet_units_pair[nxt].unsqueeze(0),
-                "ready_event": ready,
-            },
             # Pins every gate-free kernel input enqueued above (the cat
             # source, the chain arm's committed-slots cat, the units buffer
             # a slow-path repack could rebind) until the NEXT arm.
@@ -3325,6 +3334,23 @@ class EnumDraftEngine:
         }
         self._bet_units_idx = nxt
         self.bet_armed_ct += 1
+        if envs.SGLANG_ENABLE_DECOUPLED_BET_EARLY_PUSH.get():
+            # Ship the bet NOW into the verifier's speculative generation:
+            # the evented D2H rides this stream right behind the pack (it
+            # executes in the idle window), and the IPC thread sends once
+            # the event fires -- the whole block is at the verifier before
+            # the commit round-trip even starts. The verifier's select
+            # stamp-match is the hit arbiter; the real block still ships
+            # normally on gen 0/1 and wins ties.
+            self.push_speculative_block(
+                key.src_verifier_rank,
+                {
+                    "pool_indices": [state.req_pool_idx],
+                    "base_committed_lens": [base_plus],
+                    "units_device": self._bet_units_pair[nxt].unsqueeze(0),
+                    "ready_event": ready,
+                },
+            )
         if self.bet_armed_ct % 50 == 0:
             logger.info(
                 "decoupled bet: armed=%d hit=%d miss=%d skips=%s miss_why=%s",
@@ -3335,7 +3361,7 @@ class EnumDraftEngine:
                 dict(self._bet_miss_why),
             )
 
-    def _bet_check_and_push(
+    def _bet_account(
         self,
         *,
         keys: list[DraftReqKey],
@@ -3343,11 +3369,10 @@ class EnumDraftEngine:
         selections: list[tuple[int, int]],
         f_live: int,
     ) -> None:
-        """Dispatch-head bet reconciliation: on a confirmed full-accept
-        commit, push the pre-produced block NOW (its pack event fired in the
-        idle window, so the wire copy starts immediately) and mark the
-        round's own identical block skip_push. Any other outcome drops the
-        bet -- state was never touched, so the drop is free."""
+        """Dispatch-head bet accounting (D20): the block already shipped
+        speculatively at arm time and the verifier's select is the real
+        arbiter -- this only scores the hypothesis so the A/B can read
+        hit/miss rates and the layered miss attribution."""
         bet = self._bet
         if bet is None or bet["key"] not in keys:
             return
@@ -3369,19 +3394,13 @@ class EnumDraftEngine:
             why = "dlen"
         elif f_live != bet["f_live"]:
             why = "f_live"
-        elif self.early_push_block is None:
-            why = "no_hook"
         else:
             why = None
-        hit = why is None
-        if hit:
+        if why is None:
             self.bet_hit_ct += 1
-            if envs.SGLANG_ENABLE_DECOUPLED_BET_EARLY_PUSH.get():
-                self.early_push_block(bet["verifier_rank"], bet["packed"])
-                self._bet_pushed_this_round = True
             if self.bet_hit_ct <= 5:
                 logger.info(
-                    "decoupled bet hit #%d: base=%d early push",
+                    "decoupled bet hit #%d: base=%d (shipped speculatively)",
                     self.bet_hit_ct,
                     bet["base_plus"],
                 )
@@ -3822,7 +3841,6 @@ class EnumDraftEngine:
         # backbone transients + carrier-destined pages until donation).
         scratch_kv_pages: list[torch.Tensor] = []
         self.profiler.start_round()
-        self._bet_pushed_this_round = False
         try:
             hit_keys: list[DraftReqKey] = []
             hit_states: list[_DraftReqState] = []
@@ -3862,11 +3880,7 @@ class EnumDraftEngine:
                     slow_states.append(state)
             f_live = max(1, min(int(self.effective_fanout), self.fanout))
             if self._bet is not None:
-                # Bet reconciliation BEFORE any round work: a confirmed
-                # full-accept pushes the pre-produced block immediately (its
-                # pack event fired in the idle window), taking the whole
-                # armed production off the verifier's critical path.
-                self._bet_check_and_push(
+                self._bet_account(
                     keys=keys,
                     hit_keys=hit_keys,
                     selections=selections,
@@ -4038,12 +4052,6 @@ class EnumDraftEngine:
                     "units_device": torch.cat([part["units_device"] for part in parts]),
                     "ready_event": self._record_units_ready(),
                 }
-            if self._bet_pushed_this_round:
-                # The bet's early push already carried this commit's block
-                # (identical content); a second real push would rotate the
-                # verifier's generation ping-pong onto the slot it is
-                # selecting from.
-                packed["skip_push"] = True
             return packed
         finally:
             with self.profiler.stage("free-scratch"):

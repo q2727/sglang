@@ -442,20 +442,20 @@ class Envs:
     # wrong bet is rolled back and costs only idle drafter time. ZMQ data
     # plane only.
     SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN = EnvBool(False)
-    # Decoupled spec, "half bet": at every arm, enqueue a full-accept NEXT
+    # Decoupled spec bet prebuild: at every arm, enqueue a full-accept NEXT
     # block production ahead of the commit gate on the SAME stream (the same
     # skeleton / carrier rows / graphs as the armed round, commit_scatter
     # replaced by constant hypothesis fills), so its kernels fill the
     # drafter's idle window with zero extra host wakeups. Seat state stays
-    # untouched (shadow recurrent slot + glue re-fork); a wrong bet is
-    # dropped for free. On a confirmed hit the pre-packed block is pushed at
-    # dispatch head on a dedicated stream, removing the armed production
-    # (~a block of GPU time) from the verifier's critical path; the armed
-    # round still runs and keeps all bookkeeping.
+    # untouched (re-seeded shadow recurrent slot + glue re-fork). The packed
+    # block ships SPECULATIVELY into the verifier's dedicated generation the
+    # moment it exists (before the commit round-trip): the verifier's
+    # stamp-matching select is the hit arbiter, a wrong bet is never
+    # selected and the next bet overwrites it; the real-block path is
+    # untouched. ZMQ data plane only.
     SGLANG_ENABLE_DECOUPLED_BET_PREBUILD = EnvBool(False)
-    # Bet-prebuild bisect switch: keep the bet production + hit accounting
-    # but suppress the early push / skip_push consumption (the block then
-    # ships on the normal armed-round path). Diagnostic A/B lever.
+    # Bet-prebuild bisect switch: keep the bet production + accounting but
+    # suppress the speculative push. Diagnostic A/B lever.
     SGLANG_ENABLE_DECOUPLED_BET_EARLY_PUSH = EnvBool(True)
     # Decoupled spec: minimum shared-prefix length (tokens) before the
     # drafter's branch decode switches to two-level cascade attention (read
