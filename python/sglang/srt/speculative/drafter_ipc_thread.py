@@ -33,6 +33,8 @@ from sglang.srt.speculative.decoupled_spec_transport import (
     BaseDecoupledSpecTransport,
     TransportClosed,
 )
+from sglang.srt.utils.common import set_native_thread_name
+from sglang.srt.utils.thread_band_recorder import register_thread_band_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,11 @@ class DrafterIpcThread:
         self._closed = threading.Event()
         # Wakes the idle loop the instant a result is queued (latency-critical send).
         self._wakeup = threading.Event()
+        # Side-band trace recorder (kineto cannot see this thread; the bands
+        # are injected into the exported trace). Registered here so the
+        # test-driven _step() path works without _run(); the track's tid is
+        # stamped by the first band recorded on the worker thread.
+        self._bands = register_thread_band_recorder("sgl-draft-ipc")
         self._thread = threading.Thread(
             target=self._run,
             name="sglang-drafter-ipc",
@@ -189,6 +196,8 @@ class DrafterIpcThread:
         return did_work
 
     def _run(self) -> None:
+        # pthread name: py-spy / top -H / kernel-side identification.
+        set_native_thread_name("sgl-draft-ipc")
         while not self._closed.is_set():
             try:
                 if not self._step():
@@ -224,13 +233,14 @@ class DrafterIpcThread:
                 # the gate -- a batch-level sync before any publish would
                 # deadlock that chain until the gate's timeout.
                 for commit in control_batch.verify_commit_messages:
-                    landed_event = self._commit_mirror.land(commit)
-                    if landed_event is not None:
-                        landed_event.synchronize()
-                    if self._on_commits_landed is not None:
-                        self._on_commits_landed([commit])
+                    with self._bands.band("drafter_ipc.land_commit"):
+                        landed_event = self._commit_mirror.land(commit)
+                        if landed_event is not None:
+                            landed_event.synchronize()
+                        if self._on_commits_landed is not None:
+                            self._on_commits_landed([commit])
                 self._commit_mirror.record_landing()
-            with self._inbox_lock:
+            with self._inbox_lock, self._bands.band("drafter_ipc.inbox_controls"):
                 self._control_inbox.add_control_batch_locked(control_batch)
         return did_work
 
@@ -302,7 +312,8 @@ class DrafterIpcThread:
             self._evented_fifo.popleft()
             batch = head.header
             if head.buffer is not None:
-                batch.tokens = tuple(head.buffer[: head.num_tokens].tolist())
+                with self._bands.band("drafter_ipc.read_staging"):
+                    batch.tokens = tuple(head.buffer[: head.num_tokens].tolist())
             batch.sent_unix_ts = time.time()
             self._send_draft_results(batch)
             if head.on_sent is not None:
@@ -317,7 +328,8 @@ class DrafterIpcThread:
         # verifier, each already addressed.
         if not result_batch.pool_indices:
             return
-        self.transport.send(
-            int(result_batch.dst_verifier_rank),
-            DraftMeshMessage.from_enumeration_buffer_batch(result_batch),
-        )
+        with self._bands.band("drafter_ipc.send_block"):
+            self.transport.send(
+                int(result_batch.dst_verifier_rank),
+                DraftMeshMessage.from_enumeration_buffer_batch(result_batch),
+            )

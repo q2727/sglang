@@ -85,6 +85,7 @@ import copy
 import logging
 import time
 from array import array
+from collections import deque
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -112,6 +113,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+# Recent host-band samples kept per stage for the tail statistics
+# (_RoundProfiler.band_summary); a ring, so a long run cannot grow it.
+_BAND_SAMPLE_CAP = 2048
 
 
 class _ScratchTreeCache(SimpleNamespace):
@@ -161,7 +166,7 @@ class _PrebuiltFastRound(msgspec.Struct):
     keys: tuple
     base_lens: list[int]
     batch: ScheduleBatch
-    slots: torch.Tensor  # [bs * (K+1)] seat-major
+    slots: torch.Tensor  # [bs * _preadvance_alloc_width] seat-major
     slot_positions: list[int]  # logical positions, aligned with ``slots``
     graph_round: _ExtendGraphRound
     scratch_batches: list
@@ -171,12 +176,29 @@ class _PrebuiltFastRound(msgspec.Struct):
     # case-independent (tail span = [page_floor(base), base); fork source =
     # the seat's post-absorb state, stable until the next round).
     glue_seeded: bool = False
+    # Stale-consume shift (verifier-style overlap): the skeleton was built
+    # with a base d tokens behind the true one, so the true delta's slots sit
+    # at slots[shift : shift + dlen] (alloc_extend slots are aligned by
+    # logical position -- the shift IS the re-base). Set by
+    # _rebase_prebuilt_for_arm; 0 for a fresh skeleton.
+    slot_shift: int = 0
+    # Diagnostics: did the re-base move the page anchor (page_floor of the
+    # base crossed a boundary)? Bucketed against the round's outcome to
+    # localize the rebased-round draft-quality defect.
+    rebase_crossed: bool = False
     # bs == 1 only: per-case fused-extend staging, indexed by delta_len - 1.
     case_staging: Optional[list] = None
     # bs == 1 only: per-case staging tensors stacked for the commit-scatter
     # kernel's case indexing: (gather [K+1, rows*W], out_cache_loc
     # [K+1, rows*W], true_lens [K+1, rows]).
     scatter_stacks: Optional[tuple] = None
+    # bs == 1 only: scatter_stacks precomputed for EVERY stale-consume shift
+    # d in [0, K+1] (indexed by d; entry 0 aliases scatter_stacks). Only the
+    # out_cache_loc plane varies with d (delta slots shift inside the widened
+    # allocation, glue slices and pad offsets follow base+d); everything is
+    # host-static at restage, so the arm-time re-base is one list index
+    # instead of a rebuild.
+    stacks_by_shift: Optional[list] = None
     # bs == 1 only: ONE prebuilt replay ForwardBatch shared by every accept
     # case -- under uniform-W padding the positions / seq-lens family /
     # extend metadata are case-INDEPENDENT (prefix == base for all rows), so
@@ -190,6 +212,36 @@ class _PrebuiltFastRound(msgspec.Struct):
     # consuming round waits on it (record-then-wait) before touching any
     # prebuilt tensor.
     ready_event: Optional[torch.cuda.Event] = None
+
+
+class _HostBand:
+    """Sync-free host-wall timer wrapped around a stage's trace range.
+
+    The device is never touched, so a stage that BLOCKS in the driver (a graph
+    launch submitting its nodes, a pageable copy draining the stream) reports
+    that block as its own cost -- which is the whole point: under a torch
+    profile, CUPTI's per-graph-node tracing inflates ``cudaGraphLaunch`` by
+    roughly a microsecond per node, so the trace cannot answer how long the
+    launch really takes. Two ``perf_counter`` calls per stage, only when
+    ``SGLANG_DEBUG_DECOUPLED_HOST_BANDS`` is on.
+    """
+
+    __slots__ = ("_sink", "_name", "_range", "_t0")
+
+    def __init__(self, sink: _RoundProfiler, name: str, range_cm) -> None:
+        self._sink = sink
+        self._name = name
+        self._range = range_cm
+        self._t0 = 0.0
+
+    def __enter__(self):
+        self._range.__enter__()
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._sink.add_band_ms(self._name, 1000.0 * (time.perf_counter() - self._t0))
+        return self._range.__exit__(exc_type, exc, tb)
 
 
 class _RoundProfiler:
@@ -210,14 +262,49 @@ class _RoundProfiler:
 
     def __init__(self, *, enabled: bool) -> None:
         self.enabled = enabled
+        # Independent of `enabled`: the sync-free band timers (see _HostBand).
+        self.host_bands = envs.SGLANG_DEBUG_DECOUPLED_HOST_BANDS.get()
         self.round_ct = 0
         self.phase_ms: dict[str, float] = {}
+        self.band_ms: dict[str, float] = {}
+        self.band_ct: dict[str, int] = {}
+        # Per-band recent samples for the tail (see band_summary): a mean
+        # hides the stage that blocks for milliseconds every ~10 rounds,
+        # and that tail is what actually eats the drafter's lead.
+        self.band_samples: dict[str, deque] = {}
         self._t_last = 0.0
 
-    @staticmethod
-    def stage(name: str):
+    def stage(self, name: str):
         """Name a round stage for the trace (no device sync)."""
-        return profile_range(f"drafter.{name.replace('-', '_')}")
+        span = profile_range(f"drafter.{name.replace('-', '_')}")
+        if not self.host_bands:
+            return span
+        return _HostBand(self, name.replace("-", "_"), span)
+
+    def add_band_ms(self, name: str, ms: float) -> None:
+        self.band_ms[name] = self.band_ms.get(name, 0.0) + ms
+        self.band_ct[name] = self.band_ct.get(name, 0) + 1
+        samples = self.band_samples.get(name)
+        if samples is None:
+            samples = self.band_samples[name] = deque(maxlen=_BAND_SAMPLE_CAP)
+        samples.append(ms)
+
+    def band_summary(self) -> str:
+        """One line of mean/p90/max ms-per-INSTANCE, biggest first (host wall,
+        no sync). The tail is reported because the mean cannot answer the
+        question these bands exist for: a stage that blocks for milliseconds
+        once every N rounds spends the lead the drafter holds over its own
+        GPU queue, and a 5% duty spike is invisible in an average."""
+        parts = []
+        for name, ms in sorted(
+            self.band_ms.items(), key=lambda kv: kv[1], reverse=True
+        ):
+            ct = max(self.band_ct[name], 1)
+            tail = sorted(self.band_samples.get(name, ()))
+            p90 = tail[min(len(tail) - 1, int(0.9 * len(tail)))] if tail else 0.0
+            hi = tail[-1] if tail else 0.0
+            parts.append(f"{name}={ms / ct:.3f}/{p90:.3f}/{hi:.3f}x{ct}")
+        return " ".join(parts)
 
     def start_round(self) -> None:
         if not self.enabled:
@@ -313,7 +400,9 @@ class _PinnedH2D:
 
 
 class _DraftReqState:
-    def __init__(self, *, req_pool_idx: int, device: torch.device) -> None:
+    def __init__(
+        self, *, req_pool_idx: int, device: torch.device, max_slots: int = 0
+    ) -> None:
         # The seat on the OWNING VERIFIER (echoed into every block row); this
         # engine's own scratch rows are unrelated and transient.
         self.req_pool_idx = req_pool_idx
@@ -324,7 +413,15 @@ class _DraftReqState:
         self.prompt_len = 0
         # Slot ids of the committed prefix's KV in the drafter's pool
         # (device-resident: the round must never sync on slot bookkeeping).
-        self.committed_slots = torch.empty((0,), dtype=torch.int64, device=device)
+        # Storage is a per-seat persistent ring (the FutureMap idiom: allocate
+        # once, extend by VIEW); committed_slots is always committed_ring[:n].
+        # The old per-round ``torch.cat`` re-allocated and re-copied the WHOLE
+        # prefix every round -- O(base) device copy + allocator churn for an
+        # O(dlen) append.
+        self.committed_ring = torch.empty(
+            (max(max_slots, 1),), dtype=torch.int64, device=device
+        )
+        self.committed_slots = self.committed_ring[:0]
         # Last round's block, kept for the glue fast path: the winning unit's
         # chain IS the next round's backbone (greedy re-draft is a no-op).
         self.last_units_dev: Optional[torch.Tensor] = None  # [K+1, F, K+1]
@@ -350,6 +447,44 @@ class _DraftReqState:
         # seat slot with bet tokens, so the stash restores it on a miss (and
         # is simply dropped on a hit).
         self.prerun_mamba_stash: Optional[torch.Tensor] = None
+        # NOTE(step-1 postmortem): do NOT hang a cross-round reused host array
+        # on the skeleton's Req (a per-seat fill-ids scratch was tried here
+        # and locked the fast path into a permanent case0 storm after ~65
+        # rounds -- the 2a signature, mechanism unexplained; bisected clean).
+        # The skeleton rebuilds its fill ids from committed_tokens each
+        # restage; the values are dead, only the length feeds the account.
+        #
+        # Persistent block buffers for the device-side pack (pack_units).
+        # PING-PONG, not one buffer: the pack now runs at ARM time, a full
+        # round before the host consumes the block, and the host's own match
+        # (_match_seat) still reads the PREVIOUS block off the pinned mirror.
+        # One buffer would let round N's pack clobber the mirror round N's
+        # match is about to read -- measured: host_sel=None every round, the
+        # fast path collapses to a case-0 storm (523 -> 245 tok/s). The armed
+        # pack writes the free slot; consumption flips (see
+        # _adopt_prepacked_block), so an unconsumed arm costs nothing.
+        self.units_pair: list[Optional[torch.Tensor]] = [None, None]
+        self.units_pins: list[Optional[torch.Tensor]] = [None, None]
+        self.units_idx = 0
+        self.pending_units_idx = -1
+        self.pending_mirror_event: Optional[torch.cuda.Event] = None
+        # Early-judge backbone twin, ON THE UNITS' CLOCK (pending + adopt),
+        # not a dispatch-side flip. The gated sequences run commit-driven
+        # and AHEAD of the scheduler's dispatches (the arrival board releases
+        # the gate the moment the commit lands, while the dispatch trails by
+        # milliseconds), so a dispatch-head flip hands the judge the twin the
+        # CURRENT sequence just wrote (chains_out N, one generation ahead;
+        # measured: prefix failed every case>=1 round, audit-miss 545/586,
+        # acc 3.94 -> 3.77). The units never had this bug because their
+        # pending pointer binds the producing sequence's output at arm time
+        # and only the NEXT dispatch's adopt makes it live -- so the backbone
+        # twin now rides the same pair/idx/adopt cadence (written at the
+        # pack, covered by the same pending_mirror_event).
+        self.backbone_pair: list[Optional[torch.Tensor]] = [None, None]
+        # Deferred host backbone (judge rounds skip the mirror read): the
+        # (mirror_event, pins, case, f) needed to materialize
+        # last_backbone_host lazily, only if a slow-path match ever needs it.
+        self.backbone_host_lazy: Optional[tuple] = None
 
     def pending_delta(self) -> list[int]:
         """Committed tokens whose KV has not been advanced yet."""
@@ -920,6 +1055,14 @@ class EnumDraftEngine:
         # capture-bucket overflow) and entirely (kill switch, or any
         # construction failure inside _build_extend_graph_runner).
         self._extend_graph_width = 2 * self.num_steps + 1
+        # Skeleton delta allocation width (verifier-style overlap, step 2):
+        # 2x the max commit delta, so a skeleton consumed ONE ROUND STALE
+        # (base drifted by d = prev dlen <= K+1) still holds the true delta's
+        # slots at pre.slots[d : d + dlen]. alloc_extend's slots are aligned
+        # by logical position (alloc_extend_naive: the partial page is pure
+        # last_loc arithmetic, whole pages come off free_pages), so the shift
+        # IS the fix -- no re-allocation. Today's consumers read d = 0.
+        self._preadvance_alloc_width = 2 * (self.num_steps + 1)
         self._extend_graph_pad_span = (
             self._page_roundup(self._page_size - 1 + self._extend_graph_width)
             if self._paged
@@ -988,7 +1131,9 @@ class EnumDraftEngine:
         # ride a dedicated stream, so a ROUND-TAIL restage never barriers on
         # the round's still-draining GPU tail (the reason the old idle-window
         # prebuild almost never fired at tight cadence).
-        self._prebuild_stream = torch.cuda.Stream()
+        # Explicit priority 0, matching the scheduler's schedule_stream
+        # convention (CUDA: lower number = higher priority, 0 = default).
+        self._prebuild_stream = torch.cuda.Stream(priority=0)
         self._chain_plan = envs.SGLANG_ENABLE_DECOUPLED_CHAIN_PLAN.get()
         self._chain_graph = None
         if self._chain_plan and envs.SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH.get():
@@ -1053,8 +1198,21 @@ class EnumDraftEngine:
         self._prelaunch_absorb_why = {"burst": 0, "taint": 0, "carrier": 0, "dlen": 0}
         self._prelaunch_gate_release_ct = 0
         self._prelaunch_gate_timeout_ct = 0
+        # Lead margin: how long the armed sequence sat in the queue before its
+        # commit landed (accumulated inside gate_fn, gate thread only). ~0
+        # means the arm barely beat the commit; the verify cadence minus the
+        # round-serial host chain is the expected steady-state value.
+        self._prelaunch_gate_lead_s = 0.0
         self._prelaunch_forced_logged = 0
         self._align_drop_logged = 0
+        # Lead probe: an event recorded at each arm, queried at the NEXT arm.
+        # Ready == the device already drained everything queued up to the
+        # previous arm, i.e. the host holds no lead and the GPU is waiting on
+        # it. A profiler cannot answer this (CUPTI's per-node graph-launch
+        # tax changes the very quantity being measured), so it is one event
+        # record plus one non-blocking query per round, always on.
+        self._lead_probe: Optional[torch.cuda.Event] = None
+        self._lead_caught_ct = 0
         self._prelaunch_attempt_ct = 0
         self._prelaunch_skip_why = {
             "off": 0,
@@ -1064,7 +1222,70 @@ class EnumDraftEngine:
             "warm": 0,
             "landed": 0,
             "gate": 0,
+            "stale": 0,
         }
+        # Stale-skeleton re-bases performed at arm (verifier-style overlap:
+        # the skeleton was built against an older base and normalized here).
+        self._prelaunch_rebase_ct = 0
+        # Defect-localization buckets: (resolve action, producing round's
+        # slot_shift, its page-crossing flag) -> count. The producing round
+        # is the PREVIOUS armed record (its block is what the verdict judges).
+        self._resolve_by_rebase: dict[tuple, int] = {}
+        self._prev_block_meta: Optional[tuple] = None
+        self._last_resolved_dlen = 0
+        # Debug: build every bs==1 skeleton d tokens STALE on purpose, so the
+        # arm-time re-base machinery is exercised under today's round order.
+        # e2e output must stay byte-identical.
+        self._stale_inject = envs.SGLANG_DEBUG_DECOUPLED_STALE_INJECT.get()
+        self._block_hash_log = envs.SGLANG_DEBUG_DECOUPLED_BLOCK_HASH.get()
+        self._device_pack_enabled = envs.SGLANG_ENABLE_DECOUPLED_DEVICE_PACK.get()
+        # Early judge: the routing judgment (which unit did the commit hit)
+        # only depends on the previous round's TOPK output -- not on its
+        # 4ms chain-graph tail -- so a µs kernel on its own gated stream can
+        # judge the commit the moment it lands, unblocking the host a whole
+        # sequence-tail earlier than the gated scatter can. Requires the
+        # device pack (the guess plane rides the same live-mask discipline).
+        self._early_judge_enabled = (
+            envs.SGLANG_ENABLE_DECOUPLED_EARLY_JUDGE.get() and self._device_pack_enabled
+        )
+        self._judge_stream = (
+            torch.cuda.Stream(priority=0) if self._early_judge_enabled else None
+        )
+        # The match half waits on previous-generation pack events; on the
+        # same stream those waits would park the NEXT round's seg kernel
+        # (host syncs seg -> inherits the whole chain, measured 9ms rounds).
+        self._judge_match_stream = (
+            torch.cuda.Stream(priority=0) if self._early_judge_enabled else None
+        )
+        # Ping-pong (parity = arm counter & 1): the audit reads a record's
+        # pin one dispatch AFTER the next judge may already be rewriting the
+        # other one on the judge stream.
+        self._judge_buf_pair = [
+            torch.zeros(40, dtype=torch.int64, device=self.device) for _ in range(2)
+        ]
+        self._judge_pin_pair = [
+            torch.zeros(40, dtype=torch.int64, pin_memory=True) for _ in range(2)
+        ]
+        self._judge_seg_buf = torch.zeros(5, dtype=torch.int64, device=self.device)
+        self._judge_seg_pin = torch.zeros(5, dtype=torch.int64, pin_memory=True)
+        self._judge_latch: Optional[torch.Tensor] = None  # sized off the mirror
+        # Deferred (case,f) reconciliation for an optimistic route: (match
+        # event, seat state, optimistic case, pin parity, launch context).
+        self._judge_audit: Optional[tuple] = None
+        self._judge_armed_ct = 0
+        self._judge_route_ct = 0
+        self._judge_opt_ct = 0
+        self._judge_opt_miss_ct = 0
+        self._judge_opt_bad_ct = 0
+        # An unconsumed audit overwritten by the next optimistic route (its
+        # placeholder fanout then never back-fills).
+        self._judge_audit_dropped_ct = 0
+        self._audit_dump_ct = 0
+        self._audit_hit_dump_ct = 0
+        self._judge_check = envs.SGLANG_DEBUG_DECOUPLED_JUDGE_CHECK.get()
+        self._judge_check_logged = 0
+        self._judge_gate2_release_t = 0.0
+        self._dump_base = envs.SGLANG_DEBUG_DECOUPLED_DUMP_BASE.get()
         # Chain pre-queueing (the chain replay joining the gate sequence):
         # separate counters -- an extend-only pre-launch still proceeds when
         # the chain half cannot arm (cold bucket / missing carrier tables).
@@ -1076,18 +1297,45 @@ class EnumDraftEngine:
         # Arm-static chain metadata, rebuilt when (f_live, tail, base) moves:
         # base+case vector, off0 = tail+case+step, and the COW piece lists.
         self._chain_arm_cache: Optional[dict] = None
+        # Engine-lifetime constant staging planes (see _case_static_planes).
+        self._case_static_planes_cache: Optional[tuple] = None
+        # Full-grid position -> chain-output row maps, one per f_live (the
+        # variant's sel_rows_pool inverted), for the device-side pack.
+        self._pack_rowmap_cache: dict[int, torch.Tensor] = {}
+        # Skeleton lifetime pinning (the scheduler's batch_record_buf idiom):
+        # (event, skeleton) pairs whose refs are held until the event --
+        # recorded AFTER the skeleton's last enqueued use -- fires. Replaces
+        # the per-tensor record_stream storm (25/round, one allocator-lock
+        # acquisition each; see dp_attention's 270GB reserved-balloon note
+        # for why record_stream at this frequency is the wrong tool).
+        self._retired_prebuilt: deque = deque()
+        # Non-armed consumers retire at round tail (their uses span the
+        # round); collected here and flushed with ONE event per round.
+        self._round_retire_pending: list = []
         # Scatter-consume scratch: verdict sink (never host-read on the hot
         # path) and the chains buffer the topk stage reuses.
-        self._scatter_verdict = torch.zeros(10, dtype=torch.int64, device=self.device)
-        self._scatter_chains = torch.zeros(
-            max(1, self.num_steps), dtype=torch.int64, device=self.device
+        self._scatter_verdict = torch.zeros(11, dtype=torch.int64, device=self.device)
+        self._scatter_chains = torch.full(
+            (max(1, self.num_steps),), -1, dtype=torch.int64, device=self.device
         )
         self._scatter_node = torch.zeros(
             self.num_steps + 1, dtype=torch.int64, device=self.device
         )
         self._prelaunch_verdict_pin = torch.zeros(
-            10, dtype=torch.int64, pin_memory=True
+            11, dtype=torch.int64, pin_memory=True
         )
+        # Seat-indexed committed base length, mirroring the framework's
+        # pool-indexed relay buffers (FutureMap.new_seq_lens_buf). The scatter
+        # kernel reads the base from HERE rather than from a host scalar the
+        # caller happened to know: the column a pad lands at is a "where", and
+        # every other "where" in that kernel already comes from the device.
+        # The host still OWNS the value (_publish_seat_base writes it), so
+        # today this is plumbing with no behavioural delta; what it buys is
+        # that the kernel no longer requires its caller to hold the base.
+        # Sized in attach_commit_mirror, not here: seats are VERIFIER
+        # req_to_token rows -- a different index space from this engine's own
+        # pool -- and the mirror is the object that already owns that space.
+        self._seat_base_lens_dev: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ #
     # Fused-extend CUDA graph: construction (init-time)
@@ -1295,7 +1543,11 @@ class EnumDraftEngine:
     ) -> None:
         # Re-open (retraction re-sync) drops the old prefix KV entirely.
         self.close(key)
-        state = _DraftReqState(req_pool_idx=req_pool_idx, device=self.device)
+        state = _DraftReqState(
+            req_pool_idx=req_pool_idx,
+            device=self.device,
+            max_slots=self.model_runner.req_to_token_pool.req_to_token.shape[1],
+        )
         state.committed_tokens = list(prompt_tokens) + list(committed_outputs)
         state.prompt_len = len(prompt_tokens)
         if self._hybrid:
@@ -1310,6 +1562,18 @@ class EnumDraftEngine:
     def attach_commit_mirror(self, mirror, board) -> None:
         self._commit_mirror = mirror
         self._commit_board = board
+        # Same seat space as the mirror rows the scatter kernel indexes.
+        self._seat_base_lens_dev = torch.zeros(
+            mirror.rows.shape[0], dtype=torch.int64, device=self.device
+        )
+
+    def _publish_seat_base(self, *, seat: int, base_len: int) -> None:
+        """Publish a seat's committed base length for the scatter kernel.
+
+        A scalar fill on the current stream -- no H2D, no sync -- ordered ahead
+        of the scatter launch that reads it.
+        """
+        self._seat_base_lens_dev[seat].fill_(base_len)
 
     def _probe_gpu_match(
         self, state: _DraftReqState, selection: Optional[tuple[int, int]]
@@ -1457,7 +1721,14 @@ class EnumDraftEngine:
         # indices. Case 0 sources the seat tail + ALL K+1 enumerated delta
         # slots; case c >= 1 sources glue row c-1's private head.
         committed_ref = state.committed_slots
-        seat_sup = torch.cat([committed_ref[anchor:], pre.slots.view(num_steps + 1)])
+        # This round's K+1 delta candidates inside the widened allocation:
+        # slot_shift re-bases a stale skeleton's window (0 when fresh).
+        seat_sup = torch.cat(
+            [
+                committed_ref[anchor:],
+                pre.slots.view(-1)[pre.slot_shift : pre.slot_shift + num_steps + 1],
+            ]
+        )
         src_pieces: list[torch.Tensor] = []
         dst_pieces: list[torch.Tensor] = []
         for row, case in zip(variant.sel_rows_pool, variant.case_of_row):
@@ -1538,11 +1809,17 @@ class EnumDraftEngine:
                     int(fork[1].max()),
                     int(fork[0].numel()),
                 )
-        tokens = self._chain_graph.fire_armed(
-            rows=rows_sel,
-            first_tokens=branch_out.reshape(-1),
-            forked=forked,
-        )
+        # Its own band: this is the ~950-node graph LAUNCH, the one call that
+        # can block the host in the driver when the submission queue is full.
+        # Under a torch profile CUPTI inflates it beyond recognition, so the
+        # tail of THIS sync-free band is the only way to tell whether the
+        # block is real in production.
+        with self.profiler.stage("arm_chain_fire"):
+            tokens = self._chain_graph.fire_armed(
+                rows=rows_sel,
+                first_tokens=branch_out.reshape(-1),
+                forked=forked,
+            )
         self._prelaunch_chain_ct += 1
         # Keepalive: every enqueued kernel above (cat / COW / meta / replay)
         # executes only after the gate releases -- up to the gate budget
@@ -1616,14 +1893,45 @@ class EnumDraftEngine:
             rec["tainted"] = True
             return "keep", None
         self._prelaunched = None
-        # Bounded: a commit landed for this seat, so the gate released and
-        # the gated round is executing (or long done); this waits out the
-        # kernel-tail microseconds before the pinned verdict read.
-        rec["verdict_event"].synchronize()
-        verdict = int(self._prelaunch_verdict_pin[0].item())
-        kernel_case = int(self._prelaunch_verdict_pin[1].item())
-        kernel_f = int(self._prelaunch_verdict_pin[2].item())
-        kernel_delta_len = int(self._prelaunch_verdict_pin[3].item())
+        jv = rec.get("judge_verdict")
+        if jv is not None and landed_stamp > rec["base_out_len"] + max(jv[3], 0):
+            # Burst window: another commit landed after the one the judge
+            # framed. The scatter (which matches independently, lag later)
+            # may have consumed a different segment -- the data plane's own
+            # verdict is the only safe account; fall through to it.
+            jv = None
+        if jv is not None:
+            # Early judge already synced + read in the classification loop.
+            # The scatter matches the same inputs independently (same
+            # deterministic kernel recipe as the months-old host-match /
+            # scatter pair, forced=0) -- no verdict_event wait needed.
+            verdict, kernel_case, kernel_f, kernel_delta_len = jv
+        else:
+            # Bounded: a commit landed for this seat, so the gate released
+            # and the gated round is executing (or long done); this waits out
+            # the kernel-tail microseconds before the pinned verdict read.
+            # Banded on its own: the comment below calls this "kernel-tail
+            # microseconds", but that only holds while the gate opened long
+            # ago. When the host arrives before the gated sequence has run,
+            # this is a GPU wait wearing the dispatch band's clothes -- and a
+            # torch profile cannot see it, because the profiler's own
+            # overhead hands the GPU the head start that makes it vanish.
+            with self.profiler.stage("resolve_wait"):
+                rec["verdict_event"].synchronize()
+            verdict = int(self._prelaunch_verdict_pin[0].item())
+            kernel_case = int(self._prelaunch_verdict_pin[1].item())
+            kernel_f = int(self._prelaunch_verdict_pin[2].item())
+            kernel_delta_len = int(self._prelaunch_verdict_pin[3].item())
+        # Diagnostics: the delta THIS record consumed (== the accept count of
+        # the round whose block the NEXT resolve will judge).
+        self._last_resolved_dlen = kernel_delta_len
+        if self._dump_base:
+            rec_state = self._states.get(rec["keys"][0])
+            if (
+                rec_state is not None
+                and len(rec_state.committed_tokens) == self._dump_base
+            ):
+                self._dump_armed_round(rec=rec, state=rec_state)
         rec["verdict"] = verdict
         if verdict in (0, 3):
             # 0 = stale (gate lost the race); 3 = landed but the frame could
@@ -1674,7 +1982,7 @@ class EnumDraftEngine:
                 delta_lens=[kernel_delta_len],
                 scratch_slots=scratch_slots,
             )
-            state.committed_slots = torch.cat([state.committed_slots, kept])
+            self._extend_committed(state, kept)
             self._prelaunch_absorb_ct += 1
             return "absorbed", rec
         if (
@@ -1811,6 +2119,581 @@ class EnumDraftEngine:
         finally:
             self._h2d = prev_h2d
 
+    def _dump_armed_round(self, *, rec: dict, state: _DraftReqState) -> None:
+        """Debug-only (full device sync): dump the armed round's advance-row
+        inputs at the configured base -- the healthy-vs-defective diff of
+        this dump names the corrupted tensor (see the env var note)."""
+        torch.cuda.synchronize()
+        pre = rec["pre"]
+        fb = pre.replay_fb
+        width = self._extend_graph_width
+        base = len(state.committed_tokens)
+        row = int(pre.batch.reqs[0].req_pool_idx)
+        pool = self.model_runner.req_to_token_pool
+        lo = max(0, base - 10)
+        logger.info(
+            "arm-dump base=%d shift=%d input=%s out_loc=%s true=%s pos=%s "
+            "seq=%s prefix_lens=%s",
+            base,
+            pre.slot_shift,
+            fb.input_ids[:width].tolist(),
+            fb.out_cache_loc[:width].tolist(),
+            fb.spec_info.gdn_true_extend_lens_tensor.tolist(),
+            fb.positions[:width].tolist(),
+            fb.seq_lens.tolist(),
+            fb.extend_prefix_lens.tolist(),
+        )
+        logger.info(
+            "arm-dump table[%d:%d]=%s committed_tail=%s",
+            lo,
+            base + width,
+            pool.req_to_token[row, lo : base + width].tolist(),
+            state.committed_slots[lo:base].tolist(),
+        )
+        if self._hybrid and state.mamba_slot is not None:
+            idx = pool.translate_mamba_indices(state.mamba_slot)
+            cache = pool.mamba_pool.mamba_cache
+            conv_sum = float(cache.conv[0][:, idx].float().sum().item())
+            temporal_sum = float(cache.temporal[:, idx].float().sum().item())
+            logger.info(
+                "arm-dump mamba conv0_sum=%.6e temporal_sum=%.6e",
+                conv_sum,
+                temporal_sum,
+            )
+        # Glue row 0's window for contrast (its guesses were bit-exact).
+        logger.info(
+            "arm-dump glue0 input=%s out_loc=%s",
+            fb.input_ids[width : 2 * width].tolist(),
+            fb.out_cache_loc[width : 2 * width].tolist(),
+        )
+
+    def _arm_pack_units(
+        self,
+        *,
+        state: _DraftReqState,
+        chain_tokens: Optional[list],
+        guesses_out: torch.Tensor,
+        f_live: int,
+    ) -> bool:
+        """Enqueue the device-side pack behind the armed chain (see
+        _pack_units_kernel). Returns False (dispatch keeps the legacy host
+        pack) when the chain half did not arm this round."""
+        if chain_tokens is None or not self._device_pack_enabled:
+            return False
+        from sglang.srt.speculative.decoupled_fused_ops import pack_units
+
+        num_cases = self.num_steps + 1
+        rowmap = self._rowmap_for(f_live)
+        nxt = 1 - state.units_idx
+        if state.units_pair[nxt] is None:
+            state.units_pair[nxt] = torch.zeros(
+                num_cases,
+                self.fanout,
+                self.num_steps + 1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            state.units_pins[nxt] = torch.empty(
+                state.units_pair[nxt].shape, dtype=torch.int64, pin_memory=True
+            )
+        pack_units(
+            units_buf=state.units_pair[nxt],
+            guesses=guesses_out.view(num_cases, -1),
+            chains_stacked=torch.stack(chain_tokens),
+            rowmap=rowmap,
+            verdict=self._scatter_verdict,
+            num_steps=self.num_steps,
+            fanout=self.fanout,
+        )
+        # Backbone twin, same pending slot & clock as the block itself: the
+        # value is this sequence's chains_out (nothing rewrites the static
+        # buffer between the scatter and here, stream-ordered), and writing
+        # it at the pack -- the sequence TAIL -- keeps the next sequence's
+        # overwrite a full commit away from a reader of the other slot.
+        # (Copying the fresh chain-graph tokens here instead of chains_out
+        # was the second Wave-C defect: acc 3.94 -> 2.55.)
+        if self._early_judge_enabled:
+            if state.backbone_pair[nxt] is None:
+                state.backbone_pair[nxt] = torch.zeros(
+                    max(1, self.num_steps), dtype=torch.int64, device=self.device
+                )
+            state.backbone_pair[nxt][: self.num_steps].copy_(self._scatter_chains)
+        state.units_pins[nxt].copy_(state.units_pair[nxt], non_blocking=True)
+        mirror_event = torch.cuda.Event()
+        mirror_event.record()
+        state.pending_mirror_event = mirror_event
+        state.pending_units_idx = nxt
+        return True
+
+    def _audit_judge(self, *, blocking: bool = False) -> None:
+        """Reconcile the last optimistic route with the (case, f) match half
+        (see _judge_match): a real hit back-fills the placeholder fanout in
+        the lazy backbone; a real miss zeroes the host backbone ledger (the
+        device twin is -1s already, self-consistent by construction). Called
+        cheaply (query) at every dispatch head; ``blocking`` only from the
+        lazy-backbone materializer, which must not read a placeholder."""
+        if self._judge_audit is None:
+            return
+        ev, state, case, parity, ctx = self._judge_audit
+        if not ev.query():
+            if not blocking:
+                return
+            ev.synchronize()
+        self._judge_audit = None
+        pin = self._judge_pin_pair[parity]
+        verdict = int(pin[0].item())
+        f = int(pin[2].item())
+        # Phase forensics, JUDGE_CHECK-gated: on low-accept content a real
+        # fallback round is a legitimate miss (bonus not in the guess column,
+        # fail_i=-1), so an always-on dump just prints 40 healthy rounds.
+        dump_this = self._judge_check and (
+            (verdict != 2 and self._audit_dump_ct < 40)
+            or (verdict == 2 and self._audit_hit_dump_ct < 8)
+        )
+        if dump_this:
+            if verdict != 2:
+                self._audit_dump_ct += 1
+            else:
+                self._audit_hit_dump_ct += 1
+            audit_t = time.perf_counter()
+            # Phase triplet (v18's one-shot discriminator): match_lag_us =
+            # pin[15] - seg anchor, both device-clock ns. Lag beyond the
+            # round period means the match executed after the NEXT commit
+            # had landed (input-overwrite territory); a small lag with a
+            # still-wrong verdict means the inputs themselves were the wrong
+            # generation (or the miss is real and the gap is pacing).
+            logger.info(
+                "audit %s pin=%s case=%d parity=%d launch_route=%d "
+                "audit_route=%d match_lag_us=%.0f launch_to_audit_ms=%.2f "
+                "sync_ms=%.2f base=%d hdelta=%s bb_len_launch=%d "
+                "bb_host_launch=%s bb_host_now=%s seg_toks=%s bonus=%d "
+                "fail_i=%d committed_tail=%s kbase=%d sel_off=%d slot0=%s "
+                "slot1=%s",
+                "MISS" if verdict != 2 else "HIT",
+                pin[:21].tolist(),
+                case,
+                parity,
+                ctx["route_ct"],
+                self._judge_route_ct,
+                (int(pin[15].item()) - ctx["seg_gpu_ns"]) / 1e3,
+                (audit_t - ctx["launch_t"]) * 1e3,
+                (ctx["sync_t"] - ctx["launch_t"]) * 1e3,
+                ctx["base_out_len"],
+                ctx.get("host_delta"),
+                ctx["bb_len"],
+                ctx["bb_host"],
+                state.last_backbone_host,
+                pin[16:19].tolist(),
+                int(pin[19].item()),
+                int(pin[20].item()),
+                list(state.committed_tokens[-12:]),
+                int(pin[21].item()),
+                int(pin[22].item()),
+                pin[24:28].tolist(),
+                pin[28:32].tolist(),
+            )
+            # Physical-plane identity check (blocking D2H; capped by the dump
+            # counters): which pair slot holds the values the kernel loaded.
+            logger.info(
+                "audit planes live_id=%x live=%s pair0=%s pair1=%s",
+                id(state.last_backbone_dev) & 0xFFFF,
+                (
+                    state.last_backbone_dev[: self.num_steps].tolist()
+                    if state.last_backbone_dev is not None
+                    else None
+                ),
+                (
+                    state.backbone_pair[0][: self.num_steps].tolist()
+                    if state.backbone_pair[0] is not None
+                    else None
+                ),
+                (
+                    state.backbone_pair[1][: self.num_steps].tolist()
+                    if state.backbone_pair[1] is not None
+                    else None
+                ),
+            )
+        if verdict == 2:
+            lazy = state.backbone_host_lazy
+            if lazy is not None and lazy[2] == case:
+                state.backbone_host_lazy = (lazy[0], lazy[1], case, f)
+        elif verdict == 1:
+            # Optimistic hit was in fact a miss. Fix ONLY the host ledger
+            # (a later slow-path match must see an empty backbone); never
+            # touch last_backbone_len -- the device twin holds -1s on a miss
+            # (scatter's chains_out), which fails every prefix compare BY
+            # VALUE, so len=K stays self-consistent. Zeroing it here poisoned
+            # the next match's kernel arg after the fast round had already
+            # re-set it: one real miss locked a permanent miss loop
+            # (opt miss 837/838).
+            lazy = state.backbone_host_lazy
+            if lazy is not None and lazy[2] == case and lazy[3] == 0:
+                state.backbone_host_lazy = None
+                state.last_backbone_host = []
+            self._judge_opt_miss_ct += 1
+        else:
+            # seg said "consumable" but the match half saw none: only a
+            # burst overwrite between the two reads can do this (the stamp
+            # guard in resolve already rerouted the account). Count it.
+            self._judge_opt_bad_ct += 1
+
+    def _rowmap_for(self, f_live: int) -> torch.Tensor:
+        """Full-grid position -> chain output row (-1 dead) for a live
+        fanout; device-cached per width (see pack_units)."""
+        rowmap = self._pack_rowmap_cache.get(f_live)
+        if rowmap is None:
+            variant = self._fanout_variant(f_live)
+            rowmap_host = torch.full(
+                ((self.num_steps + 1) * self.fanout,), -1, dtype=torch.int32
+            )
+            for j, pos in enumerate(variant.sel_rows_pool):
+                rowmap_host[int(pos)] = j
+            rowmap = rowmap_host.to(self.device)
+            self._pack_rowmap_cache[f_live] = rowmap
+        return rowmap
+
+    def _launch_judge(
+        self, *, state: _DraftReqState, seat: int, base_out_len: int
+    ) -> Optional[tuple[torch.cuda.Event, int]]:
+        """Launch the judge AT DISPATCH TIME on the judge stream (the commit
+        has landed -- dispatch is its consequence -- so no gate is needed at
+        all; the earlier gated form parked a host-func callback for most of
+        the round and starved stream 1's own gate callback, -27%%).
+
+        SEG half immediately (mirror arithmetic; the host syncs its 4-word
+        pin in ~0.1ms and routes optimistically); MATCH half behind the
+        inputs event for the audit. Returns (match_event, pin parity)."""
+        if (
+            not self._early_judge_enabled
+            or state.last_units_dev is None
+            or state.last_backbone_dev is None
+            or state.mirror_event is None
+            or self._commit_mirror is None
+        ):
+            return None
+        from sglang.srt.speculative.decoupled_fused_ops import (
+            commit_match,
+            commit_seg,
+        )
+
+        mirror = self._commit_mirror
+        if self._judge_latch is None:
+            width = 1
+            while width < mirror.width:
+                width <<= 1
+            self._judge_latch = torch.zeros(
+                width, dtype=torch.int64, device=self.device
+            )
+        # No flip here: the judge inputs (block + backbone twin) went live at
+        # the previous dispatch's adopt, exactly like the host matcher's
+        # view. A dispatch-head flip read the twin the CURRENT commit-driven
+        # sequence had already written -- the gated sequences run ahead of
+        # the scheduler's dispatches, so "the plane the last arm wrote" is
+        # one generation ahead of "the plane the last adopt made live".
+        parity = self._judge_route_ct & 1
+        launch_t = time.perf_counter()
+        # Order both judge kernels behind the LANDING stream's batch event:
+        # the IPC thread publishes commits before their H2D copies execute
+        # (mirror contract: an invisible landing degrades to a junked round
+        # via slot arithmetic), and a partially visible row -- header words
+        # and BOTH seqlock sentinels new, token payload still old -- passes
+        # the seg account yet fails every prefix compare, which is exactly
+        # the audit-miss 545/586 signature (device DMA completion is not
+        # visibility to a concurrently launched kernel, pitfall A14). The
+        # event lives on the landing stream, so this inherits no gate-chain
+        # work (D16); by dispatch time it has usually long fired (record
+        # precedes the arrival notify that triggered this dispatch).
+        self._judge_stream.wait_event(mirror.land_event)
+        self._judge_match_stream.wait_event(mirror.land_event)
+        with torch.cuda.stream(self._judge_stream):
+            commit_seg(
+                mirror=mirror,
+                seat=seat,
+                base_out_len=base_out_len,
+                out_buf=self._judge_seg_buf,
+            )
+            self._judge_seg_pin.copy_(self._judge_seg_buf, non_blocking=True)
+            seg_ev = torch.cuda.Event()
+            seg_ev.record()
+        with torch.cuda.stream(self._judge_match_stream):
+            # MATCH half on its OWN stream (its waits park the stream until
+            # the previous generation's pack lands; sharing the seg stream
+            # made the host's seg sync inherit that whole chain): the GPU
+            # replica of _match_seat, input for input -- the block AND the
+            # backbone twin adopted last dispatch, both pinned by the same
+            # pack-tail event.
+            if state.mirror_event is not None:
+                self._judge_match_stream.wait_event(state.mirror_event)
+            commit_match(
+                mirror=mirror,
+                seat=seat,
+                units_dev=state.last_units_dev,
+                backbone_dev=state.last_backbone_dev,
+                backbone_len=state.last_backbone_len,
+                base_out_len=base_out_len,
+                num_steps=self.num_steps,
+                fanout=self.fanout,
+                out_buf=self._judge_buf_pair[parity],
+                latch=self._judge_latch,
+                probe=self._scatter_verdict,
+            )
+            self._judge_pin_pair[parity].copy_(
+                self._judge_buf_pair[parity], non_blocking=True
+            )
+            judge_ev = torch.cuda.Event()
+            judge_ev.record()
+        self._judge_armed_ct += 1
+        with self.profiler.stage("judge_wait"):
+            seg_ev.synchronize()
+        # Diagnostic launch context (acc 3.77 hunt): seg's globaltimer is the
+        # "dispatch N" anchor on the device clock; the audit subtracts it
+        # from the match pin's globaltimer to place the match's actual
+        # execution relative to this and later dispatches. Backbone snapshot
+        # taken HERE because the fast round rewrites the host ledger before
+        # the audit reads it.
+        ctx = {
+            "launch_t": launch_t,
+            "sync_t": time.perf_counter(),
+            "seg_gpu_ns": int(self._judge_seg_pin[4].item()),
+            "route_ct": self._judge_route_ct,
+            "base_out_len": base_out_len,
+            "bb_len": state.last_backbone_len,
+            "bb_host": (
+                list(state.last_backbone_host)
+                if state.last_backbone_host is not None
+                else None
+            ),
+        }
+        return judge_ev, parity, ctx
+
+    def _judge_match(self, rec: dict) -> Optional[tuple[int, int]]:
+        """Judge the outstanding record's commit, launched RIGHT HERE (the
+        dispatch is the commit's consequence, so the mirror is landed; no
+        gate). Fast path: sync only the SEG pin (~0.1ms mirror arithmetic)
+        and on a clean single-segment consume route optimistically as a hit
+        at (case = dlen-1, f = placeholder); the (case, f) match half runs
+        behind the inputs event on the judge stream and _audit_judge
+        reconciles it next dispatch. Fallback (burst / no segment): wait the
+        full match pin."""
+        key = rec["keys"][0]
+        state = self._states.get(key)
+        if state is None:
+            return None
+        if self._judge_check and self._judge_check_logged < 24:
+            self._judge_check_logged += 1
+            logger.info(
+                "bb-read seq=%s cur_id=%x",
+                rec.get("seq_no"),
+                id(state.last_backbone_dev) & 0xFFFF,
+            )
+        launched = self._launch_judge(
+            state=state,
+            seat=int(state.req_pool_idx),
+            base_out_len=rec["base_out_len"],
+        )
+        if launched is None:
+            # Judge inputs not live (bootstrap edges): legacy host match.
+            return self._match_seat(key, state)
+        judge_ev, parity, ctx = launched
+        seg = self._judge_seg_pin
+        seg_ok = int(seg[0].item())
+        dlen = int(seg[2].item())
+        host_delta = len(state.committed_tokens) - state.committed_slots.numel()
+        ctx["host_delta"] = host_delta
+        if seg_ok == 1 and 1 <= dlen <= self.num_steps + 1 and dlen == host_delta:
+            case = dlen - 1
+            if self._judge_check:
+                # SAME-round probe (debug; blocks): the match half and the
+                # host matcher judge the same (block, delta) -- a divergence
+                # dumps both sides' inputs.
+                judge_ev.synchronize()
+                pin = self._judge_pin_pair[parity]
+                host_sel = self._match_seat(key, state)
+                k_sel = (
+                    (int(pin[1].item()), int(pin[2].item()))
+                    if int(pin[0].item()) == 2
+                    else None
+                )
+                if host_sel != k_sel and self._judge_check_logged < 10:
+                    self._judge_check_logged += 1
+                    row = (
+                        state.last_units_host[case, :, 0].tolist()
+                        if state.last_units_host is not None
+                        else None
+                    )
+                    logger.info(
+                        "opt-check DIVERGE pin=%s host=%s delta=%s "
+                        "bb_host=%s bb_len=%d units_row(case=%d)=%s",
+                        pin.tolist(),
+                        host_sel,
+                        state.pending_delta()[:6],
+                        state.last_backbone_host,
+                        state.last_backbone_len,
+                        case,
+                        row,
+                    )
+            rec["judge_verdict"] = (2, case, 0, dlen)
+            rec["judge_optimistic"] = True
+            if self._judge_audit is not None:
+                self._judge_audit_dropped_ct += 1
+            self._judge_audit = (judge_ev, state, case, parity, ctx)
+            self._judge_route_ct += 1
+            self._judge_opt_ct += 1
+            return (case, 0)
+        with self.profiler.stage("judge_full_wait"):
+            judge_ev.synchronize()
+        pin = self._judge_pin_pair[parity]
+        verdict = int(pin[0].item())
+        case = int(pin[1].item())
+        f = int(pin[2].item())
+        dlen = int(pin[6].item())
+        rec["judge_verdict"] = (verdict, case, f, dlen)
+        self._judge_route_ct += 1
+        if verdict == 2:
+            return (case, f)
+        return None
+
+    @staticmethod
+    def _adopt_prepacked_block(state: _DraftReqState) -> torch.Tensor:
+        """Flip the seat onto the block the arm packed (see units_pair).
+
+        Called at consumption, AFTER the host has read the previous block off
+        the old mirror -- from here on ``last_units_*`` mean the new block
+        (and the backbone twin that was written beside it at the pack).
+        """
+        idx = state.pending_units_idx
+        state.units_idx = idx
+        state.last_units_dev = state.units_pair[idx]
+        state.last_units_host = state.units_pins[idx]
+        if state.backbone_pair[idx] is not None:
+            state.last_backbone_dev = state.backbone_pair[idx]
+        state.mirror_event = state.pending_mirror_event
+        return state.last_units_dev
+
+    def _rebase_prebuilt_for_arm(
+        self,
+        *,
+        pre: _PrebuiltFastRound,
+        state: _DraftReqState,
+        carrier,
+    ) -> bool:
+        """Normalize a STALE skeleton onto the seat's true committed length.
+
+        The skeleton was built against a base d tokens behind (verifier-style
+        overlap: restage ran before the last commit was consumed; or the
+        stale-inject probe rewound it on purpose). Everything below is a
+        host-known-value correction -- d is known at arm -- and the slots
+        need no re-allocation because alloc_extend's slots are aligned by
+        logical position: the true delta simply lives at slots[d : d + dlen]
+        (the slot_shift the consume paths honor). Returns False when the
+        drift exceeds the widened window; the caller scraps the skeleton.
+
+        Fix-ups, in order: page-table top-up for [stale, true) on the
+        skeleton's transient row (its build wrote this skeleton's own junk
+        duplicates there; mid-page they alias the kept slots and the write is
+        value-identical) -- replay-fb in-place shift (_shift_replay_fb) --
+        glue-head KV COW redo (the restage copy stopped at the stale base,
+        and a page boundary crossed moves the anchor) -- glue
+        recurrent-state re-fork (the restage fork predates the last advance;
+        stream order puts this one after it) -- scatter stacks swapped to
+        the precomputed shift variant (stacks_by_shift, built at restage).
+        """
+        true_len = state.committed_slots.numel()
+        d = true_len - pre.base_lens[0]
+        # Cumulative: a gate-refused arm hands the skeleton back after a
+        # successful re-base, and the next arm shifts it further.
+        total_shift = pre.slot_shift + d
+        if d < 0 or total_shift > self.num_steps + 1:
+            return False
+        if d > 0 and pre.stacks_by_shift is None:
+            return False
+        stale_len = pre.base_lens[0]
+        if d > 0:
+            # Page-tear guard. The stale build's allocator treats every page
+            # at or past page_roundup(stale) as FRESH, but the true tail may
+            # already have committed into such a page (its slots came from
+            # the PREVIOUS skeleton's fresh page). Keeping this skeleton
+            # would then map one logical page onto TWO physical pages; paged
+            # attention derives one page id per logical page (from the page
+            # head's table entry), so every later advance row would read
+            # garbage KV for the earlier positions of the torn page -- and
+            # the torn committed_slots persist for the request's lifetime
+            # (the poisoned-block storms). dlen is unknown until the commit
+            # lands, so guard with the K+1 maximum; the ~d/P of rounds this
+            # scraps fall back to the plain host round, which allocates
+            # against the TRUE prefix and continues the right page.
+            fresh_from = self._page_roundup(stale_len)
+            if fresh_from < true_len + self.num_steps + 1:
+                q = max(true_len, fresh_from)
+                if self._page_floor(q) < true_len:
+                    return False
+        row = int(pre.batch.reqs[0].req_pool_idx)
+        try:
+            if d > 0:
+                self.model_runner.req_to_token_pool.req_to_token[
+                    row, stale_len:true_len
+                ] = state.committed_slots[stale_len:true_len].to(torch.int32)
+                self._shift_replay_fb(pre.replay_fb, d=d)
+            if d > 0 or not pre.glue_seeded:
+                # Glue seeding lives HERE under pre-launch (never at restage):
+                # on the current stream its order against every reader is
+                # manifest, while a restage-time copy under step 5 would sit
+                # queued behind the armed gate and land mid-round on top of a
+                # case0/absorb round's glue reads.
+                base_lens = [true_len]
+                self._cow_carrier_glue_heads(
+                    states=[state], carriers=[carrier], base_lens=base_lens
+                )
+                if self._hybrid:
+                    self._fork_mamba_states(
+                        src_slots=state.mamba_slot.repeat(self.num_steps),
+                        dst_slots=carrier.glue_mamba_slots,
+                    )
+        except Exception:
+            # Same contract as the restage build guard: a failed build never
+            # kills the round -- the caller scraps and the plain host round
+            # covers the commit (sticky CUDA errors re-raise at round level).
+            logger.exception("decoupled re-base failed; skeleton scrapped")
+            return False
+        pre.glue_seeded = True
+        if d > 0:
+            pre.base_lens = [true_len]
+            pre.slot_shift = total_shift
+            pre.scatter_stacks = pre.stacks_by_shift[total_shift]
+            pre.rebase_crossed = pre.rebase_crossed or (
+                self._page_floor(true_len) != self._page_floor(stale_len)
+            )
+            self._prelaunch_rebase_ct += 1
+        return True
+
+    @staticmethod
+    def _shift_replay_fb(fb: ForwardBatch, *, d: int) -> None:
+        """In-place re-base of the replay fb's base-derived fields by d.
+
+        The complete list of ForwardBatch fields that carry the absolute
+        base (everything else in the DRAFT_EXTEND_V2 prepare contract is a
+        function of the uniform width or of row offsets): the rotary
+        positions (built by compute_position from extend_prefix_lens), the
+        mrope twin Qwen3.5-family drafters read, the seq-lens family, and
+        the extend prefix accounts the attention backend's replay prep
+        consumes. The stale-inject probe is the regression net for this
+        enumeration: a missed field diverges the output bytes.
+        """
+        from sglang.srt.speculative.decoupled_fused_ops import shift_replay_fb
+
+        rows = fb.seq_lens.numel()
+        shift_replay_fb(
+            positions=fb.positions,
+            mrope_positions=fb.mrope_positions,
+            seq_lens=fb.seq_lens,
+            orig_seq_lens=fb.orig_seq_lens,
+            extend_prefix_lens=fb.extend_prefix_lens,
+            d=d,
+        )
+        fb.seq_lens_cpu.add_(d)
+        fb.seq_lens_sum += rows * d
+        fb.extend_prefix_lens_cpu = [x + d for x in fb.extend_prefix_lens_cpu]
+
     def _pre_launch_extend_armed(
         self,
         *,
@@ -1829,7 +2712,22 @@ class EnumDraftEngine:
         # Take ownership of the skeleton (the host round must not consume it).
         self._prebuilt_fast = None
         self._fence_prebuilt(pre)
-        self._record_prebuilt_streams(pre)
+        if not self._rebase_prebuilt_for_arm(pre=pre, state=state, carrier=carrier):
+            # Drift outside the widened window (a merge or rollback moved the
+            # base by more than one round's delta): scrap and skip the arm;
+            # the plain host round covers this commit.
+            self._prelaunch_skip_why["stale"] += 1
+            tracked: list = []
+            self._track_scratch_slots(
+                tracked, slots=pre.slots, positions=pre.slot_positions
+            )
+            self._scrap_lists(
+                [pre.batch] + pre.scratch_batches,
+                pre.scratch_slots + tracked,
+                pre.scratch_kv_pages,
+            )
+            self._retire_prebuilt(pre)
+            return False
         # Carrier-row private rebind: value-independent of the commit (the
         # whole hypothesized window), so it runs at enqueue time.
         with self.profiler.stage("arm_rebind"):
@@ -1839,6 +2737,11 @@ class EnumDraftEngine:
                 base_lens=list(pre.base_lens),
                 bind_graph_width=True,
             )
+        # Lead probe (see _lead_probe): the PREVIOUS arm's tail event, read
+        # before this arm enqueues anything. Ready means the device already
+        # finished that whole sequence -- the host holds no lead.
+        if self._lead_probe is not None and self._lead_probe.query():
+            self._lead_caught_ct += 1
         _arm_cm = self.profiler.stage("arm_enqueue")
         _arm_cm.__enter__()
         gate = self._prelaunch_gate
@@ -1847,27 +2750,55 @@ class EnumDraftEngine:
         def gate_fn(seat=seat, stamp=base_out_len + 1, budget=budget_s):
             # Pure wakeup, GEQ: the kernel's own slot-vs-base arithmetic is
             # the sole consumption judge, so releasing early/late is safe.
+            t_gate = time.monotonic()
             if board.wait_for({seat: stamp}, budget):
                 self._prelaunch_gate_release_ct += 1
+                self._prelaunch_gate_lead_s += time.monotonic() - t_gate
             else:
                 self._prelaunch_gate_timeout_ct += 1
 
-        if not gate.enqueue(torch.cuda.current_stream(), gate_fn):
+        # (The early judge launches at DISPATCH time now -- the commit has
+        # landed by then, so it needs no gate of its own; a gated judge
+        # parked a host-func callback for most of the round and starved
+        # stream 1's gate callback. See _launch_judge.)
+        _gate_cm = self.profiler.stage("arm_gate")
+        _gate_cm.__enter__()
+        gate_ok = gate.enqueue(torch.cuda.current_stream(), gate_fn)
+        _gate_cm.__exit__(None, None, None)
+        if not gate_ok:
             # Driver refused the node; hand the skeleton back untouched.
             self._prelaunch_skip_why["gate"] += 1
             self._prebuilt_fast = pre
             _arm_cm.__exit__(None, None, None)
             return False
+        # NO stream-1 wait on the judge, deliberately: chaining the sequence
+        # head behind [judge <- inputs event (mid-previous-sequence) <- gate2]
+        # created a self-reinforcing lag -- once the GPU queue ran deep, the
+        # wait pushed the next sequence deeper, locking a bistable ~9ms lag
+        # (judge_wait 3.4ms was its residue). The scatter keeps its own
+        # independent match instead of replaying the judge's frame (judge=
+        # None below): identical inputs, deterministic kernel -- the exact
+        # trust model the host-match/scatter pair ran on for months with
+        # forced=0. The judge serves the HOST routing only; its inputs
+        # (guess plane, backbone twin) are per-seat buffers whose next
+        # overwrite sits behind this sequence's own kernels, which the
+        # judge always precedes (gate2 releases at the same commit).
         from sglang.srt.speculative.decoupled_fused_ops import commit_scatter
 
         gather_stack, out_loc_stack, true_stack, node_stack = pre.scatter_stacks
         fb = pre.replay_fb
+        _sc_cm = self.profiler.stage("arm_scatter")
+        _sc_cm.__enter__()
         units_kernel = state.last_units_dev.contiguous()
+        self._publish_seat_base(seat=seat, base_len=pre.base_lens[0])
         commit_scatter(
             mirror=mirror,
             seat=seat,
             units_dev=units_kernel,
-            backbone_dev=state.last_backbone_dev,
+            # The scatter's backbone IS the previous scatter's chains_out --
+            # the same static buffer, one generation old by stream order.
+            # (-1 on a miss / at bootstrap fails every compare by value.)
+            backbone_dev=self._scatter_chains,
             backbone_len=state.last_backbone_len,
             base_out_len=base_out_len,
             gather_stack=gather_stack,
@@ -1878,8 +2809,7 @@ class EnumDraftEngine:
             table_row=self.model_runner.req_to_token_pool.req_to_token[
                 int(pre.batch.reqs[0].req_pool_idx)
             ],
-            table_col0=pre.base_lens[0],
-            base_len=pre.base_lens[0],
+            base_lens_dev=self._seat_base_lens_dev,
             num_steps=self.num_steps,
             fanout=self.fanout,
             page_size=self._page_size,
@@ -1892,48 +2822,77 @@ class EnumDraftEngine:
                 self._scatter_node,
                 self._scatter_chains,
             ),
+            # judge=None deliberately: the scatter keeps its own independent
+            # match (see the no-wait note above); the judge's frame serves
+            # the host routing only.
+            judge=None,
+            seq_no=self._prelaunch_ct + 1,
         )
-        fused_logits = self._extend_graph_execute(
-            forward_batch=fb,
-            rows=rows,
-            node_gather=self._scatter_node,
-            true_lens_host=pre.case_staging[0].true_lens_host,
-            base_lens=list(pre.base_lens),
-            delta_lens=[0],
-            tag="prelaunch",
-        )
-        topk_out = self._topk_graph_fire(
-            key=topk_key,
-            fused_logits=fused_logits,
-            chains_mat=self._scatter_chains.view(1, self.num_steps),
-        )
+        # Verdict readback hoisted to RIGHT AFTER the scatter: the verdict is
+        # the scatter's own first output, but this copy used to join the queue
+        # after the extend+topk replays, so the next dispatch's resolve_wait
+        # (measured 1.7ms/round) charged the host for graph segments the
+        # verdict never depended on. With the event here, resolve unblocks
+        # ~(extend+topk) earlier and the host advances state / restages while
+        # those replays still run -- the verifier-style overlap direction.
+        with self.profiler.stage("arm_verdict"):
+            self._prelaunch_verdict_pin.copy_(self._scatter_verdict, non_blocking=True)
+            verdict_event = torch.cuda.Event()
+            verdict_event.record()
+        # Backbone twin: judge mode writes it at the PACK (see
+        # _arm_pack_units), on the units' pending/adopt clock -- a scatter-
+        # side copy into a dispatch-flipped plane handed the judge this
+        # sequence's own chains_out (the gated sequences run ahead of the
+        # dispatches). Judge off keeps the pre-judge direct write.
+        if not self._early_judge_enabled:
+            state.last_backbone_dev[: self.num_steps].copy_(self._scatter_chains)
+        _sc_cm.__exit__(None, None, None)
+        # Every arm step gets its own band: the first host-band run put 2.4ms
+        # of arm_enqueue OUTSIDE the three graph launches, and guessing which
+        # step owns it is exactly the mistake the bands exist to prevent.
+        with self.profiler.stage("arm_extend"):
+            fused_logits = self._extend_graph_execute(
+                forward_batch=fb,
+                rows=rows,
+                node_gather=self._scatter_node,
+                true_lens_host=pre.case_staging[0].true_lens_host,
+                base_lens=list(pre.base_lens),
+                delta_lens=[0],
+                tag="prelaunch",
+            )
+        with self.profiler.stage("arm_topk"):
+            topk_out = self._topk_graph_fire(
+                key=topk_key,
+                fused_logits=fused_logits,
+                chains_mat=self._scatter_chains.view(1, self.num_steps),
+            )
         if topk_out is None:
             # Unreachable by the warm-graph guard above; the scatter/extend
             # are already queued (a REAL advance if the commit lands), so
             # continuing without a record would double-advance the seat.
             _arm_cm.__exit__(None, None, None)
             raise RuntimeError("prelaunch guess-tail graph refused to replay")
-        # Zero-sync verdict readback for the dispatch: pinned copy + event
-        # recorded BEFORE the armed chain joins the queue -- the resolve
-        # only needs the verdict, and waiting out the chain's GPU segment
-        # here put ~1.5ms back on the round-serial path (397B: 400 -> 362).
-        # The chain's out_tokens need no host wait at all: their only
-        # consumer is the pack kernel, ordered behind the replay on stream.
-        self._prelaunch_verdict_pin.copy_(self._scatter_verdict, non_blocking=True)
-        verdict_event = torch.cuda.Event()
-        verdict_event.record()
+        # (The former per-round guess-plane pack for the judge is gone: the
+        # match kernel always matched against the adopted block's own guess
+        # column (last_units_dev), so the plane had no consumer.)
+        # (Verdict pin copy + event moved up, right after the scatter: the
+        # resolve only needs the verdict, and every graph segment between the
+        # scatter and the event was pure resolve_wait. The chain's out_tokens
+        # need no host wait at all: their only consumer is the pack kernel,
+        # ordered behind the replay on stream.)
         # Chain pre-queueing: the whole next-round chain replay joins the
         # gate sequence right here (still value-free -- its dlen-dependent
         # metadata is completed on stream from the scatter's tap). An
         # extend-only pre-launch proceeds when the chain half cannot arm.
-        chain_armed = self._pre_launch_chain_armed(
-            keys=keys,
-            state=state,
-            carrier=carrier,
-            pre=pre,
-            f_live=f_live,
-            branch_out=topk_out[1],
-        )
+        with self.profiler.stage("arm_chain"):
+            chain_armed = self._pre_launch_chain_armed(
+                keys=keys,
+                state=state,
+                carrier=carrier,
+                pre=pre,
+                f_live=f_live,
+                branch_out=topk_out[1],
+            )
         chain_tokens, chain_keepalive = (
             chain_armed if chain_armed is not None else (None, None)
         )
@@ -1945,6 +2904,7 @@ class EnumDraftEngine:
             "branch_out": topk_out[1],
             "fused_logits": fused_logits,
             "verdict_event": verdict_event,
+            "seq_no": self._prelaunch_ct + 1,
             "units_kernel": units_kernel,
             "base_out_len": state.committed_slots.numel() - state.prompt_len,
             # K chain-step token tensors (bucket static buffers), or None when the
@@ -1959,13 +2919,34 @@ class EnumDraftEngine:
             # is still real -- resolution then absorbs instead).
             "tainted": False,
         }
+        # Device-side pack: units + poisoning + backbone join the gated
+        # sequence right after the chain replay, and the pinned mirror copy
+        # rides behind them -- the dispatch's whole pack/mirror half moves
+        # off the host (see _pack_units_kernel for the case-0 equivalence
+        # that also retires the host miss re-draft).
+        self._prelaunched["prepacked"] = self._arm_pack_units(
+            state=state,
+            chain_tokens=chain_tokens,
+            guesses_out=topk_out[0],
+            f_live=f_live,
+        )
+        # Lead probe tail: recorded behind the ENTIRE armed sequence, so the
+        # next arm's query answers "did the device finish the previous round's
+        # work before the host came back?" -- i.e. whether any lead exists.
+        self._lead_probe = torch.cuda.Event()
+        self._lead_probe.record()
+        # Lifetime pinning for the whole armed life: the event is recorded
+        # BEHIND the just-enqueued gated sequence, so it fires only after
+        # the gate released and every kernel that reads this skeleton ran.
+        self._retire_prebuilt(pre)
         _arm_cm.__exit__(None, None, None)
         self._prelaunch_ct += 1
         if self._prelaunch_ct % 50 == 0:
             logger.info(
                 "decoupled prelaunch: enq=%d fast=%d case0=%d forced=%d "
                 "junk=%d(%s) absorb=%d why=%s gate_rel=%d gate_to=%d "
-                "chain=%d(%s)",
+                "lead_ms=%.2f rebase=%d chain=%d(%s) caught=%d judge=%d/%d "
+                "opt=%d(miss=%d,bad=%d,drop=%d)",
                 self._prelaunch_ct,
                 self._prelaunch_fast_ct,
                 self._prelaunch_case0_ct,
@@ -1976,10 +2957,31 @@ class EnumDraftEngine:
                 self._prelaunch_absorb_why,
                 self._prelaunch_gate_release_ct,
                 self._prelaunch_gate_timeout_ct,
+                1000.0
+                * self._prelaunch_gate_lead_s
+                / max(self._prelaunch_gate_release_ct, 1),
+                self._prelaunch_rebase_ct,
                 self._prelaunch_chain_ct,
                 self._prelaunch_chain_skip_why,
+                self._lead_caught_ct,
+                self._judge_route_ct,
+                self._judge_armed_ct,
+                self._judge_opt_ct,
+                self._judge_opt_miss_ct,
+                self._judge_opt_bad_ct,
+                self._judge_audit_dropped_ct,
             )
             logger.info("prelaunch skips: %s", self._prelaunch_skip_why)
+            if self._resolve_by_rebase:
+                logger.info(
+                    "rebase outcome buckets (action, shift, crossed): %s",
+                    dict(
+                        sorted(
+                            self._resolve_by_rebase.items(),
+                            key=lambda kv: -kv[1],
+                        )
+                    ),
+                )
         return True
 
     def _scatter_consume_commit(
@@ -2017,6 +3019,7 @@ class EnumDraftEngine:
 
         gather_stack, out_loc_stack, true_stack, node_stack = prebuilt.scatter_stacks
         torch.cuda.current_stream().wait_event(mirror.land_event)
+        self._publish_seat_base(seat=seat, base_len=base_len)
         commit_scatter(
             mirror=mirror,
             seat=seat,
@@ -2030,8 +3033,7 @@ class EnumDraftEngine:
             node_stack=node_stack,
             pad_flats=graph_round.seat_pad_flats[0],
             table_row=self.model_runner.req_to_token_pool.req_to_token[seat_row],
-            table_col0=base_len,
-            base_len=base_len,
+            base_lens_dev=self._seat_base_lens_dev,
             num_steps=self.num_steps,
             fanout=self.fanout,
             page_size=self._page_size,
@@ -2092,8 +3094,12 @@ class EnumDraftEngine:
             torch.zeros(rows, dtype=torch.int64, device=dev),
             torch.zeros(self.num_steps, dtype=torch.int64, device=dev),
         )
-        shadow_row = torch.zeros(width, dtype=torch.int32, device=dev)
+        # Full-width shadow row: the kernel writes at the seat's real base
+        # column now (it reads the base from the device buffer), so the probe
+        # cannot rebase the row to column 0 the way it used to.
+        shadow_row = torch.zeros(base_len + width, dtype=torch.int32, device=dev)
         torch.cuda.current_stream().wait_event(mirror.land_event)
+        self._publish_seat_base(seat=seat, base_len=base_len)
         commit_scatter(
             mirror=mirror,
             seat=seat,
@@ -2111,8 +3117,7 @@ class EnumDraftEngine:
                 else graph_round.w_slots[0, 0]
             ),
             table_row=shadow_row,
-            table_col0=0,
-            base_len=base_len,
+            base_lens_dev=self._seat_base_lens_dev,
             num_steps=self.num_steps,
             fanout=self.fanout,
             page_size=self._page_size if self._paged else 1,
@@ -2147,7 +3152,7 @@ class EnumDraftEngine:
             "node": (outs[4].tolist(), prestaged.node_gather.tolist()),
             "chains": (outs[5].tolist(), chain.to(torch.int64).tolist()),
             "pads": (
-                shadow_row[delta_len:width].tolist(),
+                shadow_row[base_len + delta_len : base_len + width].tolist(),
                 want_pads.to(torch.int32).tolist(),
             ),
         }
@@ -2417,9 +3422,23 @@ class EnumDraftEngine:
             case0_states: list[_DraftReqState] = []
             slow_keys: list[DraftReqKey] = []
             slow_states: list[_DraftReqState] = []
+            self._audit_judge()
+            rec0 = self._prelaunched
+            judged_key = (
+                rec0["keys"][0]
+                if rec0 is not None and self._early_judge_enabled
+                else None
+            )
             for key in keys:
                 state = self._states[key]
-                selection = self._match_seat(key, state)
+                if key == judged_key:
+                    # Early judge: the kernel-side match was taken the moment
+                    # the commit landed; route off its pin (~0.3ms) instead
+                    # of the host mirror match, whose sync would park the
+                    # dispatch on the previous armed sequence's whole tail.
+                    selection = self._judge_match(rec0)
+                else:
+                    selection = self._match_seat(key, state)
                 if self._debug_gpu_match:
                     self._probe_gpu_match(state, selection)
                 if selection is not None:
@@ -2446,6 +3465,27 @@ class EnumDraftEngine:
                     scratch_slots=scratch_slots,
                     scratch_kv_pages=scratch_kv_pages,
                 )
+                # Defect-localization buckets: the verdict judges the block
+                # the PREVIOUS armed round computed (backbone + units), so
+                # correlate this action with THAT round's shift/crossing.
+                if self._prev_block_meta is not None:
+                    bucket = (action, *self._prev_block_meta)
+                    self._resolve_by_rebase[bucket] = (
+                        self._resolve_by_rebase.get(bucket, 0) + 1
+                    )
+                if rec is not None:
+                    rec_pre = rec["pre"]
+                    # (accept count consumed, skeleton shift, page crossing)
+                    # of the round whose block the NEXT resolve judges. Under
+                    # the step-5 order dlen == shift; under the old order the
+                    # dlen keeps the buckets comparable (shift stays 0).
+                    self._prev_block_meta = (
+                        self._last_resolved_dlen,
+                        rec_pre.slot_shift,
+                        rec_pre.rebase_crossed,
+                    )
+                else:
+                    self._prev_block_meta = None
                 if action == "fast":
                     pl_fast = rec
                 elif action == "case0":
@@ -2490,14 +3530,21 @@ class EnumDraftEngine:
                                 if extra is not None:
                                     extra.pop(i)
                                 break
-            if self._prebuilt_fast is not None and not hit_states:
+            if (
+                self._prebuilt_fast is not None
+                and not hit_states
+                and not self._prelaunch_enabled
+            ):
                 # A miss/bootstrap round for these seats invalidates the
                 # hypothesized skeleton (committed lengths move); fold it in
-                # for the round-tail free.
+                # for the round-tail free. Under pre-launch the skeleton is
+                # the ROUND TAIL's to arm (step 5: it outlives this dispatch
+                # on purpose, and the arm re-bases it over however far the
+                # base moved -- or stale-scraps it there).
                 pre = self._prebuilt_fast
                 self._prebuilt_fast = None
                 self._fence_prebuilt(pre)
-                self._record_prebuilt_streams(pre)
+                self._round_retire_pending.append(pre)
                 self._scrap_prebuilt_into(
                     pre, scratch_batches, scratch_slots, scratch_kv_pages
                 )
@@ -2577,6 +3624,14 @@ class EnumDraftEngine:
                     scratch_mamba_slots,
                     scratch_kv_pages,
                 )
+                # Round-tail lifetime pinning flush: everything the round's
+                # enqueued work still reads survives until this ONE event
+                # fires (see _retire_prebuilt).
+                if self._round_retire_pending:
+                    pending = self._round_retire_pending
+                    self._round_retire_pending = []
+                    self._retire_prebuilt(pending)
+                self._drain_retired_prebuilt()
             self.profiler.mark("free")
 
     def _match_seat(
@@ -2588,6 +3643,21 @@ class EnumDraftEngine:
             return None
         if key not in self._seat_carriers:
             return None
+        if state.last_backbone_host is None and state.backbone_host_lazy is not None:
+            # Judge rounds deferred the mirror read; a slow-path match is the
+            # one consumer left, and by now the block's mirror has long
+            # landed (the sync is instant). Settle any pending optimistic
+            # audit first -- the lazy tuple may hold a placeholder fanout
+            # (the audit may also zero the ledger outright on a real miss).
+            self._audit_judge(blocking=True)
+            lazy = state.backbone_host_lazy
+            if lazy is not None:
+                ev, pins, case, f = lazy
+                state.backbone_host_lazy = None
+                if ev is not None:
+                    ev.synchronize()
+                if pins is not None:
+                    state.last_backbone_host = pins[case, f, 1:].tolist()
         if state.last_units_host is None or state.last_backbone_host is None:
             return None
         delta = state.pending_delta()
@@ -2708,13 +3778,24 @@ class EnumDraftEngine:
         # the block keeps its fixed (K+1) x F shape).
         guess_width = f_live if variant.guess_dead_mask is None else self.fanout
 
-        # -- Winning chains: the selected units' chains ARE the new backbone
-        # (the host mirror was synced during matching).
+        # -- Winning chains: the selected units' chains ARE the new backbone.
+        # Judge-routed rounds never synced the host mirror (that sync parks
+        # the dispatch on the previous armed sequence's tail); their host
+        # backbone is deferred (backbone_host_lazy) and the values below are
+        # only materialized on the paths that truly read them.
+        judged = prelaunched is not None and prelaunched.get("judge_verdict")
         chains: list[torch.Tensor] = []
-        new_backbones: list[list[int]] = []
+        new_backbones: list[Optional[list[int]]] = []
         for state, (case, f) in zip(states, selections):
             chains.append(state.last_units_dev[case, f, 1:])
-            new_backbones.append(state.last_units_host[case, f, 1:].tolist())
+            if judged and prelaunched.get("prepacked"):
+                new_backbones.append(None)
+            else:
+                if judged and state.mirror_event is not None:
+                    # Rare (chain half did not arm): the legacy pack below
+                    # needs the values, so pay the sync here.
+                    state.mirror_event.synchronize()
+                new_backbones.append(state.last_units_host[case, f, 1:].tolist())
         # Backbone token matrix for dead-guess exclusion: case a < K is only
         # reached by verify REJECTING c_{a+1}, so that token can never be the
         # case's bonus -- mask it before top-F so a live candidate gets the
@@ -2764,12 +3845,16 @@ class EnumDraftEngine:
                 and prebuilt.keys == tuple(keys)
                 and prebuilt.base_lens == base_lens
                 and self._enable_fused_extend
+                # Step 5: with pre-launch on, the dispatch must NOT eat the
+                # skeleton -- it belongs to the round tail's arm (which
+                # re-bases it). This branch is the prelaunch-OFF consume.
+                and not self._prelaunch_enabled
             ):
                 # Prebuilt skeleton: allocation + page-table writes already
                 # happened (on the prebuild stream); order this round's work
                 # after them, then fill the actual delta tokens and go.
                 self._fence_prebuilt(prebuilt)
-                self._record_prebuilt_streams(prebuilt)
+                self._round_retire_pending.append(prebuilt)
                 self._prebuilt_fast = None
                 glue_preseeded = prebuilt.glue_seeded
                 graph_round = prebuilt.graph_round
@@ -2814,10 +3899,12 @@ class EnumDraftEngine:
                             graph_round=graph_round,
                         )
             else:
-                if prebuilt is not None:
+                if prebuilt is not None and not self._prelaunch_enabled:
+                    # Prelaunch-off only: under step 5 the skeleton outlives
+                    # this dispatch for the round tail's arm to re-base.
                     self._prebuilt_fast = None
                     self._fence_prebuilt(prebuilt)
-                    self._record_prebuilt_streams(prebuilt)
+                    self._round_retire_pending.append(prebuilt)
                     self._scrap_prebuilt_into(
                         prebuilt, scratch_batches, scratch_slots, scratch_kv_pages
                     )
@@ -3126,6 +4213,34 @@ class EnumDraftEngine:
                     variant=variant,
                 )
         with self.profiler.stage("pack-block"):
+            if prelaunched is not None and prelaunched.get("prepacked"):
+                # Device-packed at arm (units / poisoning / backbone / pinned
+                # mirror all rode the gated sequence); only the host-side
+                # backbone bookkeeping -- the PREVIOUS block's winning chain,
+                # already read off the old mirror above -- remains.
+                for i, state in enumerate(states):
+                    if new_backbones[i] is None:
+                        # Judge-routed: defer the mirror read; only a later
+                        # slow-path match materializes it (see _match_seat).
+                        case, f = selections[i]
+                        state.backbone_host_lazy = (
+                            state.mirror_event,
+                            state.last_units_host,
+                            case,
+                            f,
+                        )
+                        state.last_backbone_host = None
+                        state.last_backbone_len = self.num_steps
+                    else:
+                        state.backbone_host_lazy = None
+                        state.last_backbone_host = list(new_backbones[i])
+                        state.last_backbone_len = len(new_backbones[i])
+                    self._adopt_prepacked_block(state)
+                return {
+                    "pool_indices": [s.req_pool_idx for s in states],
+                    "base_committed_lens": [len(s.committed_tokens) for s in states],
+                    "units_device": states[0].last_units_dev.unsqueeze(0),
+                }
             return self._pack_and_mirror(
                 states=states,
                 guesses_stack=guesses_stack,
@@ -4696,7 +5811,9 @@ class EnumDraftEngine:
         keys = [k for k in keys if k in self._states and k in self._seat_carriers]
         if not keys:
             return
-        with torch.profiler.record_function("drafter.restage"):
+        # profiler.stage, not a bare record_function: the outer total is what
+        # tells us how much of restage the named sub-bands actually cover.
+        with self.profiler.stage("restage"):
             self._prebuild_fast_round(keys)
 
     def _prebuild_fast_round(self, keys: list[DraftReqKey]) -> None:
@@ -4707,11 +5824,130 @@ class EnumDraftEngine:
         finally:
             self._h2d = prev_h2d
 
+    def _build_case_staging(
+        self,
+        *,
+        chunk: torch.Tensor,
+        base_lens: list[int],
+        carriers: list,
+        graph_round: _ExtendGraphRound,
+    ) -> list:
+        """Per-case fused-extend staging for a bs == 1 skeleton.
+
+        The gather / true-lens / node-gather tensors are ROUND-INVARIANT
+        (pure functions of delta_len and the static graph shape): built once
+        per delta_len and cached, so a restage does no H2D at all -- which is
+        what lets it run at round tail with the stream still busy. Only
+        out_cache_loc varies per round, and it is composed on-GPU
+        (sync-free). ``chunk`` is the delta-slot window the cases slice
+        [:delta_len] from -- a rebase passes the shifted view.
+        """
+        case_staging = []
+        for delta_len in range(1, self.num_steps + 2):
+            static = self._case_staging_static.get(delta_len)
+            if static is None:
+                pattern = self._extend_graph_gather_pattern(delta_len)
+                true_host = [delta_len] + [
+                    delta_len + g + 1 for g in range(self.num_steps)
+                ]
+                w = self._extend_graph_width
+                node_off = [delta_len - 1] + [
+                    (1 + g) * w + delta_len + g for g in range(self.num_steps)
+                ]
+                static = (
+                    torch.tensor(pattern, dtype=torch.int64, device=self.device),
+                    torch.tensor(true_host, dtype=torch.int32, device=self.device),
+                    true_host,
+                    torch.tensor(node_off, dtype=torch.int64, device=self.device),
+                    node_off,
+                )
+                self._case_staging_static[delta_len] = static
+            gather, true_lens, true_host, node_gather, node_off = static
+            case_staging.append(
+                _ExtendCaseStaging(
+                    gather=gather,
+                    out_cache_loc=self._extend_graph_out_cache_loc(
+                        carriers=carriers,
+                        seat_delta_slots=chunk[:delta_len],
+                        base_lens=base_lens,
+                        delta_lens=[delta_len],
+                        graph_round=graph_round,
+                    ),
+                    true_lens=true_lens,
+                    true_lens_host=true_host,
+                    node_gather=node_gather,
+                    node_offsets=node_off,
+                )
+            )
+        return case_staging
+
+    @staticmethod
+    def _stack_case_staging(case_staging: list) -> tuple:
+        """Stack per-case staging for the commit-scatter kernel's indexing."""
+        return (
+            torch.stack([cs.gather for cs in case_staging]).contiguous(),
+            torch.stack([cs.out_cache_loc for cs in case_staging]).contiguous(),
+            torch.stack([cs.true_lens for cs in case_staging]).contiguous(),
+            torch.stack([cs.node_gather for cs in case_staging]).contiguous(),
+        )
+
+    def _case_static_planes(self) -> tuple:
+        """The round-INVARIANT halves of the per-case staging, stacked once
+        for the engine's lifetime: gather / true-lens / node-gather are pure
+        functions of delta_len and the static graph shape. Only the
+        out_cache_loc plane varies per restage (slots move), and that plane
+        is written by ONE triton launch (build_out_loc_stacks) instead of the
+        ~200 host-dispatched slices the python loop used to pay.
+
+        Returns (gather_stack, true_stack, node_stack, per_case_statics)
+        where per_case_statics[d-1] = the _case_staging_static entry.
+        """
+        if self._case_static_planes_cache is not None:
+            return self._case_static_planes_cache
+        static_entries = []
+        for delta_len in range(1, self.num_steps + 2):
+            static = self._case_staging_static.get(delta_len)
+            if static is None:
+                pattern = self._extend_graph_gather_pattern(delta_len)
+                true_host = [delta_len] + [
+                    delta_len + g + 1 for g in range(self.num_steps)
+                ]
+                w = self._extend_graph_width
+                node_off = [delta_len - 1] + [
+                    (1 + g) * w + delta_len + g for g in range(self.num_steps)
+                ]
+                static = (
+                    torch.tensor(pattern, dtype=torch.int64, device=self.device),
+                    torch.tensor(true_host, dtype=torch.int32, device=self.device),
+                    true_host,
+                    torch.tensor(node_off, dtype=torch.int64, device=self.device),
+                    node_off,
+                )
+                self._case_staging_static[delta_len] = static
+            static_entries.append(static)
+        self._case_static_planes_cache = (
+            torch.stack([s[0] for s in static_entries]).contiguous(),
+            torch.stack([s[1] for s in static_entries]).contiguous(),
+            torch.stack([s[3] for s in static_entries]).contiguous(),
+            static_entries,
+        )
+        return self._case_static_planes_cache
+
     def _prebuild_fast_round_inner(self, keys: list[DraftReqKey]) -> None:
         states = [self._states[k] for k in keys]
         bs = len(states)
         width = self.num_steps + 1
         base_lens = [state.committed_slots.numel() for state in states]
+        committed_token_lists = [state.committed_tokens for state in states]
+        if self._stale_inject and bs == 1:
+            # Validation probe: build the skeleton against a rewound base, so
+            # the arm's re-base machinery runs every round under today's
+            # round order (faithful to the step-5 reorder, where the skeleton
+            # predates the last commit). Output must stay byte-identical.
+            d_inj = min(self._stale_inject, self.num_steps + 1)
+            if base_lens[0] - d_inj > states[0].prompt_len:
+                base_lens = [base_lens[0] - d_inj]
+                committed_token_lists = [states[0].committed_tokens[:-d_inj]]
         pre_batches: list = []
         pre_slots: list = []
         pre_pages: list = []
@@ -4736,9 +5972,13 @@ class EnumDraftEngine:
                 return
             batch, slots = self._extend_batch(
                 token_lists=[
-                    list(state.committed_tokens) + [0] * width for state in states
+                    list(tokens) + [0] * self._preadvance_alloc_width
+                    for tokens in committed_token_lists
                 ],
-                prefix_slots=[state.committed_slots for state in states],
+                prefix_slots=[
+                    state.committed_slots[: base_lens[i]]
+                    for i, state in enumerate(states)
+                ],
                 tag="preadvance",
                 mamba_slots=self._seat_mamba_slots(states),
             )
@@ -4750,66 +5990,73 @@ class EnumDraftEngine:
         finally:
             _stage_cm.__exit__(None, None, None)
         carriers = [self._seat_carriers[k] for k in keys]
-        if self._paged:
-            with self.profiler.stage("restage_glue"):
-                self._cow_carrier_glue_heads(
-                    states=states, carriers=carriers, base_lens=base_lens
+        # Prelaunch-off only. Under step 5 (arm-before-restage) these two
+        # writes would be queued BEHIND the armed gate on the prebuild stream
+        # and land at an arbitrary point of the NEXT round's execution --
+        # racing any case0/absorb round that reads glue state in between (the
+        # episodic case0 storms). The arm seeds the glue itself, every time,
+        # on the current stream where order is manifest.
+        glue_seeded = not self._prelaunch_enabled
+        if glue_seeded:
+            if self._paged:
+                with self.profiler.stage("restage_glue"):
+                    self._cow_carrier_glue_heads(
+                        states=states, carriers=carriers, base_lens=base_lens
+                    )
+            if self._hybrid:
+                self._fork_mamba_states(
+                    src_slots=torch.cat(
+                        [state.mamba_slot.repeat(self.num_steps) for state in states]
+                    ),
+                    dst_slots=torch.cat(
+                        [carrier.glue_mamba_slots for carrier in carriers]
+                    ),
                 )
-        if self._hybrid:
-            self._fork_mamba_states(
-                src_slots=torch.cat(
-                    [state.mamba_slot.repeat(self.num_steps) for state in states]
-                ),
-                dst_slots=torch.cat([carrier.glue_mamba_slots for carrier in carriers]),
-            )
         case_staging = None
+        out_loc_all = None
         _cs_cm = self.profiler.stage("restage_case_staging")
         _cs_cm.__enter__()
-        if bs == 1:
-            # The gather / true-lens / node-gather tensors are ROUND-INVARIANT
-            # (pure functions of delta_len and the static graph shape): built
-            # once per delta_len and cached, so a restage does no H2D at all
-            # -- which is what lets it run at round tail with the stream
-            # still busy. Only out_cache_loc varies per round, and it is
-            # composed on-GPU (sync-free).
-            case_staging = []
-            chunk = slots.view(width)
-            for delta_len in range(1, width + 1):
-                static = self._case_staging_static.get(delta_len)
-                if static is None:
-                    pattern = self._extend_graph_gather_pattern(delta_len)
-                    true_host = [delta_len] + [
-                        delta_len + g + 1 for g in range(self.num_steps)
-                    ]
-                    w = self._extend_graph_width
-                    node_off = [delta_len - 1] + [
-                        (1 + g) * w + delta_len + g for g in range(self.num_steps)
-                    ]
-                    static = (
-                        torch.tensor(pattern, dtype=torch.int64, device=self.device),
-                        torch.tensor(true_host, dtype=torch.int32, device=self.device),
-                        true_host,
-                        torch.tensor(node_off, dtype=torch.int64, device=self.device),
-                        node_off,
-                    )
-                    self._case_staging_static[delta_len] = static
-                gather, true_lens, true_host, node_gather, node_off = static
-                case_staging.append(
-                    _ExtendCaseStaging(
-                        gather=gather,
-                        out_cache_loc=self._extend_graph_out_cache_loc(
-                            carriers=carriers,
-                            seat_delta_slots=chunk[:delta_len],
-                            base_lens=base_lens,
-                            delta_lens=[delta_len],
-                            graph_round=graph_round,
-                        ),
-                        true_lens=true_lens,
-                        true_lens_host=true_host,
-                        node_gather=node_gather,
-                        node_offsets=node_off,
-                    )
+        if bs == 1 and self._paged:
+            # Every (stale-shift, accept-case) out_cache_loc row in ONE
+            # triton launch; gather / true-lens / node planes are engine-
+            # lifetime constants (_case_static_planes). The old python loop
+            # paid ~200 host dispatches per restage for the same values.
+            from sglang.srt.speculative.decoupled_fused_ops import (
+                build_out_loc_stacks,
+            )
+
+            gather_stack, true_stack, node_stack, static_entries = (
+                self._case_static_planes()
+            )
+            out_loc_all = build_out_loc_stacks(
+                alloc_slots=slots.view(self._preadvance_alloc_width),
+                pad_flats=graph_round.seat_pad_flats[0],
+                glue_flats=carriers[0].glue_private_slots,
+                base_len=base_lens[0],
+                num_steps=self.num_steps,
+                width=self._extend_graph_width,
+                page_size=self._page_size,
+            )
+            case_staging = [
+                _ExtendCaseStaging(
+                    gather=static_entries[d - 1][0],
+                    out_cache_loc=out_loc_all[0, d - 1],
+                    true_lens=static_entries[d - 1][1],
+                    true_lens_host=static_entries[d - 1][2],
+                    node_gather=static_entries[d - 1][3],
+                    node_offsets=static_entries[d - 1][4],
                 )
+                for d in range(1, self.num_steps + 2)
+            ]
+        elif bs == 1:
+            # P == 1 eager fallback keeps the python composition.
+            chunk = slots.view(self._preadvance_alloc_width)
+            case_staging = self._build_case_staging(
+                chunk=chunk,
+                base_lens=base_lens,
+                carriers=carriers,
+                graph_round=graph_round,
+            )
         _cs_cm.__exit__(None, None, None)
         replay_fb = None
         if (
@@ -4834,19 +6081,22 @@ class EnumDraftEngine:
                     "falls back to inline replay prep"
                 )
         scatter_stacks = None
-        if case_staging is not None:
-            _st_cm = self.profiler.stage("restage_stacks")
-            _st_cm.__enter__()
-            scatter_stacks = (
-                torch.stack([cs.gather for cs in case_staging]).contiguous(),
-                torch.stack([cs.out_cache_loc for cs in case_staging]).contiguous(),
-                torch.stack([cs.true_lens for cs in case_staging]).contiguous(),
-                torch.stack([cs.node_gather for cs in case_staging]).contiguous(),
-            )
-            _st_cm.__exit__(None, None, None)
+        stacks_by_shift = None
+        if out_loc_all is not None:
+            # Pure views into the fused [S, C, R*W] tensor + the constant
+            # planes: zero copies, zero stacks (the old path stacked 24x).
+            gather_stack, true_stack, node_stack, _ = self._case_static_planes()
+            stacks_by_shift = [
+                (gather_stack, out_loc_all[s], true_stack, node_stack)
+                for s in range(self.num_steps + 2)
+            ]
+            scatter_stacks = stacks_by_shift[0]
+        elif case_staging is not None:
+            with self.profiler.stage("restage_stacks"):
+                scatter_stacks = self._stack_case_staging(case_staging)
         positions: list[int] = []
         for base in base_lens:
-            positions.extend(range(base, base + width))
+            positions.extend(range(base, base + self._preadvance_alloc_width))
         ready_event = torch.cuda.Event()
         ready_event.record(self._prebuild_stream)
         stream_cm.__exit__(None, None, None)
@@ -4860,9 +6110,10 @@ class EnumDraftEngine:
             scratch_batches=pre_batches,
             scratch_slots=pre_slots,
             scratch_kv_pages=pre_pages,
-            glue_seeded=True,
+            glue_seeded=glue_seeded,
             case_staging=case_staging,
             scatter_stacks=scatter_stacks,
+            stacks_by_shift=stacks_by_shift,
             replay_fb=replay_fb,
             ready_event=ready_event,
         )
@@ -4976,7 +6227,7 @@ class EnumDraftEngine:
             return
         self._prebuilt_fast = None
         self._fence_prebuilt(pre)
-        self._record_prebuilt_streams(pre)
+        self._retire_prebuilt(pre)
         tracked: list = []
         self._track_scratch_slots(
             tracked, slots=pre.slots, positions=pre.slot_positions
@@ -5002,46 +6253,23 @@ class EnumDraftEngine:
         if pre.ready_event is not None:
             torch.cuda.current_stream().wait_event(pre.ready_event)
 
-    @staticmethod
-    def _record_prebuilt_streams(pre: _PrebuiltFastRound) -> None:
-        """Mark every prebuilt device tensor as used by the CONSUMING stream.
-
-        The skeleton's tensors were allocated on the prebuild stream; without
-        this, freeing them at round end lets the caching allocator reuse
-        their blocks as soon as the (long-idle) prebuild stream catches up --
-        while this round's main-stream kernels may still be reading them.
-        record_stream defers block reuse until the consuming stream passes
-        the free point. (The lucky-green / usually-red flakiness this fixes
-        surfaced as index-out-of-bounds device asserts from garbage slots.)
+    def _retire_prebuilt(self, refs) -> None:
+        """SGLang-style lifetime pinning (the scheduler's batch_record_buf
+        idiom): hold the skeleton's python references until an event recorded
+        AFTER its last enqueued use fires. The caching allocator reclaims a
+        block only when its tensor's refcount drops, so holding the object
+        past the consuming stream's last use gives exactly the safety the
+        old per-tensor record_stream storm bought -- without 25 allocator-
+        lock acquisitions per round or deferred-block ballooning.
         """
-        stream = torch.cuda.current_stream()
+        event = torch.cuda.Event()
+        event.record()
+        self._retired_prebuilt.append((event, refs))
 
-        def mark(obj) -> None:
-            if isinstance(obj, torch.Tensor):
-                if obj.is_cuda:
-                    obj.record_stream(stream)
-            elif isinstance(obj, (list, tuple)):
-                for item in obj:
-                    mark(item)
-
-        mark(pre.slots)
-        for value in vars(pre.batch).values():
-            mark(value)
-        holder = pre.graph_round
-        fields = getattr(holder, "__struct_fields__", None) or vars(holder).keys()
-        for name in fields:
-            mark(getattr(holder, name, None))
-        if pre.case_staging is not None:
-            for staging in pre.case_staging:
-                mark(staging.out_cache_loc)
-        if pre.replay_fb is not None:
-            for value in vars(pre.replay_fb).values():
-                mark(value)
-            if pre.replay_fb.spec_info is not None:
-                for value in vars(pre.replay_fb.spec_info).values():
-                    mark(value)
-        for extra in pre.scratch_slots:
-            mark(extra)
+    def _drain_retired_prebuilt(self) -> None:
+        retired = self._retired_prebuilt
+        while retired and retired[0][0].query():
+            retired.popleft()
 
     def _consume_prebuilt(
         self,
@@ -5054,19 +6282,30 @@ class EnumDraftEngine:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compact the hypothesized-max allocation to the actual deltas and
         stage the real token values. Returns (advance_slots, seat_input_ids)."""
-        width = self.num_steps + 1
+        width = self._preadvance_alloc_width
+        shift = pre.slot_shift
         chunks = pre.slots.view(len(states), width)
+        pos = pre.slot_positions  # aligned with slots (stale-base logical)
         pieces: list[torch.Tensor] = []
         delta_tokens: list[int] = []
         for i, (state, delta_len) in enumerate(zip(states, delta_lens)):
-            pieces.append(chunks[i, :delta_len])
-            if delta_len < width:
+            pieces.append(chunks[i, shift : shift + delta_len])
+            if shift:
+                # Rebased skeleton: the leading slots cover positions the
+                # previous round already committed -- mid-page they are
+                # physical ALIASES of the kept slots (never page heads, so
+                # the tracker refuses to free them); across a page boundary
+                # they are junk duplicate pages (page head tracked, freed).
                 self._track_scratch_slots(
                     scratch_slots,
-                    slots=chunks[i, delta_len:],
-                    positions=list(
-                        range(base_lens[i] + delta_len, base_lens[i] + width)
-                    ),
+                    slots=chunks[i, :shift],
+                    positions=pos[i * width : i * width + shift],
+                )
+            if shift + delta_len < width:
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=chunks[i, shift + delta_len :],
+                    positions=pos[i * width + shift + delta_len : (i + 1) * width],
                 )
             delta_tokens.extend(state.committed_tokens[-delta_len:])
         advance_slots = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
@@ -5086,20 +6325,37 @@ class EnumDraftEngine:
         round already staged the token VALUES in-kernel): split the
         hypothesized-max allocation into the absorbed delta prefix and the
         leftover scratch."""
-        width = self.num_steps + 1
+        width = self._preadvance_alloc_width
+        shift = pre.slot_shift
         chunks = pre.slots.view(len(states), width)
+        pos = pre.slot_positions
         pieces: list[torch.Tensor] = []
         for i, delta_len in enumerate(delta_lens):
-            pieces.append(chunks[i, :delta_len])
-            if delta_len < width:
+            pieces.append(chunks[i, shift : shift + delta_len])
+            if shift:
+                # Rebased leading slots: aliases or junk duplicates of the
+                # previous kept -- see _consume_prebuilt.
                 self._track_scratch_slots(
                     scratch_slots,
-                    slots=chunks[i, delta_len:],
-                    positions=list(
-                        range(base_lens[i] + delta_len, base_lens[i] + width)
-                    ),
+                    slots=chunks[i, :shift],
+                    positions=pos[i * width : i * width + shift],
+                )
+            if shift + delta_len < width:
+                self._track_scratch_slots(
+                    scratch_slots,
+                    slots=chunks[i, shift + delta_len :],
+                    positions=pos[i * width + shift + delta_len : (i + 1) * width],
                 )
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+
+    @staticmethod
+    def _extend_committed(state: _DraftReqState, kept: torch.Tensor) -> None:
+        """Append kept slots to the committed prefix: O(dlen) copy into the
+        seat's persistent ring + an O(1) view rebind (never a cat)."""
+        base = state.committed_slots.numel()
+        n = kept.numel()
+        state.committed_ring[base : base + n].copy_(kept)
+        state.committed_slots = state.committed_ring[: base + n]
 
     def _absorb_advance_slots(
         self, states: list[_DraftReqState], advance_slots: torch.Tensor
@@ -5108,9 +6364,7 @@ class EnumDraftEngine:
         offset = 0
         for state in states:
             new_len = len(state.committed_tokens) - state.committed_slots.numel()
-            state.committed_slots = torch.cat(
-                [state.committed_slots, advance_slots[offset : offset + new_len]]
-            )
+            self._extend_committed(state, advance_slots[offset : offset + new_len])
             offset += new_len
         self.profiler.mark("commit_slots")
 
@@ -5179,8 +6433,13 @@ class EnumDraftEngine:
         trivial next to a forward."""
         if not src_pieces:
             return
+        # disjoint: COW targets are carrier-private rows, never aliased with
+        # the committed sources -- the copy may fan locs across the grid
+        # (19x over the in-place-safe order at this size).
         self._cow_kv_pool.move_kv_cache(
-            tgt_loc=torch.cat(dst_pieces), src_loc=torch.cat(src_pieces)
+            tgt_loc=torch.cat(dst_pieces),
+            src_loc=torch.cat(src_pieces),
+            disjoint=True,
         )
         self.profiler.mark(f"{tag}_cow")
 
@@ -5466,6 +6725,27 @@ class EnumDraftEngine:
                 delta_lens=delta_lens,
                 scratch_slots=scratch_slots,
             )
+            if prelaunched.get("prepacked") and prelaunched.get("verdict") == 1:
+                # KERNEL-routed miss only (a forced_case0 -- host/kernel
+                # disagreement -- must keep the legacy re-draft: the kernel
+                # packed the grid under ITS verdict, not this routing).
+                # The armed grid's case-0 lanes ARE this round's product (the
+                # scatter fed -1 chains to the topk, so its node-0 guesses
+                # are exclusion-free; the chain graph forked case-0 branches
+                # from the post-advance seat state) and the pack kernel
+                # poisoned every case > 0 lane. Nothing left to compute.
+                self._absorb_advance_slots(states, advance_slots)
+                for state in states:
+                    state.backbone_host_lazy = None
+                    state.last_backbone_host = []
+                    state.last_backbone_len = 0
+                    self._adopt_prepacked_block(state)
+                self.profiler.mark("case0_prepacked")
+                return {
+                    "pool_indices": [s.req_pool_idx for s in states],
+                    "base_committed_lens": [len(s.committed_tokens) for s in states],
+                    "units_device": states[0].last_units_dev.unsqueeze(0),
+                }
             node0_logits = prelaunched["fused_logits"].view(bs, num_steps + 1, -1)[:, 0]
             node0_guesses = torch.topk(node0_logits, f_live, dim=-1).indices
         else:
@@ -5873,6 +7153,18 @@ class EnumDraftEngine:
         )
         guesses_col = guesses_stack.unsqueeze(-1)  # [bs, K+1, F, 1]
         units_device = torch.cat([guesses_col, chains], dim=-1)  # [bs, K+1, F, K+1]
+        if self._block_hash_log:
+            # Deterministic-drafter fingerprint (syncs; debug only): commits
+            # are config-invariant, so a healthy config and a defective one
+            # must produce IDENTICAL blocks -- the first diverging (base,
+            # case) names the poisoned plane.
+            for i, state in enumerate(states):
+                logger.info(
+                    "block-fp base=%d guesses=%s chainsum=%d",
+                    len(state.committed_tokens),
+                    units_device[i, :, :, 0].flatten().tolist(),
+                    int(chains[i].sum().item()),
+                )
         self.profiler.mark("pack")
         mirror_event = torch.cuda.Event()
         for i, state in enumerate(states):
@@ -5882,19 +7174,46 @@ class EnumDraftEngine:
                     units_device[i].shape, dtype=units_device.dtype, pin_memory=True
                 )
             state.last_units_host.copy_(units_device[i], non_blocking=True)
+            state.backbone_host_lazy = None
             state.last_backbone_host = list(new_backbones[i])
             backbone = new_backbones[i]
             state.last_backbone_len = len(backbone)
-            if state.last_backbone_dev is None:
-                state.last_backbone_dev = torch.zeros(
-                    max(1, self.num_steps),
-                    dtype=torch.int64,
-                    device=units_device.device,
-                )
-            if backbone:
-                state.last_backbone_dev[: len(backbone)].copy_(
-                    self._h2d.to_device(backbone, dtype=torch.int64)
-                )
+            if self._early_judge_enabled:
+                # Slow-path production is host truth: write BOTH pair slots
+                # (the next armed round's pack overwrites whichever slot its
+                # cadence picks, the adopt then flips onto it; seeding both
+                # keeps the live twin correct no matter which slot that is)
+                # and point the live twin at one of them.
+                for slot in range(2):
+                    if state.backbone_pair[slot] is None:
+                        state.backbone_pair[slot] = torch.zeros(
+                            max(1, self.num_steps),
+                            dtype=torch.int64,
+                            device=units_device.device,
+                        )
+                    if backbone:
+                        state.backbone_pair[slot][: len(backbone)].copy_(
+                            self._h2d.to_device(backbone, dtype=torch.int64)
+                        )
+                state.last_backbone_dev = state.backbone_pair[max(state.units_idx, 0)]
+                if backbone:
+                    # Keep the scatter's own backbone source in step across
+                    # slow-path production (it reads _scatter_chains, see
+                    # the arm's commit_scatter call).
+                    self._scatter_chains[: len(backbone)].copy_(
+                        self._h2d.to_device(backbone, dtype=torch.int64)
+                    )
+            else:
+                if state.last_backbone_dev is None:
+                    state.last_backbone_dev = torch.zeros(
+                        max(1, self.num_steps),
+                        dtype=torch.int64,
+                        device=units_device.device,
+                    )
+                if backbone:
+                    state.last_backbone_dev[: len(backbone)].copy_(
+                        self._h2d.to_device(backbone, dtype=torch.int64)
+                    )
             state.mirror_event = mirror_event
         mirror_event.record()
         self.profiler.mark("mirror")

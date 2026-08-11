@@ -801,6 +801,14 @@ class DecoupledVerifyManager:
         *,
         overlap: bool,
     ) -> None:
+        if req.multimodal_inputs is not None:
+            # The drafter is a text-only model fed nothing but token ids: a
+            # multimodal prompt's placeholder ids stand for embeddings it never
+            # receives (and mrope positions it cannot derive), which took the
+            # drafter down with an out-of-bounds gather -- the VLM server
+            # warmup alone was enough. Never open a seat for such a request;
+            # it rides the plain (unspeculated) verify path.
+            return
         state = self._rid_states.get(req.rid)
         if req.finished():
             if state is not None:

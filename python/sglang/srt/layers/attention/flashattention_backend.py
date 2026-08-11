@@ -3311,6 +3311,11 @@ class FlashAttentionMultiStepBackend:
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        # Same value the per-step backends derive; the hybrid draft-decode
+        # wrapper (draft_utils.build_hybrid_draft_decode_backend) reads it off
+        # the multi-step backend, so a hybrid model + fa3 draft fails to boot
+        # without it.
+        self.max_context_len = model_runner.model_config.context_len
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(

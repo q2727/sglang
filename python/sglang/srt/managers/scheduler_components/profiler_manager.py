@@ -23,6 +23,11 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.thread_band_recorder import (
+    inject_into_chrome_trace,
+    mark_clock_sync,
+    set_recording,
+)
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -248,6 +253,12 @@ class SchedulerProfilerManager:
             except RuntimeError as e:
                 self.torch_profiler = None
                 return ProfileReqOutput(success=False, message=str(e))
+            # Kineto's callbacks are thread-local to THIS thread: long-lived
+            # worker threads (decoupled IPC) are invisible to it and record
+            # side-bands instead, injected into the exported trace at stop.
+            # The sync marker pairs kineto's clock with the recorders'.
+            set_recording(True)
+            mark_clock_sync()
             self.profile_in_progress = True
 
         if "MEM" in activities:
@@ -335,9 +346,13 @@ class SchedulerProfilerManager:
                     + ".trace.json.gz"
                 )
 
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, filename)
-                )
+                trace_path = os.path.join(self.torch_profiler_output_dir, filename)
+                self.torch_profiler.export_chrome_trace(trace_path)
+                # Worker threads kineto cannot see (thread-local callbacks)
+                # recorded side-bands on the same monotonic clock; fold them
+                # into the just-written trace so their tracks appear inline.
+                set_recording(False)
+                inject_into_chrome_trace(trace_path)
             torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:

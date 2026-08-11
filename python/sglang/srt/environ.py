@@ -358,6 +358,13 @@ class Envs:
     # enumeration round. Adds a device sync at every phase boundary, so the
     # round itself gets slower -- debug instrumentation only.
     SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE = EnvBool(False)
+    # Decoupled spec: sync-free host-time breakdown of the drafter's round.
+    # Unlike DRAFT_PROFILE above it never syncs the device, so the numbers are
+    # the host thread's REAL wall time per stage (a stage that blocks in the
+    # driver -- e.g. a graph launch -- shows its true cost). Answers what a
+    # torch profile cannot: CUPTI's per-graph-node tracing inflates
+    # cudaGraphLaunch by ~1us/node, which is exactly the band under study.
+    SGLANG_DEBUG_DECOUPLED_HOST_BANDS = EnvBool(False)
     # Decoupled spec: verifier-side round timeline (wall between rounds,
     # control-plane send, arrival wait, block transport latency). Pure host
     # timestamps -- cheap, but debug instrumentation only.
@@ -377,6 +384,48 @@ class Envs:
     # lengths (no pad half-rows). Corrupts states/guesses by design; only
     # for localizing which plane injects NaN. Debug instrumentation only.
     SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_FULLSCAN = EnvBool(False)
+    # Decoupled spec: build every bs==1 prebuilt skeleton N tokens STALE on
+    # purpose (base rewound at restage), so the arm-time re-base machinery
+    # (slot-shift consume, replay-fb rebuild, glue COW/fork redo, page-table
+    # top-up) runs under today's round order. Validation only: e2e output
+    # must stay byte-identical to a run without it. 0 = off.
+    SGLANG_DEBUG_DECOUPLED_STALE_INJECT = EnvInt(0)
+    # Decoupled spec, step-5 order A/B: arm the previous tail's skeleton
+    # BEFORE building the next one (True, the verifier-style overlap order)
+    # or build-then-arm fresh (False, the pre-step-5 order). Diagnostic
+    # toggle while the rebased-round draft-quality defect is open.
+    SGLANG_ENABLE_DECOUPLED_ARM_BEFORE_RESTAGE = EnvBool(True)
+    # Decoupled spec: log every packed block's guess tokens + chain checksum
+    # (device sync per round -- debug only). The drafter is deterministic and
+    # commits are config-invariant, so diffing these logs between a healthy
+    # and a defective config names the first poisoned block and the exact
+    # case/row that diverged.
+    SGLANG_DEBUG_DECOUPLED_BLOCK_HASH = EnvBool(False)
+    # Decoupled spec: device-side block pack (pack_units riding the armed
+    # sequence: units + miss poisoning + backbone update on stream, host
+    # pack/mirror/case0-redraft retired). Kill switch for A/B bisection.
+    SGLANG_ENABLE_DECOUPLED_DEVICE_PACK = EnvBool(True)
+    # Decoupled spec: early judge -- a us match kernel judges the commit at
+    # dispatch time (seg half synced in ~0.1ms for the optimistic route, the
+    # (case, f) match half audited next dispatch), so the host never parks
+    # on the previous armed sequence's tail. Requires DEVICE_PACK.
+    # DEFAULT ON (2026-08-11): the acc 3.77 phase bug is fixed -- the
+    # backbone twin was one generation ahead (a dispatch-side flip against
+    # commit-driven gated sequences that run ahead of the dispatches); it
+    # now rides the units' pending/adopt cadence. Same-day same-text legs:
+    # judge ON 542 tok/s / acc 3.94 vs judge OFF (host match) 524 / 3.79 --
+    # the kernel match also covers rounds the host mirror match loses to
+    # its own read cadence, so ON strictly dominates.
+    SGLANG_ENABLE_DECOUPLED_EARLY_JUDGE = EnvBool(True)
+    # Debug: after every judge routing, also run the host mirror match and
+    # log divergences (re-adds the mirror sync; diagnosis only).
+    SGLANG_DEBUG_DECOUPLED_JUDGE_CHECK = EnvBool(False)
+    # Decoupled spec: at the resolve whose post-commit base equals this
+    # value, synchronize and dump the armed round's advance-row inputs
+    # (input window, out_cache_loc, true lens, positions, page-table slice,
+    # committed slots tail, recurrent-state checksums). Diffing the dump
+    # between a healthy and a defective config names the corrupted tensor.
+    SGLANG_DEBUG_DECOUPLED_DUMP_BASE = EnvInt(0)
     # Decoupled spec: after each round the drafter bets the most likely next
     # commit (full accept + its own top bonus guess), pre-runs that round and
     # ships the block early into the speculative buffer generation. A right

@@ -36,6 +36,8 @@ from sglang.srt.speculative.decoupled_spec_transport import (
     BaseDecoupledSpecTransport,
     TransportClosed,
 )
+from sglang.srt.utils.common import set_native_thread_name
+from sglang.srt.utils.thread_band_recorder import register_thread_band_recorder
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.decoupled_enum_buffer import DecoupledEnumBuffer
@@ -131,6 +133,9 @@ class VerifierIpcThread:
         self.num_drafters = max(1, int(num_drafters))
         self.src_verifier_rank = int(src_verifier_rank)
         self._closed = threading.Event()
+        # Side-band trace recorder (kineto is blind to this thread; bands
+        # are injected into the exported trace at stop_profile).
+        self._bands = register_thread_band_recorder("sgl-verify-ipc")
         self._thread = threading.Thread(
             target=self._run,
             name="sglang-verifier-ipc",
@@ -177,6 +182,8 @@ class VerifierIpcThread:
         return did_work
 
     def _run(self) -> None:
+        # pthread name for profiler/py-spy/top track labeling.
+        set_native_thread_name("sgl-verify-ipc")
         while not self._closed.is_set():
             try:
                 if not self._step():
@@ -223,10 +230,11 @@ class VerifierIpcThread:
                         self._closed_rids.discard(self._closed_rid_ring[0])
                     self._closed_rid_ring.append(close.request_id)
                     self._closed_rids.add(close.request_id)
-            self.transport.send(
-                int(batch.dst_drafter_rank),
-                DraftMeshMessage.from_control_batch(batch),
-            )
+            with self._bands.band("verifier_ipc.send_controls"):
+                self.transport.send(
+                    int(batch.dst_drafter_rank),
+                    DraftMeshMessage.from_control_batch(batch),
+                )
         return did_work
 
     def _drain_evented_commits(self) -> bool:
@@ -277,7 +285,8 @@ class VerifierIpcThread:
                     missing[:4],
                 )
             self._evented_fifo.popleft()
-            self._send_round_commits(head)
+            with self._bands.band("verifier_ipc.send_round_commits"):
+                self._send_round_commits(head)
             did_work = True
         return did_work
 
@@ -362,13 +371,14 @@ class VerifierIpcThread:
             # seat-range guard all live in land(); the SYNC scatter runs on the
             # current stream (6.3 moves it to a copy stream), or on the
             # dedicated landing stream when the doorbell is armed.
-            if self._land_stream is not None:
-                with torch.cuda.stream(self._land_stream):
+            with self._bands.band("verifier_ipc.land_block"):
+                if self._land_stream is not None:
+                    with torch.cuda.stream(self._land_stream):
+                        self.enum_buffer.land(block)
+                else:
                     self.enum_buffer.land(block)
-            else:
-                self.enum_buffer.land(block)
-            if self._on_land is not None:
-                self._on_land(block)
+                if self._on_land is not None:
+                    self._on_land(block)
         return did_work
 
     def _route_enumeration_message(

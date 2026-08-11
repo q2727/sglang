@@ -215,7 +215,7 @@ def _mirror_snapshot(
     seg_ok = (sel_taken == 1) & (s0b == sel_seq) & (s1b == sel_seq)
     skip = base_out_len - sel_pre
     dlen = sel_pre + sel_wire - base_out_len
-    return seg_ok, skip, dlen, sel_wire, sel_pre, toks
+    return seg_ok, skip, dlen, sel_wire, sel_pre, toks, sel_off
 
 
 @triton.jit
@@ -229,6 +229,8 @@ def _commit_match_kernel(
     units_ptr,
     backbone_ptr,
     out_ptr,
+    latch_ptr,
+    probe_ptr,
     seat,
     backbone_len,
     base_out_len,
@@ -238,18 +240,21 @@ def _commit_match_kernel(
     ROW_WORDS: tl.constexpr,
     SLOTS: tl.constexpr,
     W_PAD: tl.constexpr,
+    LATCH: tl.constexpr,
 ):
-    seg_ok, skip, dlen, wire, pre_len, toks = _mirror_snapshot(
+    seg_ok, skip, dlen, wire, pre_len, toks, sel_off = _mirror_snapshot(
         rows_ptr, seat, base_out_len, ROW_WORDS, SLOTS, W_PAD
     )
     lanes = tl.arange(0, W_PAD)
     case = dlen - 1
     prefix_ok = seg_ok & (case >= 0) & (case <= K) & (case <= backbone_len)
     skip_c = tl.minimum(tl.maximum(skip, 0), ROW_WORDS - 5)
+    fail_i = -1
     for i in tl.static_range(K):
         d = _tok_at(toks, lanes, tl.minimum(skip_c + i, W_PAD - 1))
         b = tl.load(backbone_ptr + i)
         prefix_ok &= (i >= case) | (d == b)
+        fail_i = tl.where((i < case) & (d != b) & (fail_i < 0), i, fail_i)
     case_c = tl.minimum(tl.maximum(case, 0), K)
     bonus = _tok_at(toks, lanes, tl.minimum(skip_c + case_c, W_PAD - 1))
     f_found = -1
@@ -265,40 +270,370 @@ def _commit_match_kernel(
     tl.store(out_ptr + 1, case_c.to(tl.int64))
     tl.store(out_ptr + 2, f_found.to(tl.int64))
     tl.store(out_ptr + 3, (pre_len + wire).to(tl.int64))
+    if LATCH:
+        # Early-judge mode: extend the verdict with the full judgment frame
+        # and snapshot the row's tokens, so the gated scatter (which runs
+        # only after the previous armed sequence drains) can replay THIS
+        # judgment instead of re-reading the live mirror -- a burst landing
+        # between the two reads would otherwise give host and kernel two
+        # different truths (the D10 two-coordinate-system trap).
+        tl.store(out_ptr + 4, tl.where(seg_ok, 1, 0).to(tl.int64))
+        tl.store(out_ptr + 5, skip.to(tl.int64))
+        tl.store(out_ptr + 6, dlen.to(tl.int64))
+        tl.store(out_ptr + 7, wire.to(tl.int64))
+        tl.store(latch_ptr + lanes, toks)
+        # Debug taps: what THIS execution actually loaded (the host-side
+        # dump of the same tensors is useless here -- its tolist syncs the
+        # main stream and reads the NEXT generation).
+        for i in tl.static_range(3):
+            tl.store(
+                out_ptr + 8 + i,
+                tl.load(backbone_ptr + tl.minimum(i, K - 1)).to(tl.int64),
+            )
+        tl.store(out_ptr + 11, tl.load(units_ptr + (case_c * F + 0) * W_UNIT))
+        tl.store(
+            out_ptr + 12,
+            tl.load(units_ptr + (case_c * F + tl.minimum(1, F - 1)) * W_UNIT),
+        )
+        # Generation fingerprint: the scatter verdict buffer's CURRENT
+        # (verdict, dlen). If these match THIS commit at judge time, the
+        # same-generation scatter has already run -- the seq's wait on the
+        # judge event did not hold.
+        tl.store(out_ptr + 13, tl.load(probe_ptr + 0))
+        tl.store(out_ptr + 14, tl.load(probe_ptr + 3))
+        tl.store(out_ptr + 15, tl.extra.cuda.globaltimer())
+        # Prefix forensics (acc 3.77 hunt): the exact segment tokens this
+        # execution compared, the bonus it looked up, and the first prefix
+        # position that failed -- the audit lines these up against the host
+        # committed-token chain to tell WHICH side is the wrong generation.
+        for i in tl.static_range(3):
+            tl.store(
+                out_ptr + 16 + i,
+                _tok_at(toks, lanes, tl.minimum(skip_c + i, W_PAD - 1)),
+            )
+        tl.store(out_ptr + 19, bonus)
+        tl.store(out_ptr + 20, fail_i.to(tl.int64))
+        # Slot hologram: the base this execution was handed, the slot it
+        # picked, and BOTH slots' full headers as it saw them -- the final
+        # discriminator between "picked the wrong slot", "slot holds stale
+        # payload under a fresh header", and "was handed a stale base".
+        tl.store(out_ptr + 21, base_out_len)
+        tl.store(out_ptr + 22, sel_off)
+        for s in tl.static_range(SLOTS):
+            hoff = (seat * SLOTS + s) * ROW_WORDS
+            tl.store(out_ptr + 24 + s * 4 + 0, tl.load(rows_ptr + hoff + 0))
+            tl.store(out_ptr + 24 + s * 4 + 1, tl.load(rows_ptr + hoff + 1))
+            tl.store(out_ptr + 24 + s * 4 + 2, tl.load(rows_ptr + hoff + 2))
+            tl.store(
+                out_ptr + 24 + s * 4 + 3,
+                tl.load(rows_ptr + hoff + ROW_WORDS - 1),
+            )
 
 
 def commit_match(
     *,
     mirror,
     seat: int,
-    units_dev: torch.Tensor,  # [K+1, F, K+1] this seat's last block (contiguous)
+    units_dev: torch.Tensor,  # [K+1, F, K+1] block (or [C*F] guess plane)
     backbone_dev: torch.Tensor,  # [K] device backbone twin
     backbone_len: int,
     base_out_len: int,
     num_steps: int,
     fanout: int,
+    unit_stride: Optional[int] = None,  # per-unit stride; default K+1 (block)
+    out_buf: Optional[torch.Tensor] = None,  # [>=8] i64 static (judge mode)
+    latch: Optional[torch.Tensor] = None,  # [W_PAD] i64 static (judge mode)
+    probe: Optional[torch.Tensor] = None,  # debug generation fingerprint
 ) -> torch.Tensor:
     """The drafter-side GPU replica of ``_match_seat``, fed from the commit
     mirror: out = [verdict(0=no consumable segment, 1=miss, 2=hit), case, f,
     new_total]. Self-consistent by construction -- the consumable segment is
     picked by pure arithmetic between each slot's own pre_len and the
     caller-sampled committed base, exactly the verifier-select stamp
-    recipe."""
-    out = torch.empty(4, dtype=torch.int64, device=units_dev.device)
+    recipe. With ``out_buf``+``latch`` it doubles as the early-judge kernel:
+    out[4..7] = (seg_ok, skip, dlen, wire) and the row tokens latch."""
+    out = (
+        out_buf
+        if out_buf is not None
+        else torch.empty(4, dtype=torch.int64, device=units_dev.device)
+    )
     _commit_match_kernel[(1,)](
         mirror.rows,
         units_dev,
         backbone_dev,
         out,
+        latch if latch is not None else out,
+        probe if probe is not None else out,
         seat,
         backbone_len,
         base_out_len,
         K=num_steps,
         F=fanout,
-        W_UNIT=num_steps + 1,
+        W_UNIT=unit_stride if unit_stride is not None else num_steps + 1,
         ROW_WORDS=mirror.row_words,
         SLOTS=2,
         W_PAD=triton.next_power_of_2(mirror.width),
+        LATCH=latch is not None,
+    )
+    return out
+
+
+@triton.jit
+def _commit_seg_kernel(
+    rows_ptr,
+    out_ptr,
+    seat,
+    base_out_len,
+    ROW_WORDS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    W_PAD: tl.constexpr,
+):
+    """The SEGMENT half of the judge: seg_ok/skip/dlen/wire from the mirror
+    alone -- no guesses, no backbone. This is the only bit of the judgment
+    the host truly has to wait for ("did the GPU consume this commit"); it
+    is pure arithmetic over the landed row and the armed base, so it can sit
+    directly behind the commit gate with NO ordering on the previous
+    sequence's products. The (case, f) match half stays on the judge stream
+    behind the inputs event and is consumed as an after-the-fact audit."""
+    seg_ok, skip, dlen, wire, pre_len, toks, sel_off = _mirror_snapshot(
+        rows_ptr, seat, base_out_len, ROW_WORDS, SLOTS, W_PAD
+    )
+    tl.store(out_ptr + 0, tl.where(seg_ok, 1, 0).to(tl.int64))
+    tl.store(out_ptr + 1, skip.to(tl.int64))
+    tl.store(out_ptr + 2, dlen.to(tl.int64))
+    tl.store(out_ptr + 3, wire.to(tl.int64))
+    # Phase anchor: seg runs the moment dispatch launches it (empty stream,
+    # no waits), so this stamps "dispatch N" on the same device clock the
+    # match half stamps into its pin[15] -- their delta is the match's true
+    # execution lag with no host/GPU clock calibration.
+    tl.store(out_ptr + 4, tl.extra.cuda.globaltimer())
+
+
+def commit_seg(
+    *,
+    mirror,
+    seat: int,
+    base_out_len: int,
+    out_buf: torch.Tensor,  # [>=5] i64 static
+) -> None:
+    _commit_seg_kernel[(1,)](
+        mirror.rows,
+        out_buf,
+        seat,
+        base_out_len,
+        ROW_WORDS=mirror.row_words,
+        SLOTS=2,
+        W_PAD=triton.next_power_of_2(mirror.width),
+    )
+
+
+@triton.jit
+def _pack_guesses_kernel(
+    plane_ptr,  # [C*F] i64 persistent per-seat guess plane
+    guesses_ptr,  # [C, GW] i64 topk-graph static output
+    rowmap_ptr,  # [C*F] i32: full-grid position -> chain row, -1 dead
+    verdict_ptr,  # [>=1] i64 from commit_scatter: [0]=verdict
+    GW,
+    C: tl.constexpr,
+    F: tl.constexpr,
+):
+    """The guess half of _pack_units_kernel, run right after the topk so the
+    NEXT round's early judge can match against exactly the values the pack
+    will publish (same live-mask poisoning), a whole chain graph earlier
+    than the packed block exists."""
+    pid = tl.program_id(0)
+    c = pid // F
+    f = pid % F
+    verdict = tl.load(verdict_ptr)
+    hit = verdict == 2
+    row = tl.load(rowmap_ptr + pid)
+    live = (row >= 0) & (hit | (c == 0))
+    g = tl.load(guesses_ptr + c * GW + tl.minimum(f, GW - 1))
+    tl.store(plane_ptr + pid, tl.where((f < GW) & live, g, -1))
+
+
+def pack_guesses(
+    *,
+    plane: torch.Tensor,  # [C*F] i64
+    guesses: torch.Tensor,  # [C, GW] i64
+    rowmap: torch.Tensor,  # [C*F] i32
+    verdict: torch.Tensor,
+    num_steps: int,
+    fanout: int,
+) -> None:
+    num_cases = num_steps + 1
+    _pack_guesses_kernel[(num_cases * fanout,)](
+        plane,
+        guesses,
+        rowmap,
+        verdict,
+        guesses.shape[-1],
+        C=num_cases,
+        F=fanout,
+    )
+
+
+@triton.jit
+def _pack_units_kernel(
+    units_ptr,  # [C, F, K+1] i64 persistent per-seat block buffer
+    guesses_ptr,  # [C, GW] i64 topk-graph static output
+    chains_ptr,  # [K, ROWS] i64 (stacked chain-graph static outputs)
+    rowmap_ptr,  # [C*F] i32: full-grid position -> chain output row, -1 dead
+    verdict_ptr,  # [>=4] i64 from commit_scatter: [0]=verdict
+    GW,  # guess tensor width (f_live, or F for pre-poisoned budget grids)
+    ROWS,  # chain output rows
+    C: tl.constexpr,
+    F: tl.constexpr,
+    K: tl.constexpr,
+    K_POW2: tl.constexpr,
+):
+    """Device-side block pack + miss poisoning.
+
+    One program per (case, f) lane. Replaces the dispatch-time host pack
+    (units cat/stack + poisoning) AND the whole host case-0
+    re-draft: on a miss the armed grid's case-0 lanes are already the case-0
+    round's product (scatter feeds -1 chains to the topk on a miss, so its
+    node-0 guesses are exclusion-free, and the chain graph forked the case-0
+    branches from the post-advance seat state) -- the only thing the host
+    path added was poisoning the dead lanes, which is this kernel's `live`
+    mask. Enqueued at arm behind the gate: zero host work at round time.
+    """
+    pid = tl.program_id(0)
+    c = pid // F
+    f = pid % F
+    verdict = tl.load(verdict_ptr)
+    hit = verdict == 2
+    row = tl.load(rowmap_ptr + pid)
+    live = (row >= 0) & (hit | (c == 0))
+    g = tl.load(guesses_ptr + c * GW + tl.minimum(f, GW - 1))
+    g = tl.where((f < GW) & live, g, -1)
+    tl.store(units_ptr + pid * (K + 1), g)
+    i = tl.arange(0, K_POW2)
+    mi = i < K
+    row_c = tl.maximum(row, 0)
+    cv = tl.load(chains_ptr + i * ROWS + tl.minimum(row_c, ROWS - 1), mask=mi, other=0)
+    cv = tl.where(live, cv, 0)
+    tl.store(units_ptr + pid * (K + 1) + 1 + i, cv, mask=mi)
+    # The backbone is NOT written here: the next round's prefix key is the
+    # winning chain of the block this round's scatter MATCHED (one round
+    # older than the block being packed), and commit_scatter already emits
+    # exactly that as chains_out -- the caller copies it. Writing the fresh
+    # chains here instead was an off-by-one-round bug (acc 3.94 -> 2.55).
+
+
+def pack_units(
+    *,
+    units_buf: torch.Tensor,  # [C, F, K+1] i64
+    guesses: torch.Tensor,  # [C, GW] i64
+    chains_stacked: torch.Tensor,  # [K, ROWS] i64
+    rowmap: torch.Tensor,  # [C*F] i32
+    verdict: torch.Tensor,  # commit_scatter verdict buffer
+    num_steps: int,
+    fanout: int,
+) -> None:
+    num_cases = num_steps + 1
+    _pack_units_kernel[(num_cases * fanout,)](
+        units_buf,
+        guesses,
+        chains_stacked,
+        rowmap,
+        verdict,
+        guesses.shape[-1],
+        chains_stacked.shape[-1],
+        C=num_cases,
+        F=fanout,
+        K=num_steps,
+        K_POW2=triton.next_power_of_2(max(num_steps, 1)),
+    )
+
+
+@triton.jit
+def _out_loc_stacks_kernel(
+    out_ptr,  # [S, C, R*W] int64: per (stale-shift, accept-case) write slots
+    alloc_ptr,  # [ALLOC_W] int64: the skeleton's widened delta allocation
+    pad_flats_ptr,  # [PAD_SPAN] int64: the seat's junk pad plane (paged layout)
+    glue_flats_ptr,  # [R-1, SPAN_MAX] int64: glue rows' private flat slots
+    base_len,  # skeleton base at build (stale; +s gives the consume base)
+    S: tl.constexpr,  # shifts (K + 2)
+    C: tl.constexpr,  # accept cases (K + 1)
+    R: tl.constexpr,  # fused rows per seat (K + 1: seat + K glue)
+    W: tl.constexpr,  # padded row width (2K + 1)
+    PAGE: tl.constexpr,
+    ALLOC_W: tl.constexpr,
+    PAD_SPAN: tl.constexpr,
+    SPAN_MAX: tl.constexpr,
+    W_POW2: tl.constexpr,
+):
+    """One-launch replacement for the restage's out_cache_loc composition.
+
+    The host used to assemble S*C rows out of ~6 tiny cat/slice ops each
+    (~200 dispatches per restage); every entry is pure index arithmetic over
+    four inputs, so one program per (s, c, r) writes its W-slot row directly:
+
+      seat row (r == 0): delta slots straight from the widened allocation at
+        offset s (alloc slots are position-aligned, so the stale-consume
+        shift IS the fix), then junk pads at in-page offset (base+s+dlen)%P;
+      glue row r >= 1: the row's private window at in-page offset
+        (base+s)%P -- an arena page hosts any offset, tail+W <= SPAN_MAX.
+    """
+    pid = tl.program_id(0)
+    s = pid // (C * R)
+    c = (pid % (C * R)) // R
+    r = pid % R
+    dlen = c + 1
+    w = tl.arange(0, W_POW2)
+    mask = w < W
+    if r == 0:
+        pad_offset = (base_len + s + dlen) % PAGE
+        pad_idx = tl.minimum(pad_offset + tl.maximum(w - dlen, 0), PAD_SPAN - 1)
+        pads = tl.load(pad_flats_ptr + pad_idx, mask=mask, other=0)
+        alloc_idx = tl.minimum(s + w, ALLOC_W - 1)
+        delta = tl.load(alloc_ptr + alloc_idx, mask=mask, other=0)
+        val = tl.where(w < dlen, delta, pads)
+    else:
+        tail = (base_len + s) % PAGE
+        val = tl.load(
+            glue_flats_ptr + (r - 1) * SPAN_MAX + tail + w, mask=mask, other=0
+        )
+    tl.store(out_ptr + ((s * C + c) * R + r) * W + w, val, mask=mask)
+
+
+def build_out_loc_stacks(
+    *,
+    alloc_slots: torch.Tensor,  # [ALLOC_W] int64
+    pad_flats: torch.Tensor,  # [PAD_SPAN] int64
+    glue_flats: torch.Tensor,  # [R-1, SPAN_MAX] int64 (contiguous)
+    base_len: int,
+    num_steps: int,
+    width: int,
+    page_size: int,
+) -> torch.Tensor:
+    """All (shift, case) out_cache_loc rows in one launch -> [S, C, R*W]."""
+    num_shifts = num_steps + 2
+    num_cases = num_steps + 1
+    rows = num_steps + 1
+    out = torch.empty(
+        num_shifts,
+        num_cases,
+        rows * width,
+        dtype=torch.int64,
+        device=alloc_slots.device,
+    )
+    _out_loc_stacks_kernel[(num_shifts * num_cases * rows,)](
+        out,
+        alloc_slots,
+        pad_flats,
+        glue_flats,
+        base_len,
+        S=num_shifts,
+        C=num_cases,
+        R=rows,
+        W=width,
+        PAGE=page_size,
+        ALLOC_W=alloc_slots.numel(),
+        PAD_SPAN=pad_flats.numel(),
+        SPAN_MAX=glue_flats.shape[1],
+        W_POW2=triton.next_power_of_2(width),
     )
     return out
 
@@ -323,13 +658,17 @@ def _commit_scatter_kernel(
     true_out_ptr,  # [ROWS] int32
     node_out_ptr,  # [ROWS] int64
     chains_out_ptr,  # [K] int64
-    table_ptr,  # page-table row base (real or shadow); pads land at
-    table_col0,  # columns [table_col0 + delta - ? ...]: col0 = base offset
+    table_ptr,  # page-table row base (real or shadow); pads land in its
+    # columns [base_len + delta, base_len + WIDTH)
+    base_lens_ptr,  # [seats] int64, seat-indexed: committed base length
+    # early-judge inputs (read only when FROM_JUDGE; see commit_match LATCH)
+    judge_ptr,  # [8] int64: verdict, case, f, new_total, seg_ok, skip, dlen, wire
+    latch_ptr,  # [W_PAD] int64: the judged row's token snapshot
     # scalars
     seat,
     backbone_len,
-    base_len,
     base_out_len,
+    seq_no,  # monotone arm counter; written to verdict[10] as a generation tag
     K: tl.constexpr,
     F: tl.constexpr,
     W_UNIT: tl.constexpr,
@@ -340,29 +679,51 @@ def _commit_scatter_kernel(
     ROW_WORDS: tl.constexpr,
     SLOTS: tl.constexpr,
     W_PAD: tl.constexpr,
+    FROM_JUDGE: tl.constexpr,
 ):
-    seg_ok, skip, dlen, wire_len, pre_len, toks = _mirror_snapshot(
-        rows_ptr, seat, base_out_len, ROW_WORDS, SLOTS, W_PAD
-    )
-    lanes = tl.arange(0, W_PAD)
-    case = dlen - 1
-    prefix_ok = seg_ok & (case >= 0) & (case <= K) & (case <= backbone_len)
-    skip_c = tl.minimum(tl.maximum(skip, 0), W_PAD - 1)
-    for i in tl.static_range(K):
-        d = _tok_at(toks, lanes, tl.minimum(skip_c + i, W_PAD - 1))
-        b = tl.load(backbone_ptr + i)
-        prefix_ok &= (i >= case) | (d == b)
-    case_c = tl.minimum(tl.maximum(case, 0), K)
-    bonus = _tok_at(toks, lanes, tl.minimum(skip_c + case_c, W_PAD - 1))
-    f_found = -1
-    for f in tl.static_range(F):
-        g = tl.load(units_ptr + (case_c * F + f) * W_UNIT)
-        f_found = tl.where((g == bonus) & (f_found < 0), f, f_found)
-    hit = prefix_ok & (f_found >= 0)
-    # 0 = no consumable segment for this base (nothing landed yet / old /
-    # later / torn): the junk lane below leaves the seat untouched and the
-    # host round redoes everything.
-    verdict = tl.where(~seg_ok, 0, tl.where(hit, 2, 1))
+    if FROM_JUDGE:
+        # Early-judge mode: the judgment and the row snapshot were taken by
+        # commit_match(latch=...) on the judge stream the moment the commit
+        # landed, and the HOST has already routed on them. Replay exactly
+        # that frame -- re-reading the live mirror here (a whole armed
+        # sequence later) could see a newer generation after a burst and
+        # hand the host and this kernel two different truths (D10).
+        lanes = tl.arange(0, W_PAD)
+        verdict = tl.load(judge_ptr + 0)
+        case_c = tl.load(judge_ptr + 1)
+        f_found = tl.load(judge_ptr + 2)
+        seg_ok = tl.load(judge_ptr + 4) == 1
+        skip = tl.load(judge_ptr + 5)
+        dlen = tl.load(judge_ptr + 6)
+        wire_len = tl.load(judge_ptr + 7)
+        pre_len = base_out_len - skip
+        toks = tl.load(latch_ptr + lanes)
+        hit = verdict == 2
+        skip_c = tl.minimum(tl.maximum(skip, 0), W_PAD - 1)
+        bonus = _tok_at(toks, lanes, tl.minimum(skip_c + case_c, W_PAD - 1))
+    else:
+        seg_ok, skip, dlen, wire_len, pre_len, toks, _sel_off = _mirror_snapshot(
+            rows_ptr, seat, base_out_len, ROW_WORDS, SLOTS, W_PAD
+        )
+        lanes = tl.arange(0, W_PAD)
+        case = dlen - 1
+        prefix_ok = seg_ok & (case >= 0) & (case <= K) & (case <= backbone_len)
+        skip_c = tl.minimum(tl.maximum(skip, 0), W_PAD - 1)
+        for i in tl.static_range(K):
+            d = _tok_at(toks, lanes, tl.minimum(skip_c + i, W_PAD - 1))
+            b = tl.load(backbone_ptr + i)
+            prefix_ok &= (i >= case) | (d == b)
+        case_c = tl.minimum(tl.maximum(case, 0), K)
+        bonus = _tok_at(toks, lanes, tl.minimum(skip_c + case_c, W_PAD - 1))
+        f_found = -1
+        for f in tl.static_range(F):
+            g = tl.load(units_ptr + (case_c * F + f) * W_UNIT)
+            f_found = tl.where((g == bonus) & (f_found < 0), f, f_found)
+        hit = prefix_ok & (f_found >= 0)
+        # 0 = no consumable segment for this base (nothing landed yet / old /
+        # later / torn): the junk lane below leaves the seat untouched and the
+        # host round redoes everything.
+        verdict = tl.where(~seg_ok, 0, tl.where(hit, 2, 1))
     tl.store(verdict_ptr + 0, verdict.to(tl.int64))
     tl.store(verdict_ptr + 1, case_c.to(tl.int64))
     tl.store(verdict_ptr + 2, f_found.to(tl.int64))
@@ -376,6 +737,7 @@ def _commit_scatter_kernel(
     tl.store(verdict_ptr + 7, tl.where(seg_ok, 1, 0).to(tl.int64))
     tl.store(verdict_ptr + 8, pre_len.to(tl.int64))
     tl.store(verdict_ptr + 9, wire_len.to(tl.int64))
+    tl.store(verdict_ptr + 10, seq_no)
     stale_row = verdict == 0
     f_c = tl.maximum(f_found, 0)
     # E: winning chain (junk zeros on miss -- its cells are dead by theorem)
@@ -407,7 +769,12 @@ def _commit_scatter_kernel(
     for r in tl.static_range(ROWS):
         nv = tl.load(node_stack_ptr + case_c * ROWS + r)
         tl.store(node_out_ptr + r, nv)
-    # D: seat-row pad table entries, columns [base+delta, base+WIDTH)
+    # D: seat-row pad table entries, columns [base+delta, base+WIDTH).
+    # The base is read from the seat-indexed device buffer, not passed down as
+    # a host scalar: the column a pad lands at is a "where", and every "where"
+    # in this kernel already comes from the device (dlen from the mirror). That
+    # is what lets the skeleton stop depending on the host knowing the base.
+    base_len = tl.load(base_lens_ptr + seat)
     new_len = base_len + dlen
     pad_offset = new_len - (new_len // PAGE) * PAGE
     for i in tl.static_range(WIDTH):
@@ -415,7 +782,7 @@ def _commit_scatter_kernel(
         in_pad = (col >= dlen) & (col < WIDTH)
         pval = tl.load(pad_flats_ptr + tl.minimum(pad_offset + i, PAGE + WIDTH - 2))
         tl.store(
-            table_ptr + table_col0 + col,
+            table_ptr + base_len + col,
             pval.to(tl.int32),
             mask=in_pad & ~stale_row,
         )
@@ -434,23 +801,28 @@ def commit_scatter(
     node_stack: torch.Tensor,
     pad_flats: torch.Tensor,
     table_row: torch.Tensor,  # 1-D view of the seat row (real or shadow)
-    table_col0: int,
-    base_len: int,
+    base_lens_dev: torch.Tensor,  # [req_pool] int64, seat-indexed base length
     base_out_len: int,
     num_steps: int,
     fanout: int,
     page_size: int,
     extend_width: int,
     outs: tuple,  # (verdict[4]i64, input[ROWS_W]i64, out_loc[ROWS_W]i64, true[ROWS]i32, node[ROWS]i64, chains[K]i64)
+    judge: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # (judge_buf, latch)
+    seq_no: int = 0,
 ) -> None:
     """One-launch commit consumption: the on-GPU match plus every per-case
     value the fused-extend replay needs (input assembly, out_cache_loc /
     GDN true-lens selection, seat-pad page-table suffix), fed entirely from
     the commit mirror. Stale generation writes only the verdict -- the
-    caller's junk-lane / fallback handles the rest."""
+    caller's junk-lane / fallback handles the rest. With ``judge`` the match
+    half is skipped: the early-judge kernel already took the judgment and
+    the row snapshot the moment the commit landed, and this kernel replays
+    that exact frame."""
     verdict, input_out, out_loc_out, true_out, node_out, chains_out = outs
     rows = true_stack.shape[1]
     rows_w = gather_stack.shape[1]
+    judge_buf, latch = judge if judge is not None else (verdict, verdict)
     _commit_scatter_kernel[(1,)](
         mirror.rows,
         units_dev,
@@ -467,11 +839,13 @@ def commit_scatter(
         node_out,
         chains_out,
         table_row,
-        table_col0,
+        base_lens_dev,
+        judge_buf,
+        latch,
         seat,
         backbone_len,
-        base_len,
         base_out_len,
+        seq_no,
         K=num_steps,
         F=fanout,
         W_UNIT=num_steps + 1,
@@ -482,6 +856,7 @@ def commit_scatter(
         ROW_WORDS=mirror.row_words,
         SLOTS=2,
         W_PAD=triton.next_power_of_2(mirror.width),
+        FROM_JUDGE=judge is not None,
     )
 
 
@@ -559,4 +934,80 @@ def chain_meta_fill(
         K=num_steps,
         ROWS_SEL=rows_sel,
         ROWS_PAD=triton.next_power_of_2(rows_sel),
+    )
+
+
+@triton.jit
+def _shift_replay_fb_kernel(
+    positions_ptr,  # [N_POS] per-token rotary positions
+    mrope_ptr,  # [3, N_POS] (HAS_MROPE only)
+    seq_lens_ptr,  # [N_ROWS]
+    orig_seq_lens_ptr,  # [N_ROWS]
+    prefix_lens_ptr,  # [N_ROWS]
+    d,
+    n_pos,
+    n_rows,
+    HAS_MROPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Add d to every base-derived field of the replay fb in ONE launch (the
+    five separate ``.add_(d)`` calls cost a launch each on the round-serial
+    restage path). Sizes are tiny (rows x width tokens), one program."""
+    lanes = tl.arange(0, BLOCK)
+    m_pos = lanes < n_pos
+    tl.store(
+        positions_ptr + lanes,
+        tl.load(positions_ptr + lanes, mask=m_pos, other=0) + d,
+        mask=m_pos,
+    )
+    m_rows = lanes < n_rows
+    tl.store(
+        seq_lens_ptr + lanes,
+        tl.load(seq_lens_ptr + lanes, mask=m_rows, other=0) + d,
+        mask=m_rows,
+    )
+    tl.store(
+        orig_seq_lens_ptr + lanes,
+        tl.load(orig_seq_lens_ptr + lanes, mask=m_rows, other=0) + d,
+        mask=m_rows,
+    )
+    tl.store(
+        prefix_lens_ptr + lanes,
+        tl.load(prefix_lens_ptr + lanes, mask=m_rows, other=0) + d,
+        mask=m_rows,
+    )
+    if HAS_MROPE:
+        m_mrope = lanes < 3 * n_pos
+        tl.store(
+            mrope_ptr + lanes,
+            tl.load(mrope_ptr + lanes, mask=m_mrope, other=0) + d,
+            mask=m_mrope,
+        )
+
+
+def shift_replay_fb(
+    *,
+    positions: torch.Tensor,
+    mrope_positions: Optional[torch.Tensor],
+    seq_lens: torch.Tensor,
+    orig_seq_lens: torch.Tensor,
+    extend_prefix_lens: torch.Tensor,
+    d: int,
+) -> None:
+    """One-launch replacement for the replay fb's device-side +d family
+    (positions / mrope twin / seq-lens family / extend prefix)."""
+    n_pos = positions.numel()
+    n_rows = seq_lens.numel()
+    has_mrope = mrope_positions is not None
+    _shift_replay_fb_kernel[(1,)](
+        positions,
+        mrope_positions if has_mrope else positions,
+        seq_lens,
+        orig_seq_lens,
+        extend_prefix_lens,
+        d,
+        n_pos,
+        n_rows,
+        HAS_MROPE=has_mrope,
+        BLOCK=triton.next_power_of_2(max(3 * n_pos if has_mrope else n_pos, n_rows)),
     )

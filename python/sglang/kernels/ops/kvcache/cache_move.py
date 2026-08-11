@@ -93,6 +93,56 @@ def copy_all_layer_kv_cache_tiled(
     tl.store(tgt_ptr, vals, mask=mask)
 
 
+@triton.jit
+def copy_all_layer_kv_cache_tiled_disjoint(
+    data_ptrs,
+    strides,
+    tgt_loc_ptr,
+    src_loc_ptr,
+    num_locs,
+    LOC_BLOCK: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    """3D-grid variant for DISJOINT src/tgt sets only.
+
+    The 2D kernel above keeps in-place safety by having one program load
+    every loc before any store -- which also serializes all locs inside a
+    single program: at a few dozen locs the whole copy runs on
+    O(buffers x byte_tiles) CTAs at ~6 GB/s (measured 19x slower than this
+    kernel). When the caller guarantees src and tgt never overlap (COW-style
+    private-head seeding), the loc dimension can join the grid.
+    """
+    bid = tl.program_id(0)
+    tid = tl.program_id(1)
+    lid = tl.program_id(2)
+
+    stride = tl.load(strides + bid)
+    base_ptr = tl.load(data_ptrs + bid)
+    base_ptr = tl.cast(base_ptr, tl.pointer_type(tl.uint8))
+
+    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < stride
+    tl.multiple_of(byte_off, 16)
+
+    loc_idx = lid * LOC_BLOCK + tl.arange(0, LOC_BLOCK)
+    mask_loc = loc_idx < num_locs
+
+    src = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
+    tgt = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
+
+    src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
+    tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]
+
+    mask = mask_loc[:, None] & mask_byte[None, :]
+    vals = tl.load(src_ptr, mask=mask)
+    tl.store(tgt_ptr, vals, mask=mask)
+
+
+# Loc-block width for the disjoint 3D copy: small enough that a ~100-loc
+# COW fans out across dozens of CTAs, large enough to keep index-load reuse.
+_DISJOINT_LOC_BLOCK = 8
+
+
 def copy_all_layer_kv_cache_func(
     data_ptrs: torch.Tensor,
     strides: torch.Tensor,
@@ -101,6 +151,7 @@ def copy_all_layer_kv_cache_func(
     num_locs: int,
     num_locs_upper: int,
     kv_copy_config: dict,
+    disjoint: bool = False,
 ):
     if _is_cpu:
         copy_all_layer_kv_cache_cpu(
@@ -108,6 +159,27 @@ def copy_all_layer_kv_cache_func(
             strides,
             tgt_loc[:num_locs],
             src_loc[:num_locs],
+        )
+        return
+    if disjoint:
+        # Caller-guaranteed non-overlapping src/tgt: the loc dimension joins
+        # the grid (19x on small COW copies; the in-place kernel serializes
+        # every loc inside one program per byte tile).
+        grid = (
+            data_ptrs.numel(),
+            kv_copy_config["byte_tiles"],
+            triton.cdiv(num_locs, _DISJOINT_LOC_BLOCK),
+        )
+        copy_all_layer_kv_cache_tiled_disjoint[grid](
+            data_ptrs,
+            strides,
+            tgt_loc,
+            src_loc,
+            num_locs,
+            LOC_BLOCK=_DISJOINT_LOC_BLOCK,
+            BYTES_PER_TILE=kv_copy_config["bytes_per_tile"],
+            num_warps=kv_copy_config["num_warps"],
+            num_stages=2,
         )
         return
     grid = (data_ptrs.numel(), kv_copy_config["byte_tiles"])

@@ -2883,6 +2883,24 @@ def human_readable_int(value: str) -> int:
         )
 
 
+def set_native_thread_name(name: str) -> None:
+    """Set the calling thread's OS-level (pthread) name on Linux.
+
+    ``threading.Thread(name=...)`` only names the Python object; profilers
+    that label CPU tracks by pthread name (kineto/chrome traces, py-spy,
+    ``top -H``) show a bare tid unless this is set from inside the thread.
+    The kernel truncates to 15 bytes. Best-effort no-op elsewhere.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        PR_SET_NAME = 15
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(PR_SET_NAME, name.encode()[:15], 0, 0, 0)
+    except OSError:
+        pass
+
+
 def kill_itself_when_parent_died():
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies

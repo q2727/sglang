@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import traceback
 from functools import partial
 from typing import TYPE_CHECKING, Optional
 
@@ -203,6 +204,9 @@ class DecoupledDraftManager:
             envs.SGLANG_ENABLE_DECOUPLED_PREP_AHEAD.get()
             and not envs.SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN.get()
         )
+        # Step-5 order A/B (see the env var note): True = arm the previous
+        # tail's skeleton first, False = the pre-step-5 build-then-arm order.
+        self._arm_before_restage = envs.SGLANG_ENABLE_DECOUPLED_ARM_BEFORE_RESTAGE.get()
         self._prep_keys: dict[DraftReqKey, None] = {}
         self._misaligned_ct = 0
         self._mirror_probe_ct = 0
@@ -256,8 +260,13 @@ class DecoupledDraftManager:
         endpoint while spamming the log. Better dead than undead."""
         text = str(exc)
         if "device-side assert" in text or "illegal memory access" in text:
+            # With the traceback: the frame is the only localization this
+            # process will ever produce (it exits before any handler above
+            # can log), and under CUDA_LAUNCH_BLOCKING it names the exact op.
             logger.critical(
-                "sticky CUDA failure in the drafter loop; exiting: %s", text
+                "sticky CUDA failure in the drafter loop; exiting: %s\n%s",
+                text,
+                "".join(traceback.format_exception(exc)),
             )
             os._exit(70)
 
@@ -361,8 +370,13 @@ class DecoupledDraftManager:
                                 ).append(draft_key)
                             self._prep_keys.clear()
                             for group in by_verifier.values():
-                                self.engine.prebuild_fast_round(group)
-                                self.engine.pre_launch_extend(group)
+                                # Order A/B: see the round-tail site.
+                                if self._arm_before_restage:
+                                    self.engine.pre_launch_extend(group)
+                                    self.engine.prebuild_fast_round(group)
+                                else:
+                                    self.engine.prebuild_fast_round(group)
+                                    self.engine.pre_launch_extend(group)
                         time.sleep(_IDLE_WAIT_S)
                 except Exception as exc:
                     self._die_if_sticky_cuda(exc)
@@ -500,6 +514,11 @@ class DecoupledDraftManager:
                         "decoupled drafter round breakdown: %s",
                         self.engine.profiler.summary(),
                     )
+                if self.engine.profiler.host_bands:
+                    logger.info(
+                        "decoupled drafter host bands (ms/instance, no sync): %s",
+                        self.engine.profiler.band_summary(),
+                    )
             with stage("push-block"):
                 self._push_block(verifier_rank=verifier_rank, packed=packed)
         if self._enable_top1_prerun:
@@ -521,8 +540,18 @@ class DecoupledDraftManager:
                 )
             for group in by_verifier_prep.values():
                 try:
-                    self.engine.prebuild_fast_round(group)
-                    self.engine.pre_launch_extend(group)
+                    if self._arm_before_restage:
+                        # Verifier-style overlap, step 5: ARM the skeleton
+                        # the PREVIOUS tail built (stale by this round's
+                        # delta; the arm re-bases it), THEN build the next
+                        # round's skeleton -- the gated GPU sequence joins
+                        # the queue one restage earlier.
+                        self.engine.pre_launch_extend(group)
+                        self.engine.prebuild_fast_round(group)
+                    else:
+                        # Pre-step-5 order: build fresh, arm immediately.
+                        self.engine.prebuild_fast_round(group)
+                        self.engine.pre_launch_extend(group)
                 except Exception:
                     logger.exception(
                         "decoupled round-tail restage failed; next round "

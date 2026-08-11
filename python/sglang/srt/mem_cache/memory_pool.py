@@ -2753,7 +2753,17 @@ class MHATokenToKVPool(KVCache):
             store_dtype=self.store_dtype,
         )
 
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+    def move_kv_cache(
+        self,
+        tgt_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+        *,
+        disjoint: bool = False,
+    ):
+        """``disjoint=True`` promises src and tgt never overlap (COW-style
+        private-head seeding): the copy then fans the loc dimension across
+        the grid instead of the in-place-safe single-program order (19x on
+        few-dozen-loc copies)."""
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
         if self.layer_num == 0:
             return
@@ -2780,7 +2790,7 @@ class MHATokenToKVPool(KVCache):
                 vb[pages_t, :, offs_t, :] = vb[pages_s, :, offs_s, :]
             return
 
-        self._move_kv_cache_impl(tgt_loc, src_loc)
+        self._move_kv_cache_impl(tgt_loc, src_loc, disjoint=disjoint)
 
     @cached_property
     def _hnd_move_desc(self):
@@ -2795,7 +2805,13 @@ class MHATokenToKVPool(KVCache):
 
         return build_hnd_move_descriptor(bufs)
 
-    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+    def _move_kv_cache_impl(
+        self,
+        tgt_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+        *,
+        disjoint: bool = False,
+    ):
         # Physical move strategy. Override for layouts that change buffer identity
         # (e.g. PageMajorMHATokenToKVPool always uses the native move). The 3-D
         # per-layer buffers here ignore page_size in move_kv_cache_native.
@@ -2827,6 +2843,7 @@ class MHATokenToKVPool(KVCache):
                 N,
                 next_power_of_2(N),
                 cfg,
+                disjoint=disjoint,
             )
             return
 
@@ -2842,6 +2859,7 @@ class MHATokenToKVPool(KVCache):
                 chunk_len,
                 next_power_of_2(chunk_len),
                 cfg,
+                disjoint=disjoint,
             )
 
 
@@ -3224,7 +3242,13 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
             page_size=self.page_size,
         )
 
-    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+    def _move_kv_cache_impl(
+        self,
+        tgt_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+        *,
+        disjoint: bool = False,
+    ):
         # Strided 4-D views: the tiled copy kernel assumes stride == row bytes, so
         # always take the native move (it splits token ids into
         # (page_id, slot_in_page) for the 4-D advanced index).
