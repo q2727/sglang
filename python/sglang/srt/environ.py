@@ -405,6 +405,15 @@ class Envs:
     # sequence: units + miss poisoning + backbone update on stream, host
     # pack/mirror/case0-redraft retired). Kill switch for A/B bisection.
     SGLANG_ENABLE_DECOUPLED_DEVICE_PACK = EnvBool(True)
+    # Decoupled spec: template fast path for the restage's preadvance batch
+    # (bs == 1, paged, delta within the K+1 window). The ALLOCATION call
+    # sequence is byte-identical to the generic path (alloc_req_slots + paged
+    # extend alloc); only the tensor construction around it is templated --
+    # per-length zero inputs cached (fill values are dead, the armed scatter
+    # rewrites them), the page-table write collapsed to two row-slice
+    # stores, sampling_info reused. DEFAULT ON (2026-08-11): B200 397B
+    # 435.6 vs 431.5 tok/s, H200 s1 parity; TEXT_EXACT both.
+    SGLANG_ENABLE_DECOUPLED_PREADVANCE_FAST_ALLOC = EnvBool(True)
     # Decoupled spec: early judge -- a us match kernel judges the commit at
     # dispatch time (seg half synced in ~0.1ms for the optimistic route, the
     # (case, f) match half audited next dispatch), so the host never parks

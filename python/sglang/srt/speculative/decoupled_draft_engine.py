@@ -93,7 +93,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -1111,6 +1111,15 @@ class EnumDraftEngine:
             enabled=envs.SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE.get()
         )
         self._h2d = _PinnedH2D(device=self.device)
+        # Preadvance template fast path (see _extend_batch_preadvance_fast):
+        # seeded from the first generic build, holds the constant-shape
+        # pieces (zero input ids, reusable sampling_info). The ALLOCATOR call
+        # sequence stays byte-identical to the generic path.
+        self._preadvance_fast_alloc = (
+            envs.SGLANG_ENABLE_DECOUPLED_PREADVANCE_FAST_ALLOC.get()
+        )
+        self._preadv_tmpl: Optional[dict] = None
+        self._preadv_fast_ct = 0
         # Dedicated staging ring for the prep path (restage + pre-launch
         # arm). Sharing the main ring couples the two paths' slot-reuse
         # clocks: prep would land on a slot whose event sits BEHIND the
@@ -5981,18 +5990,43 @@ class EnumDraftEngine:
             if graph_round is None:
                 self._scrap_lists(pre_batches, pre_slots, pre_pages)
                 return
-            batch, slots = self._extend_batch(
-                token_lists=[
-                    list(tokens) + [0] * self._preadvance_alloc_width
-                    for tokens in committed_token_lists
-                ],
-                prefix_slots=[
-                    state.committed_slots[: base_lens[i]]
-                    for i, state in enumerate(states)
-                ],
-                tag="preadvance",
-                mamba_slots=self._seat_mamba_slots(states),
+            delta_len = len(committed_token_lists[0]) - base_lens[0] if bs == 1 else -1
+            fast_eligible = (
+                self._preadvance_fast_alloc
+                and bs == 1
+                and self._paged
+                and not self._stale_inject
+                and 0 <= delta_len <= self.num_steps + 1
             )
+            batch = slots = None
+            if fast_eligible:
+                got = self._extend_batch_preadvance_fast(
+                    state=states[0], base_len=base_lens[0], delta_len=delta_len
+                )
+                if got is not None:
+                    batch, slots = got
+                    self._preadv_fast_ct += 1
+                    if self._preadv_fast_ct <= 3 or self._preadv_fast_ct % 500 == 0:
+                        logger.info(
+                            "decoupled preadvance fast-alloc #%d (delta=%d)",
+                            self._preadv_fast_ct,
+                            delta_len,
+                        )
+            if batch is None:
+                batch, slots = self._extend_batch(
+                    token_lists=[
+                        list(tokens) + [0] * self._preadvance_alloc_width
+                        for tokens in committed_token_lists
+                    ],
+                    prefix_slots=[
+                        state.committed_slots[: base_lens[i]]
+                        for i, state in enumerate(states)
+                    ],
+                    tag="preadvance",
+                    mamba_slots=self._seat_mamba_slots(states),
+                )
+                if fast_eligible and self._preadv_tmpl is None:
+                    self._seed_preadvance_template(batch)
         except Exception:
             stream_cm.__exit__(None, None, None)
             logger.exception("decoupled prep-ahead build failed; falling back inline")
@@ -7545,6 +7579,132 @@ class EnumDraftEngine:
     ) -> None:
         pool = self.model_runner.req_to_token_pool
         pool.mamba_pool.copy_from(src_indices=src_indices, dst_indices=dst_indices)
+
+    def _seed_preadvance_template(self, batch: ScheduleBatch) -> None:
+        """Capture the constant pieces of a freshly built preadvance batch:
+        per-extend-length zeroed inputs (the fill values are dead -- the
+        armed scatter rewrites the graph input every round; only the length
+        feeds the account) and the sampling_info (bs == 1, engine-constant
+        params, no penalizers -- safe to share across rounds)."""
+        self._preadv_tmpl = {
+            "zeros": {},  # extend_len -> constant zero input_ids
+            "sampling_info": batch.sampling_info,
+        }
+
+    def _extend_batch_preadvance_fast(
+        self, *, state: _DraftReqState, base_len: int, delta_len: int
+    ) -> Optional[tuple[ScheduleBatch, torch.Tensor]]:
+        """Template fast path for the restage's preadvance batch (bs == 1,
+        paged: extend segment = the pending delta + ``width`` padding slots
+        past the on-pool prefix; every fill value is dead -- the armed
+        scatter rewrites the graph input each round -- so the input is a
+        cached zero tensor per extend length).
+
+        The generic ``_extend_batch`` runs the full prefill-style
+        ``prepare_for_extend`` every restage: ~10 host tensor constructions +
+        H2Ds, the generic cache-indices writer, and a fresh SamplingBatchInfo,
+        together most of the round's stray index_put/copy kernels. Here the
+        ALLOCATION calls stay byte-identical (alloc_req_slots + paged extend
+        alloc, same order, same arguments) and only the surroundings are
+        templated: four single-value pinned H2Ds, two row-slice page-table
+        stores, constant tensors reused."""
+        tmpl = self._preadv_tmpl
+        if tmpl is None:
+            return None
+        from sglang.srt.mem_cache.allocation import (
+            _compute_dsv4_state_lens,
+            alloc_paged_token_slots_extend,
+            alloc_req_slots,
+        )
+
+        width = self._preadvance_alloc_width
+        extend_len = delta_len + width
+        seq_len = base_len + extend_len
+        prefix = state.committed_slots[:base_len]
+        input_ids = tmpl["zeros"].get(extend_len)
+        if input_ids is None:
+            input_ids = torch.zeros(extend_len, dtype=torch.int64, device=self.device)
+            tmpl["zeros"][extend_len] = input_ids
+        req = Req(
+            rid="0",
+            origin_input_text="",
+            origin_input_ids=array("q", ()),
+            sampling_params=self._sampling_params,
+        )
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        req.logprob_start_len = -1
+        req.prefix_indices = prefix
+        req.set_extend_range(base_len, seq_len)
+        if self._hybrid:
+            req.mamba_pool_idx = self._seat_mamba_slots([state])[0]
+        batch = ScheduleBatch.init_new(
+            reqs=[req],
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            tree_cache=self._tree_cache,
+            model_config=self.model_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+        )
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.maybe_evict_swa()
+        # Batch fields alloc_for_extend's generic twin derives before the
+        # allocator calls -- same values, template-shaped.
+        batch.prefix_lens = [base_len]
+        batch.extend_lens = [extend_len]
+        batch.extend_num_tokens = extend_len
+        batch.seq_lens = self._h2d.to_device([seq_len], dtype=torch.int64)
+        batch.seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64)
+        batch.seq_lens_sum = seq_len
+        prefix_lens_cpu = torch.tensor([base_len], dtype=torch.int64)
+        prefix_lens_device = self._h2d.to_device([base_len], dtype=torch.int64)
+        # Allocator sequence, byte-identical to alloc_for_extend.
+        req_pool_indices = alloc_req_slots(
+            self.model_runner.req_to_token_pool, [req], self._tree_cache
+        )
+        req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        req_pool_indices_device = self._h2d.to_device(
+            req_pool_indices, dtype=torch.int64
+        )
+        last_loc = (
+            prefix[-1:]
+            if base_len > 0
+            else torch.full((1,), -1, dtype=prefix.dtype, device=self.device)
+        )
+        out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache=self._tree_cache,
+            prefix_lens=prefix_lens_device,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=extend_len,
+            req_pool_indices=req_pool_indices_device,
+            dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
+            batch=batch,
+        )
+        # Page-table row: prefix + fresh extend segment, two slice stores
+        # (the generic write_cache_indices does the same two writes for
+        # bs == 1, wrapped in its batch machinery).
+        row = self.model_runner.req_to_token_pool.req_to_token[req_pool_indices[0]]
+        row[:base_len] = prefix.to(torch.int32)
+        row[base_len:seq_len] = out_cache_loc.to(torch.int32)
+        req.kv_committed_len = seq_len
+        req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+        # Field set the generic prepare_for_extend leaves behind.
+        batch.input_ids = input_ids
+        batch.prefill_input_ids_cpu = None
+        batch.req_pool_indices = req_pool_indices_device
+        batch.req_pool_indices_cpu = req_pool_indices_cpu
+        batch.orig_seq_lens = self._h2d.to_device([seq_len], dtype=torch.int64).to(
+            torch.int32
+        )
+        batch.out_cache_loc = out_cache_loc
+        batch.input_embeds = None
+        batch.multimodal_inputs = [None]
+        batch.extend_logprob_start_lens = [-1]
+        batch.sampling_info = tmpl["sampling_info"]
+        return batch, out_cache_loc
 
     def _extend_batch(
         self,
