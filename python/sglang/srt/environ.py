@@ -487,6 +487,10 @@ class Envs:
     # dead-cell poison + branch selection) as one CUDA graph per
     # (bs, fanout) shape; False restores the eager kernel launches.
     SGLANG_ENABLE_DECOUPLED_TOPK_GRAPH = EnvBool(True)
+    # Decoupled spec: build the armed branch-head COW's (src, dst) slot
+    # lists with one kernel launch; False restores the host per-row
+    # assembly (a python slice loop + two cats on the dispatch tail).
+    SGLANG_ENABLE_DECOUPLED_FUSED_ARM_COW = EnvBool(True)
     # Decoupled spec: compare the drafter's GPU commit mirror against each
     # host-applied commit (a device sync per check -- debug only).
     SGLANG_DEBUG_DECOUPLED_COMMIT_MIRROR = EnvBool(False)

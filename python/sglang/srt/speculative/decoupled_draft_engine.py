@@ -574,6 +574,10 @@ class _FanoutVariant(msgspec.Struct):
     comb_j: torch.Tensor  # glue triangle cols + br_j
     case_of_row: list[int]  # accept case per selected row
     case_of_row_dev: torch.Tensor  # same, device tensor (hybrid fork gather)
+    # Exclusive prefix sum of case_of_row + its total: the armed COW kernel's
+    # per-row output offsets (row spans grow by the row's case).
+    case_prefix_dev: torch.Tensor
+    case_sum: int
 
 
 class _SeatCarrier:
@@ -1344,9 +1348,23 @@ class EnumDraftEngine:
         self._prelaunch_chain_enabled = (
             envs.SGLANG_ENABLE_DECOUPLED_CHAIN_PRELAUNCH.get()
         )
-        # Arm-static chain metadata, rebuilt when (f_live, tail, base) moves:
-        # base+case vector, off0 = tail+case+step, and the COW piece lists.
-        self._chain_arm_cache: Optional[dict] = None
+        # Armed branch-head COW via one index-building kernel (see
+        # build_armed_cow_locs); False restores the host per-row assembly.
+        self._fused_arm_cow = envs.SGLANG_ENABLE_DECOUPLED_FUSED_ARM_COW.get()
+        self._fused_arm_cow_ct = 0
+        if self._fused_arm_cow and self._paged:
+            # All of the kernel's compiles happen HERE (one per W_POW2
+            # bucket): a first-hit compile at arm time would stall the
+            # dispatch tail ~100ms, a fallback-capture window (D25 family).
+            from sglang.srt.speculative.decoupled_fused_ops import (
+                prewarm_armed_cow_locs,
+            )
+
+            prewarm_armed_cow_locs(
+                device=self.device,
+                num_steps=self.num_steps,
+                page_size=self._page_size,
+            )
         # Engine-lifetime constant staging planes (see _case_static_planes).
         self._case_static_planes_cache: Optional[tuple] = None
         # Full-grid position -> chain-output row maps, one per f_live (the
@@ -1758,43 +1776,70 @@ class EnumDraftEngine:
         if span_sup + num_steps > carrier.glue_private_slots.shape[1]:
             self._prelaunch_chain_skip_why["shape"] += 1
             return None
-        # Arm-static metadata: base+case and off0 = tail+case+step (host
-        # ints, tiny pinned H2Ds on the prep ring).
-        case_vec = torch.tensor(variant.case_of_row, dtype=torch.int64)
-        base_plus_case = self._h2d.to_device(base_len + case_vec, dtype=torch.int64)
-        off0_host = (
-            tail
-            + case_vec.unsqueeze(0)
-            + torch.arange(num_steps, dtype=torch.int64).unsqueeze(1)
-        )
-        off0 = self._h2d.to_device(off0_host.reshape(-1), dtype=torch.int64).view(
-            num_steps, rows_sel
-        )
         # Branch-head COW superset (see docstring): ONE copy kernel, fixed
-        # indices. Case 0 sources the seat tail + ALL K+1 enumerated delta
-        # slots; case c >= 1 sources glue row c-1's private head.
+        # indices. Case 0 sources the seat tail + this round's K+1 delta
+        # candidates inside the widened allocation (slot_shift re-bases a
+        # stale skeleton's window; 0 when fresh); case c >= 1 sources glue
+        # row c-1's private head.
         committed_ref = state.committed_slots
-        # This round's K+1 delta candidates inside the widened allocation:
-        # slot_shift re-bases a stale skeleton's window (0 when fresh).
-        seat_sup = torch.cat(
-            [
-                committed_ref[anchor:],
-                pre.slots.view(-1)[pre.slot_shift : pre.slot_shift + num_steps + 1],
-            ]
-        )
-        src_pieces: list[torch.Tensor] = []
-        dst_pieces: list[torch.Tensor] = []
-        for row, case in zip(variant.sel_rows_pool, variant.case_of_row):
-            span = span_sup + case
-            src_pieces.append(
-                seat_sup if case == 0 else carrier.glue_private_slots[case - 1, :span]
+        alloc_flat = pre.slots.view(-1)
+        if self._fused_arm_cow:
+            # One index-building launch replaces the host per-row assembly
+            # (a python slice loop + two cats on the dispatch tail).
+            from sglang.srt.speculative.decoupled_fused_ops import (
+                build_armed_cow_locs,
             )
-            dst_pieces.append(carrier.branch_private_slots[row, :span])
-        self._cow_kv(
-            src_pieces=[torch.cat(src_pieces)],
-            dst_pieces=[torch.cat(dst_pieces)],
-            tag="prelaunch_branch_head",
-        )
+
+            cow_locs = build_armed_cow_locs(
+                committed=committed_ref,
+                alloc=alloc_flat,
+                glue_flats=carrier.glue_private_slots,
+                branch_flats=carrier.branch_private_slots,
+                sel_rows=variant.sel_rows_dev,
+                case_of_row=variant.case_of_row_dev,
+                case_prefix=variant.case_prefix_dev,
+                case_sum=variant.case_sum,
+                anchor=anchor,
+                tail=tail,
+                slot_shift=pre.slot_shift,
+                num_steps=num_steps,
+            )
+            self._cow_kv_pool.move_kv_cache(
+                tgt_loc=cow_locs[1], src_loc=cow_locs[0], disjoint=True
+            )
+            self.profiler.mark("prelaunch_branch_head_cow")
+            cow_keepalive: torch.Tensor = cow_locs
+            self._fused_arm_cow_ct += 1
+            if self._fused_arm_cow_ct <= 3 or self._fused_arm_cow_ct % 2000 == 0:
+                logger.info(
+                    "decoupled fused arm-COW #%d (rows=%d span_sup=%d)",
+                    self._fused_arm_cow_ct,
+                    rows_sel,
+                    span_sup,
+                )
+        else:
+            seat_sup = torch.cat(
+                [
+                    committed_ref[anchor:],
+                    alloc_flat[pre.slot_shift : pre.slot_shift + num_steps + 1],
+                ]
+            )
+            src_pieces: list[torch.Tensor] = []
+            dst_pieces: list[torch.Tensor] = []
+            for row, case in zip(variant.sel_rows_pool, variant.case_of_row):
+                span = span_sup + case
+                src_pieces.append(
+                    seat_sup
+                    if case == 0
+                    else carrier.glue_private_slots[case - 1, :span]
+                )
+                dst_pieces.append(carrier.branch_private_slots[row, :span])
+            self._cow_kv(
+                src_pieces=[torch.cat(src_pieces)],
+                dst_pieces=[torch.cat(dst_pieces)],
+                tag="prelaunch_branch_head",
+            )
+            cow_keepalive = seat_sup
         if verdict_dev is not None:
             # Bet chain sub-bisect (diagnostic): 30 = COW only, 31 = + the
             # stage/prep/meta half, else full.
@@ -1829,14 +1874,15 @@ class EnumDraftEngine:
 
         chain_meta_fill(
             verdict=(verdict_dev if verdict_dev is not None else self._scatter_verdict),
-            base_plus_case=base_plus_case,
-            sel_rows=variant.sel_rows_dev.to(torch.int64),
-            off0=off0,
+            case_of_row=variant.case_of_row_dev,
+            sel_rows=variant.sel_rows_dev,
             flats=carrier.branch_private_slots,
             seq_lens_out=seq_lens_out,
             positions_out=positions_out,
             mrope_out=mrope_out,
             out_locs_out=out_locs_out,
+            base_len=base_len,
+            tail=tail,
             num_steps=num_steps,
         )
         if verdict_dev is not None:
@@ -1889,18 +1935,20 @@ class EnumDraftEngine:
             )
         if verdict_dev is None:
             self._prelaunch_chain_ct += 1
-        # Keepalive: every enqueued kernel above (cat / COW / meta / replay)
-        # executes only after the gate releases -- up to the gate budget
-        # later. The committed-slots tensor this round's cat reads is
+        # Keepalive: every enqueued kernel above (locs build / COW / meta /
+        # replay) executes only after the gate releases -- up to the gate
+        # budget later. The committed-slots tensor those kernels read is
         # REBOUND by any interleaved host round (junk-mode redo, absorb),
         # and a garbage-collected input's memory can be reused by the
         # prebuild stream's allocations with no fence. Holding the refs on
         # the record pins the memory until resolution drops it.
         # committed_ref matters most: the seat REBINDS committed_slots on
-        # any interleaved host round, and the cat above only EXECUTES after
-        # the gate -- without a live reference its freed storage can be
-        # reused (prebuild stream, no fence) before the cat reads it.
-        return tokens, (committed_ref, seat_sup, base_plus_case, off0)
+        # any interleaved host round, and the enqueued reads only EXECUTE
+        # after the gate -- without a live reference its freed storage can
+        # be reused (prebuild stream, no fence) before they run. The lane's
+        # scratch (fused: the [2, TOTAL] locs the copy reads; host: the
+        # seat_sup cat the big cat reads) is pinned the same way.
+        return tokens, (committed_ref, cow_keepalive)
 
     def _resolve_prelaunched(
         self,
@@ -4177,6 +4225,12 @@ class EnumDraftEngine:
             case_of_row_dev=torch.tensor(
                 case_of_row, dtype=torch.int64, device=self.device
             ),
+            case_prefix_dev=torch.tensor(
+                [sum(case_of_row[:i]) for i in range(len(case_of_row))],
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            case_sum=sum(case_of_row),
         )
 
     def _fanout_variant(self, f_live: int) -> _FanoutVariant:

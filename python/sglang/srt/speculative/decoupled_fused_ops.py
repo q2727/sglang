@@ -860,17 +860,178 @@ def commit_scatter(
     )
 
 
-@triton.jit
+@triton.jit(
+    # Per-round host ints: triton's default divisibility specialization
+    # would recompile per {==1, %16, other} class combination -- dozens of
+    # mid-run compile stalls riding the dispatch tail (each one a chance
+    # for the verifier to fall back). One compile per W_POW2 bucket only,
+    # all prewarmed at engine init (see prewarm_armed_cow_locs).
+    do_not_specialize=[
+        "anchor",
+        "tail",
+        "slot_shift",
+        "span_sup",
+        "alloc_w",
+        "span_max",
+        "flats_w",
+    ]
+)
+def _armed_cow_locs_kernel(
+    src_out_ptr,  # [TOTAL] int64 (flat COW source slots, row-major)
+    dst_out_ptr,  # [TOTAL] int64 (flat COW target slots, aligned with src)
+    committed_ptr,  # [>= anchor + tail] int64 (seat committed flat slots)
+    alloc_ptr,  # [alloc_w] int64 (the skeleton's widened delta allocation)
+    glue_flats_ptr,  # [K, span_max] int64 (glue rows' private flat slots)
+    branch_flats_ptr,  # [ROWS_POOL, flats_w] int64 (branch private slots)
+    sel_rows_ptr,  # [ROWS_SEL] int64 (selected row -> carrier pool row)
+    case_ptr,  # [ROWS_SEL] int64 (accept case per selected row)
+    case_prefix_ptr,  # [ROWS_SEL] int64 (exclusive prefix sum of case)
+    anchor,  # page_floor(base_len)
+    tail,  # base_len - anchor
+    slot_shift,  # stale-skeleton re-base into the widened allocation
+    span_sup,  # tail + K + 1 (case-0 span; case c spans span_sup + c)
+    alloc_w,
+    span_max,
+    flats_w,
+    W_POW2: tl.constexpr,
+):
+    """One-launch replacement for the armed branch-head COW's host assembly
+    (a per-row python loop of slice views + two big cats). One program per
+    selected row writes its span of the flat (src, dst) index lists:
+
+      case 0: seat boundary tail (committed[anchor:]) then this round's K+1
+        delta candidates inside the widened allocation (slot_shift re-bases
+        a stale skeleton's window);
+      case c >= 1: glue row c-1's private head, span_sup + c slots.
+
+    Row r's output offset = r * span_sup + prefix(case) -- the case prefix
+    sum is variant-static and cached on device."""
+    row = tl.program_id(0)
+    case = tl.load(case_ptr + row)
+    pool_row = tl.load(sel_rows_ptr + row)
+    span = span_sup + case
+    out0 = row * span_sup + tl.load(case_prefix_ptr + row)
+    w = tl.arange(0, W_POW2)
+    mask = w < span
+    if case == 0:
+        boundary = tl.load(committed_ptr + anchor + w, mask=mask & (w < tail), other=0)
+        alloc_idx = tl.minimum(slot_shift + w - tail, alloc_w - 1)
+        delta = tl.load(alloc_ptr + alloc_idx, mask=mask & (w >= tail), other=0)
+        src = tl.where(w < tail, boundary, delta)
+    else:
+        src = tl.load(glue_flats_ptr + (case - 1) * span_max + w, mask=mask, other=0)
+    dst = tl.load(branch_flats_ptr + pool_row * flats_w + w, mask=mask, other=0)
+    tl.store(src_out_ptr + out0 + w, src, mask=mask)
+    tl.store(dst_out_ptr + out0 + w, dst, mask=mask)
+
+
+def build_armed_cow_locs(
+    *,
+    committed: torch.Tensor,  # [>= base_len] int64
+    alloc: torch.Tensor,  # [ALLOC_W] int64, contiguous
+    glue_flats: torch.Tensor,  # [K, SPAN_MAX] int64 (contiguous)
+    branch_flats: torch.Tensor,  # [ROWS_POOL, FLATS_W] int64 (contiguous)
+    sel_rows: torch.Tensor,  # [ROWS_SEL] int64 (variant-static, device)
+    case_of_row: torch.Tensor,  # [ROWS_SEL] int64 (variant-static, device)
+    case_prefix: torch.Tensor,  # [ROWS_SEL] int64 (variant-static, device)
+    case_sum: int,  # variant-static sum(case_of_row)
+    anchor: int,
+    tail: int,
+    slot_shift: int,
+    num_steps: int,
+) -> torch.Tensor:
+    """The armed branch-head COW's (src, dst) flat slot lists in one launch
+    -> [2, TOTAL] (row 0 = src, row 1 = dst), ready for ``move_kv_cache``.
+    Enqueued pre-gate: every input it reads at gate release must be pinned
+    by the caller's keepalive (committed rebinding) or outlive the round
+    (variant/carrier tensors)."""
+    rows_sel = sel_rows.numel()
+    span_sup = tail + num_steps + 1
+    out = torch.empty(
+        2, rows_sel * span_sup + case_sum, dtype=torch.int64, device=committed.device
+    )
+    _armed_cow_locs_kernel[(rows_sel,)](
+        out[0],
+        out[1],
+        committed,
+        alloc,
+        glue_flats,
+        branch_flats,
+        sel_rows,
+        case_of_row,
+        case_prefix,
+        anchor,
+        tail,
+        slot_shift,
+        span_sup,
+        alloc.numel(),
+        glue_flats.shape[1],
+        branch_flats.shape[1],
+        W_POW2=triton.next_power_of_2(span_sup + num_steps),
+    )
+    return out
+
+
+def prewarm_armed_cow_locs(
+    *, device: torch.device, num_steps: int, page_size: int
+) -> None:
+    """Compile every W_POW2 bucket the armed COW kernel can hit (span_sup =
+    tail + K + 1, tail in [0, page)) at engine init: a mid-run Triton
+    compile rides the dispatch tail for ~100ms -- long past the commit
+    interval, so each first-hit bucket would be a fallback-capture window
+    (D25 family). With do_not_specialize on every host int, these launches
+    are the kernel's ONLY compiles for the engine's lifetime."""
+    width = page_size + 2 * num_steps + 2  # >= any span the loop launches
+    dummy = torch.zeros(width, dtype=torch.int64, device=device)
+    glue = torch.zeros((max(num_steps, 1), width), dtype=torch.int64, device=device)
+    branch = torch.zeros((1, width), dtype=torch.int64, device=device)
+    row = torch.zeros(1, dtype=torch.int64, device=device)
+    seen: set[int] = set()
+    for tail in range(page_size):
+        span_sup = tail + num_steps + 1
+        w_pow2 = triton.next_power_of_2(span_sup + num_steps)
+        if w_pow2 in seen:
+            continue
+        seen.add(w_pow2)
+        out = torch.empty(2, span_sup, dtype=torch.int64, device=device)
+        _armed_cow_locs_kernel[(1,)](
+            out[0],
+            out[1],
+            dummy,
+            dummy,
+            glue,
+            branch,
+            row,
+            row,
+            row,
+            0,
+            0,
+            0,
+            span_sup,
+            dummy.numel(),
+            glue.shape[1],
+            branch.shape[1],
+            W_POW2=w_pow2,
+        )
+
+
+@triton.jit(
+    # Per-round host ints (see _armed_cow_locs_kernel): without this the
+    # divisibility specializer would add compile classes the old
+    # device-vector signature never had.
+    do_not_specialize=["base_len", "tail"]
+)
 def _chain_meta_kernel(
     verdict_ptr,  # [>=4] int64 from commit_scatter: [0]=verdict, [3]=dlen
-    base_plus_case_ptr,  # [ROWS_SEL] int64 (arm-static: pre-commit base + case)
+    case_ptr,  # [ROWS_SEL] int64 (variant-static: accept case per row)
     sel_rows_ptr,  # [ROWS_SEL] int64 (selected row -> carrier pool row)
-    off0_ptr,  # [K, ROWS_SEL] int64 (arm-static: tail + case + step)
     flats_ptr,  # [ROWS_POOL, FLATS_W] int64 (branch rows' private flat slots)
     seq_lens_ptr,  # [ROWS_SEL] int64 (chain bucket static)
     positions_ptr,  # [ROWS_SEL] int64 (chain bucket static)
     mrope_ptr,  # [3, ROWS_SEL] int64 (chain bucket static)
     out_locs_ptr,  # [K, ROWS_SEL] int64 (chain bucket static)
+    base_len,  # pre-commit base (host int at arm time; no H2D staging)
+    tail,  # base_len - page_floor(base_len)
     FLATS_W: tl.constexpr,
     K: tl.constexpr,
     ROWS_SEL: tl.constexpr,
@@ -879,24 +1040,27 @@ def _chain_meta_kernel(
     """Arithmetic completion of the pre-launched chain's metadata: everything
     per-dlen about the chain is a +dlen shift (seq/pos/mrope) or a +dlen
     offset into the rows' private flat-slot table (out_locs), so ONE kernel
-    reading the scatter's dlen tap finishes what the arm staged. Junk verdict
-    (0) degrades to dlen=0: reads stay inside the pre-commit base, writes
-    stay inside the rows' private scratch slots -- harmless by layout."""
+    reading the scatter's dlen tap finishes what the arm staged. The former
+    arm-static device vectors were pure arithmetic over (base_len, tail,
+    case) -- scalars + the variant's cached case vector replace their two
+    pinned H2Ds. Junk verdict (0) degrades to dlen=0: reads stay inside the
+    pre-commit base, writes stay inside the rows' private scratch slots --
+    harmless by layout."""
     lanes = tl.arange(0, ROWS_PAD)
     mask = lanes < ROWS_SEL
     verdict = tl.load(verdict_ptr + 0)
     dlen = tl.load(verdict_ptr + 3)
     dlen = tl.where(verdict == 0, 0, dlen)
     dlen = tl.minimum(tl.maximum(dlen, 0), K + 1)
-    base_case = tl.load(base_plus_case_ptr + lanes, mask=mask, other=0)
-    seq = base_case + dlen
+    case = tl.load(case_ptr + lanes, mask=mask, other=0)
+    seq = base_len + case + dlen
     tl.store(seq_lens_ptr + lanes, seq, mask=mask)
     tl.store(positions_ptr + lanes, seq - 1, mask=mask)
     for d in tl.static_range(3):
         tl.store(mrope_ptr + d * ROWS_SEL + lanes, seq - 1, mask=mask)
     pool_row = tl.load(sel_rows_ptr + lanes, mask=mask, other=0)
     for s in tl.static_range(K):
-        off = tl.load(off0_ptr + s * ROWS_SEL + lanes, mask=mask, other=0) + dlen
+        off = tail + case + s + dlen
         off = tl.minimum(tl.maximum(off, 0), FLATS_W - 1)
         loc = tl.load(flats_ptr + pool_row * FLATS_W + off, mask=mask, other=0)
         tl.store(out_locs_ptr + s * ROWS_SEL + lanes, loc, mask=mask)
@@ -905,31 +1069,33 @@ def _chain_meta_kernel(
 def chain_meta_fill(
     *,
     verdict: torch.Tensor,
-    base_plus_case: torch.Tensor,
+    case_of_row: torch.Tensor,
     sel_rows: torch.Tensor,
-    off0: torch.Tensor,
     flats: torch.Tensor,
     seq_lens_out: torch.Tensor,
     positions_out: torch.Tensor,
     mrope_out: torch.Tensor,
     out_locs_out: torch.Tensor,
+    base_len: int,
+    tail: int,
     num_steps: int,
 ) -> None:
     """Finish the armed chain's static buffers from the scatter's dlen tap
     (see _chain_meta_kernel). Enqueue AFTER commit_scatter on the same
     stream; every output is a chain-bucket static buffer the queued replay
     reads."""
-    rows_sel = base_plus_case.numel()
+    rows_sel = case_of_row.numel()
     _chain_meta_kernel[(1,)](
         verdict,
-        base_plus_case,
+        case_of_row,
         sel_rows,
-        off0,
         flats,
         seq_lens_out,
         positions_out,
         mrope_out,
         out_locs_out,
+        base_len,
+        tail,
         FLATS_W=flats.shape[1],
         K=num_steps,
         ROWS_SEL=rows_sel,
