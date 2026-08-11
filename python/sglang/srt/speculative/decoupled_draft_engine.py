@@ -85,9 +85,9 @@ import copy
 import logging
 import time
 from array import array
-from collections import deque
+from collections import Counter, deque
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
@@ -1120,6 +1120,36 @@ class EnumDraftEngine:
         )
         self._preadv_tmpl: Optional[dict] = None
         self._preadv_fast_ct = 0
+        # "Half bet" (see _bet_enqueue_armed): one outstanding pre-produced
+        # next block per engine (bs == 1 scope), enqueued INSIDE the arm's
+        # gate sequence BEFORE the gate -- the same skeleton / carrier rows /
+        # graphs as the armed round, with the commit_scatter replaced by a
+        # constant full-accept hypothesis fill. Injected by the manager:
+        # early_push_block pushes a confirmed bet immediately at dispatch.
+        self._bet_prebuild_enabled = envs.SGLANG_ENABLE_DECOUPLED_BET_PREBUILD.get()
+        self._bet: Optional[dict] = None
+        self.bet_armed_ct = 0
+        self.bet_hit_ct = 0
+        self.bet_miss_ct = 0
+        self._bet_pushed_this_round = False
+        self._bet_skip_why: Counter = Counter()
+        self._bet_miss_why: Counter = Counter()
+        # Ping-pong wire buffers: the early push's D2H/D2D may still read
+        # slot i while the round tail packs the next bet -- the flip keeps a
+        # full dispatch between writer and any straggling reader (D18).
+        self._bet_units_pair: list[Optional[torch.Tensor]] = [None, None]
+        self._bet_units_idx = 0
+        # Constant hypothesis verdict, commit_scatter layout ([0]=verdict=2
+        # hit, [1]=case=K, [2]=f=0, [3]=dlen=K+1): pack_units / chain_meta
+        # read only [0] and [3].
+        self._bet_verdict: Optional[torch.Tensor] = None
+        # Shadow recurrent-state slot for the bet's advance row (the seat
+        # slot must stay pre-advance for the armed replay behind the gate).
+        self._bet_mamba_slot: Optional[torch.Tensor] = None
+        # Keepalive of the PREVIOUS bet's enqueued-kernel inputs, released
+        # one arm later (same one-dispatch gap contract as pending/adopt).
+        self._bet_keepalive_prev: Optional[tuple] = None
+        self.early_push_block: Optional[Callable[[int, dict], None]] = None
         # Dedicated staging ring for the prep path (restage + pre-launch
         # arm). Sharing the main ring couples the two paths' slot-reuse
         # clocks: prep would land on a slot whose event sits BEHIND the
@@ -1674,6 +1704,9 @@ class EnumDraftEngine:
         pre,
         f_live: int,
         branch_out: torch.Tensor,
+        verdict_dev: Optional[torch.Tensor] = None,
+        fork_src_head: Optional[torch.Tensor] = None,
+        fork_cache_tag: str = "arm",
     ) -> Optional[tuple[list[torch.Tensor], tuple]]:
         """Enqueue the branch-chain replay INSIDE the gate sequence (after
         the guess-tail graph), before the commit exists. Everything host-side
@@ -1751,15 +1784,25 @@ class EnumDraftEngine:
             dst_pieces=[torch.cat(dst_pieces)],
             tag="prelaunch_branch_head",
         )
+        if verdict_dev is not None:
+            # Bet chain sub-bisect (diagnostic): 30 = COW only, 31 = + the
+            # stage/prep/meta half, else full.
+            _stage = envs.SGLANG_DEBUG_DECOUPLED_BET_STAGE_MAX.get()
+            if _stage == 30:
+                return None
+
         # GDN branch fork rides the chain graph's prologue; same cached
         # indices as the host fast round (pure function of seat x width).
         fork = None
         if self._hybrid:
-            fork_key = (tuple(keys), f_live)
+            fork_key = (fork_cache_tag, tuple(keys), f_live)
             fork = self._branch_fork_cache.get(fork_key)
             if fork is None:
+                src_head = (
+                    fork_src_head if fork_src_head is not None else state.mamba_slot
+                )
                 fork = self._build_mamba_fork(
-                    src_slots=torch.cat([state.mamba_slot, carrier.glue_mamba_slots])[
+                    src_slots=torch.cat([src_head, carrier.glue_mamba_slots])[
                         variant.case_of_row_dev
                     ],
                     dst_slots=carrier.branch_mamba_slots[variant.sel_rows_dev],
@@ -1774,7 +1817,7 @@ class EnumDraftEngine:
         from sglang.srt.speculative.decoupled_fused_ops import chain_meta_fill
 
         chain_meta_fill(
-            verdict=self._scatter_verdict,
+            verdict=(verdict_dev if verdict_dev is not None else self._scatter_verdict),
             base_plus_case=base_plus_case,
             sel_rows=variant.sel_rows_dev.to(torch.int64),
             off0=off0,
@@ -1785,6 +1828,10 @@ class EnumDraftEngine:
             out_locs_out=out_locs_out,
             num_steps=num_steps,
         )
+        if verdict_dev is not None:
+            _stage = envs.SGLANG_DEBUG_DECOUPLED_BET_STAGE_MAX.get()
+            if _stage == 31:
+                return None
         if envs.SGLANG_DEBUG_DECOUPLED_GPU_MATCH.get() and self._prelaunch_chain_ct < 8:
             # Diagnostic (junk/blocking runs): everything queued before the
             # replay has executed once this sync returns; dump the static
@@ -1829,7 +1876,8 @@ class EnumDraftEngine:
                 first_tokens=branch_out.reshape(-1),
                 forked=forked,
             )
-        self._prelaunch_chain_ct += 1
+        if verdict_dev is None:
+            self._prelaunch_chain_ct += 1
         # Keepalive: every enqueued kernel above (cat / COW / meta / replay)
         # executes only after the gate releases -- up to the gate budget
         # later. The committed-slots tensor this round's cat reads is
@@ -2760,6 +2808,27 @@ class EnumDraftEngine:
         # finished that whole sequence -- the host holds no lead.
         if self._lead_probe is not None and self._lead_probe.query():
             self._lead_caught_ct += 1
+        if self._bet_prebuild_enabled:
+            # Half bet: the full-accept next block joins THIS stream ahead of
+            # the gate below, so its kernels fill the idle window while the
+            # verify round is in flight -- zero extra host wakeups, and every
+            # cross-generation buffer reuse is stream-ordered by construction
+            # (the reason this must NOT ride a side stream: the extend / topk
+            # / chain graphs' static buffers are shared with the armed replay
+            # enqueued next).
+            with self.profiler.stage("bet_enqueue"):
+                self._bet_enqueue_armed(
+                    key=keys[0],
+                    state=state,
+                    carrier=carrier,
+                    pre=pre,
+                    f_live=f_live,
+                    topk_key=topk_key,
+                    rows=rows,
+                    seat=seat,
+                    base_out_len=base_out_len,
+                    board=board,
+                )
         _arm_cm = self.profiler.stage("arm_enqueue")
         _arm_cm.__enter__()
         gate = self._prelaunch_gate
@@ -3001,6 +3070,324 @@ class EnumDraftEngine:
                     ),
                 )
         return True
+
+    def _retire_bet(self) -> None:
+        """Drop the outstanding bet but keep its enqueued-kernel inputs
+        alive one more arm: pre-gate kernels may still be QUEUED when the
+        dispatch retires the bet (deep GPU backlog), and a freed input's
+        memory can be reused by the prebuild stream with no fence -- the
+        same lifetime rule as the armed chain's keepalive."""
+        if self._bet is not None:
+            self._bet_keepalive_prev = self._bet.get("keepalive")
+            self._bet = None
+
+    def _bet_enqueue_armed(
+        self,
+        *,
+        key: DraftReqKey,
+        state: _DraftReqState,
+        carrier,
+        pre,
+        f_live: int,
+        topk_key,
+        rows: int,
+        seat: int,
+        base_out_len: int,
+        board,
+    ) -> None:
+        """Enqueue the full-accept bet block production INSIDE the arm's gate
+        sequence, BEFORE the gate (same stream): [hypothesis fill -> fused
+        extend replay -> guess-tail replay -> branch-chain replay -> device
+        pack into the bet wire buffer]. Identical machinery to the armed
+        round, with commit_scatter replaced by constant fills for the
+        hypothesis "this block gets fully accepted and the bonus is its own
+        top guess" (dlen = K+1, case = K, f = 0): the delta tokens are the
+        block's backbone (chains_out, still one generation old by stream
+        order) plus g_{K,0}, and the new backbone is the case-K f0 chain.
+        On a hit the armed round recomputes the exact same block (same
+        inputs, deterministic greedy) -- only the WIRE copy is early, all
+        bookkeeping stays on the armed path.
+
+        Shadow discipline (the seat must be untouched for either verdict):
+        the only in-place seat state a replay advances is recurrent -- the
+        advance row is re-pointed at a shadow slot around the replay-prep
+        gather, and the glue slots (advanced in place by the replay) are
+        re-forked from the untouched seat slot afterwards. All KV writes
+        land where the armed round writes them anyway: identical values on
+        a hit, overwritten-before-read on a miss (the junk-round layout
+        discipline)."""
+        num_steps = self.num_steps
+        if not self._early_judge_enabled:
+            # The delta source below is _scatter_chains; only judge mode
+            # keeps it current across slow-path production (_pack_and_mirror).
+            self._bet_skip_why["judge_off"] += 1
+            return
+        if state.last_units_dev is None or state.last_backbone_len != num_steps:
+            # case-0 blocks carry no backbone: there is no full-accept
+            # outcome to bet (same guard as the retired top-1 prerun).
+            self._bet_skip_why["no_backbone"] += 1
+            return
+        bet_dbg = envs.SGLANG_DEBUG_DECOUPLED_BET.get()
+        stage_max = envs.SGLANG_DEBUG_DECOUPLED_BET_STAGE_MAX.get()
+        with board._cond:
+            landed = board._stamps.get(seat, 0)
+        if landed > base_out_len and not bet_dbg:
+            # The commit already landed: bet kernels enqueued now would only
+            # DELAY the real armed sequence behind ~a block of GPU work.
+            self._bet_skip_why["landed"] += 1
+            return
+        if self._bet_verdict is None:
+            self._bet_verdict = torch.tensor(
+                [2, num_steps, 0, num_steps + 1] + [0] * 7,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        nxt = 1 - self._bet_units_idx
+        if self._bet_units_pair[nxt] is None:
+            self._bet_units_pair[nxt] = torch.zeros(
+                num_steps + 1,
+                self.fanout,
+                num_steps + 1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        if self._hybrid and self._bet_mamba_slot is None:
+            self._bet_mamba_slot = self._mamba_arena.take(1)
+        mapping = None
+        adv_row_idx = None
+        if self._hybrid:
+            # Re-point the ADVANCE ROW's recurrent binding at the shadow
+            # slot. The extend replay's advance row is the SKELETON'S
+            # TRANSIENT pool row (pre.batch.reqs[0]), not the seat's live
+            # row -- the restage bound it to the seat's mamba slot, so
+            # without the flip the bet replay advances the REAL seat state
+            # in place. The replay-prep's state-indices gather is enqueued
+            # on this stream inside the replay below, so both writes are
+            # ordered against it (and against the armed replay's own
+            # gather, which is enqueued after the restore).
+            mapping = (
+                self.model_runner.req_to_token_pool.req_index_to_mamba_index_mapping
+            )
+            adv_row = int(pre.batch.reqs[0].req_pool_idx)
+            adv_row_idx = self._h2d.to_device([adv_row], dtype=torch.int64)
+            mapping.index_copy_(0, adv_row_idx, self._bet_mamba_slot.to(mapping.dtype))
+            # Seed the shadow slot from the seat EVERY arm: the recurrent
+            # scan starts from the slot's current content, and without the
+            # re-seed the shadow carries the PREVIOUS bet's end state -- a
+            # hypothesis trajectory that only matches reality on unbroken
+            # full-accept streaks (it self-heals on high-accept regimes and
+            # diverges on low ones, a nasty silent-content failure).
+            self._fork_mamba_states(
+                src_slots=state.mamba_slot, dst_slots=self._bet_mamba_slot
+            )
+        from sglang.srt.speculative.decoupled_fused_ops import pack_units
+
+        units = state.last_units_dev
+        gather_stack, out_loc_stack, true_stack, node_stack = pre.scatter_stacks
+        fb = pre.replay_fb
+        chain_keepalive = None
+        source = None
+        try:
+            # [delta | chain] source for the gather pattern: delta =
+            # backbone c_1..c_K + g_{K,0}; chain = the case-K f0 chain
+            # (units[K][0] is exactly [g_{K,0}, chain_1..chain_K]).
+            source = torch.cat(
+                [self._scatter_chains[:num_steps], units[num_steps, 0, :]]
+            )
+            # Value-poisoned blocks (scatter miss chains_out = -1, dead unit
+            # lanes = -1) keep last_backbone_len == K by design (the match
+            # compares BY VALUE); those values must never reach the embedding
+            # gather. Clamp like fire_armed does: a poisoned bet becomes a
+            # valid-token garbage speculation that can never win the hit
+            # check (the commit can't full-accept a block the verifier fell
+            # back on), so it is dropped for free.
+            source.clamp_(min=0)
+            fb.input_ids.copy_(source[gather_stack[num_steps]])
+            fb.out_cache_loc.copy_(out_loc_stack[num_steps])
+            fb.spec_info.gdn_true_extend_lens_tensor.copy_(true_stack[num_steps])
+            if stage_max < 1:
+                self._bet_skip_why["stage_cut"] += 1
+                self._retire_bet()
+                return
+            if bet_dbg:
+                torch.cuda.synchronize()
+                logger.info(
+                    "bet dbg fill ok: src=[%d,%d] adv_row=%s",
+                    int(source.min()),
+                    int(source.max()),
+                    int(pre.batch.reqs[0].req_pool_idx),
+                )
+            bet_logits = self._extend_graph_execute(
+                forward_batch=fb,
+                rows=rows,
+                node_gather=node_stack[num_steps],
+                true_lens_host=pre.case_staging[0].true_lens_host,
+                base_lens=list(pre.base_lens),
+                delta_lens=[num_steps + 1],
+                tag="bet",
+            )
+            if bet_dbg:
+                torch.cuda.synchronize()
+                logger.info("bet dbg extend ok")
+            if stage_max < 2:
+                self._bet_skip_why["stage_cut"] += 1
+                self._retire_bet()
+                return
+            topk_out = self._topk_graph_fire(
+                key=topk_key,
+                fused_logits=bet_logits,
+                chains_mat=units[num_steps, 0, 1:].view(1, num_steps),
+            )
+            if bet_dbg:
+                torch.cuda.synchronize()
+                logger.info("bet dbg topk ok")
+            if stage_max < 3:
+                self._bet_skip_why["stage_cut"] += 1
+                self._retire_bet()
+                return
+            chain_armed = (
+                self._pre_launch_chain_armed(
+                    keys=[key],
+                    state=state,
+                    carrier=carrier,
+                    pre=pre,
+                    f_live=f_live,
+                    branch_out=topk_out[1],
+                    verdict_dev=self._bet_verdict,
+                    fork_src_head=self._bet_mamba_slot,
+                    fork_cache_tag="bet",
+                )
+                if topk_out is not None
+                else None
+            )
+            if bet_dbg:
+                torch.cuda.synchronize()
+                logger.info("bet dbg chain ok (armed=%s)", chain_armed is not None)
+            if chain_armed is None:
+                self._bet_skip_why["chain"] += 1
+                self._retire_bet()
+                return
+            if stage_max < 4:
+                self._bet_skip_why["stage_cut"] += 1
+                self._retire_bet()
+                return
+            chain_tokens, chain_keepalive = chain_armed
+            pack_units(
+                units_buf=self._bet_units_pair[nxt],
+                guesses=topk_out[0].view(num_steps + 1, -1),
+                chains_stacked=torch.stack(chain_tokens),
+                rowmap=self._rowmap_for(f_live),
+                verdict=self._bet_verdict,
+                num_steps=num_steps,
+                fanout=self.fanout,
+            )
+            if bet_dbg:
+                torch.cuda.synchronize()
+                logger.info("bet dbg pack ok")
+        except Exception:
+            logger.exception("decoupled bet enqueue failed; bet skipped")
+            self._bet_skip_why["error"] += 1
+            self._retire_bet()
+            return
+        finally:
+            if self._hybrid:
+                # The bet replay advanced the glue slots in place; the armed
+                # replay behind the gate needs the pre-advance forks back
+                # (the seat slot itself was never touched -- the shadow
+                # binding above kept it). Then restore the seat binding.
+                self._fork_mamba_states(
+                    src_slots=state.mamba_slot.repeat(num_steps),
+                    dst_slots=carrier.glue_mamba_slots,
+                )
+                mapping.index_copy_(0, adv_row_idx, state.mamba_slot.to(mapping.dtype))
+                if bet_dbg:
+                    torch.cuda.synchronize()
+                    logger.info("bet dbg restore ok")
+        ready = torch.cuda.Event()
+        ready.record()
+        base_plus = len(state.committed_tokens) + num_steps + 1
+        self._retire_bet()
+        self._bet = {
+            "key": key,
+            "verifier_rank": key.src_verifier_rank,
+            "base_plus": base_plus,
+            "f_live": f_live,
+            "packed": {
+                "pool_indices": [state.req_pool_idx],
+                "base_committed_lens": [base_plus],
+                "units_device": self._bet_units_pair[nxt].unsqueeze(0),
+                "ready_event": ready,
+            },
+            # Pins every gate-free kernel input enqueued above (the cat
+            # source, the chain arm's committed-slots cat, the units buffer
+            # a slow-path repack could rebind) until the NEXT arm.
+            "keepalive": (source, chain_keepalive, units),
+        }
+        self._bet_units_idx = nxt
+        self.bet_armed_ct += 1
+        if self.bet_armed_ct % 50 == 0:
+            logger.info(
+                "decoupled bet: armed=%d hit=%d miss=%d skips=%s miss_why=%s",
+                self.bet_armed_ct,
+                self.bet_hit_ct,
+                self.bet_miss_ct,
+                dict(self._bet_skip_why),
+                dict(self._bet_miss_why),
+            )
+
+    def _bet_check_and_push(
+        self,
+        *,
+        keys: list[DraftReqKey],
+        hit_keys: list[DraftReqKey],
+        selections: list[tuple[int, int]],
+        f_live: int,
+    ) -> None:
+        """Dispatch-head bet reconciliation: on a confirmed full-accept
+        commit, push the pre-produced block NOW (its pack event fired in the
+        idle window, so the wire copy starts immediately) and mark the
+        round's own identical block skip_push. Any other outcome drops the
+        bet -- state was never touched, so the drop is free."""
+        bet = self._bet
+        if bet is None or bet["key"] not in keys:
+            return
+        self._retire_bet()
+        key = bet["key"]
+        state = self._states[key]
+        # Layered miss attribution (the A/B's first question is always
+        # "which leg of the hypothesis broke").
+        if key not in hit_keys:
+            why = "sel_miss"
+        elif selections[hit_keys.index(key)] != (self.num_steps, 0):
+            why = "sel_other"
+        elif len(state.committed_tokens) != bet["base_plus"]:
+            why = "base"
+        elif (
+            len(state.committed_tokens) - state.committed_slots.numel()
+            != self.num_steps + 1
+        ):
+            why = "dlen"
+        elif f_live != bet["f_live"]:
+            why = "f_live"
+        elif self.early_push_block is None:
+            why = "no_hook"
+        else:
+            why = None
+        hit = why is None
+        if hit:
+            self.bet_hit_ct += 1
+            if envs.SGLANG_ENABLE_DECOUPLED_BET_EARLY_PUSH.get():
+                self.early_push_block(bet["verifier_rank"], bet["packed"])
+                self._bet_pushed_this_round = True
+            if self.bet_hit_ct <= 5:
+                logger.info(
+                    "decoupled bet hit #%d: base=%d early push",
+                    self.bet_hit_ct,
+                    bet["base_plus"],
+                )
+        else:
+            self.bet_miss_ct += 1
+            self._bet_miss_why[why] += 1
 
     def _scatter_consume_commit(
         self,
@@ -3370,10 +3757,13 @@ class EnumDraftEngine:
     def close(self, key: DraftReqKey) -> None:
         self.drop_prebuilt_for(key)
         self._evict_seat(key)
+        if self._bet is not None and self._bet["key"] == key:
+            self._retire_bet()
         # Any composition containing this seat is invalid now (open() calls
-        # close() first, so re-seeds funnel through here too).
+        # close() first, so re-seeds funnel through here too). Cache keys are
+        # (tag, keys, f_live).
         self._branch_fork_cache = {
-            k: v for k, v in self._branch_fork_cache.items() if key not in k[0]
+            k: v for k, v in self._branch_fork_cache.items() if key not in k[1]
         }
         state = self._states.pop(key, None)
         if state is None:
@@ -3432,6 +3822,7 @@ class EnumDraftEngine:
         # backbone transients + carrier-destined pages until donation).
         scratch_kv_pages: list[torch.Tensor] = []
         self.profiler.start_round()
+        self._bet_pushed_this_round = False
         try:
             hit_keys: list[DraftReqKey] = []
             hit_states: list[_DraftReqState] = []
@@ -3470,6 +3861,17 @@ class EnumDraftEngine:
                     slow_keys.append(key)
                     slow_states.append(state)
             f_live = max(1, min(int(self.effective_fanout), self.fanout))
+            if self._bet is not None:
+                # Bet reconciliation BEFORE any round work: a confirmed
+                # full-accept pushes the pre-produced block immediately (its
+                # pack event fired in the idle window), taking the whole
+                # armed production off the verifier's critical path.
+                self._bet_check_and_push(
+                    keys=keys,
+                    hit_keys=hit_keys,
+                    selections=selections,
+                    f_live=f_live,
+                )
             pl_fast: Optional[dict] = None
             pl_case0: Optional[dict] = None
             forced_case0: Optional[tuple[DraftReqKey, _DraftReqState, dict]] = None
@@ -3622,19 +4024,27 @@ class EnumDraftEngine:
             if not parts:
                 return None
             if len(parts) == 1:
-                return parts[0]
-            return {
-                "pool_indices": [
-                    pool_idx for part in parts for pool_idx in part["pool_indices"]
-                ],
-                "base_committed_lens": [
-                    base_len
-                    for part in parts
-                    for base_len in part["base_committed_lens"]
-                ],
-                "units_device": torch.cat([part["units_device"] for part in parts]),
-                "ready_event": self._record_units_ready(),
-            }
+                packed = parts[0]
+            else:
+                packed = {
+                    "pool_indices": [
+                        pool_idx for part in parts for pool_idx in part["pool_indices"]
+                    ],
+                    "base_committed_lens": [
+                        base_len
+                        for part in parts
+                        for base_len in part["base_committed_lens"]
+                    ],
+                    "units_device": torch.cat([part["units_device"] for part in parts]),
+                    "ready_event": self._record_units_ready(),
+                }
+            if self._bet_pushed_this_round:
+                # The bet's early push already carried this commit's block
+                # (identical content); a second real push would rotate the
+                # verifier's generation ping-pong onto the slot it is
+                # selecting from.
+                packed["skip_push"] = True
+            return packed
         finally:
             with self.profiler.stage("free-scratch"):
                 self._free_scratch(
@@ -4135,7 +4545,7 @@ class EnumDraftEngine:
                         variant=variant,
                     )
                 if self._hybrid:
-                    fork_key = (tuple(keys), f_live)
+                    fork_key = ("arm", tuple(keys), f_live)
                     hoist_fork = self._branch_fork_cache.get(fork_key)
                     if hoist_fork is None:
                         hoist_fork = self._build_mamba_fork(

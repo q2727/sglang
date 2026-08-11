@@ -247,6 +247,8 @@ class VerifyWorker(BaseVerifyWorker):
         # Verify prep-ahead (block-independent half before the C6 gate wait):
         # per-bs placeholder unit buffers; the select overwrites them in place.
         self._verify_prep_ahead = envs.SGLANG_ENABLE_DECOUPLED_VERIFY_PREP_AHEAD.get()
+        self._bet_dump_ct = 0
+        self._bet_round_ct = 0
         self._placeholder_units: dict[int, torch.Tensor] = {}
         # Post-gate select as one captured graph (TP1 + prep-ahead only);
         # built in alloc_memory_pool once the enum buffer exists. None = the
@@ -397,7 +399,7 @@ class VerifyWorker(BaseVerifyWorker):
         self, batch: ScheduleBatch, select_input: EnumSelectInput
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rows, stamps = self.enum_buffer.gather(batch.req_pool_indices)
-        return select_enum_units(
+        selected, hits = select_enum_units(
             rows,
             stamps,
             bonus_tokens=select_input.bonus_tokens,
@@ -407,6 +409,42 @@ class VerifyWorker(BaseVerifyWorker):
             fanout=self.speculative_fanout,
             unit_width=self.speculative_num_draft_tokens,
         )
+        if envs.SGLANG_DEBUG_DECOUPLED_BET.get():
+            self._bet_round_ct += 1
+            miss = not bool(hits.all())
+            if self._bet_round_ct > 200 and miss and self._bet_dump_ct < 30:
+                self._bet_dump_ct += 1
+                torch.cuda.synchronize()
+                exp = select_input.base_committed_lens.tolist()
+                st = stamps.tolist()
+                # The fresh generation's case-0 guess column (or gen 0 when
+                # nothing is fresh): is the landed block garbage, or valid
+                # but bonus-less?
+                gen = 0
+                for g in range(stamps.shape[1]):
+                    if st[0][g] == exp[0]:
+                        gen = g
+                        break
+                unit_w = rows.shape[-1] // (
+                    (self.speculative_num_steps + 1) * self.speculative_fanout
+                )
+                block = rows[0, gen].view(
+                    self.speculative_num_steps + 1, self.speculative_fanout, unit_w
+                )
+                logger.info(
+                    "select MISS dbg #%d (round=%d): pool=%s expected=%s "
+                    "stamps=%s bonus=%s fresh_gen=%d guess_col=%s case0_units=%s",
+                    self._bet_dump_ct,
+                    self._bet_round_ct,
+                    batch.req_pool_indices.tolist(),
+                    exp,
+                    st,
+                    select_input.bonus_tokens.tolist(),
+                    gen,
+                    block[:, :, 0].reshape(-1).tolist(),
+                    block[0].reshape(-1).tolist(),
+                )
+        return selected, hits
 
     def _select_units_graph(
         self, batch: ScheduleBatch, select_input: EnumSelectInput
@@ -415,6 +453,9 @@ class VerifyWorker(BaseVerifyWorker):
         back to the eager select (runner off, or this bucket's capture
         failed)."""
         if self._select_graph is None:
+            return None
+        if envs.SGLANG_DEBUG_DECOUPLED_BET.get():
+            # Bet forensics: force the eager select so its dump below runs.
             return None
         with profile_range("verifier.select_graph"):
             got = self._select_graph.run(

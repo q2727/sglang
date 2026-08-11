@@ -442,6 +442,21 @@ class Envs:
     # wrong bet is rolled back and costs only idle drafter time. ZMQ data
     # plane only.
     SGLANG_ENABLE_DECOUPLED_TOP1_PRERUN = EnvBool(False)
+    # Decoupled spec, "half bet": at every arm, enqueue a full-accept NEXT
+    # block production ahead of the commit gate on the SAME stream (the same
+    # skeleton / carrier rows / graphs as the armed round, commit_scatter
+    # replaced by constant hypothesis fills), so its kernels fill the
+    # drafter's idle window with zero extra host wakeups. Seat state stays
+    # untouched (shadow recurrent slot + glue re-fork); a wrong bet is
+    # dropped for free. On a confirmed hit the pre-packed block is pushed at
+    # dispatch head on a dedicated stream, removing the armed production
+    # (~a block of GPU time) from the verifier's critical path; the armed
+    # round still runs and keeps all bookkeeping.
+    SGLANG_ENABLE_DECOUPLED_BET_PREBUILD = EnvBool(False)
+    # Bet-prebuild bisect switch: keep the bet production + hit accounting
+    # but suppress the early push / skip_push consumption (the block then
+    # ships on the normal armed-round path). Diagnostic A/B lever.
+    SGLANG_ENABLE_DECOUPLED_BET_EARLY_PUSH = EnvBool(True)
     # Decoupled spec: minimum shared-prefix length (tokens) before the
     # drafter's branch decode switches to two-level cascade attention (read
     # the shared prefix once per seat instead of once per row). Below ~4k the
@@ -482,6 +497,17 @@ class Envs:
     # hit-round consume and compare every produced tensor (device syncs --
     # debug only).
     SGLANG_DEBUG_DECOUPLED_GPU_SCATTER = EnvBool(False)
+    # Decoupled spec, bet prebuild forensics: synchronize + log after every
+    # bet sub-stage (fill / extend / topk / chain / pack / restore) so a
+    # device-side assert surfaces at the guilty enqueue, and arm the bet
+    # even when the commit already landed (the perf skip starves the bet
+    # under sync-heavy debugging, hiding timing bugs). Debug only.
+    SGLANG_DEBUG_DECOUPLED_BET = EnvBool(False)
+    # Bet stage bisect: truncate the bet production after stage N
+    # (0=fill, 1=+extend, 2=+topk, 3=+chain, 4=full incl. pack). The
+    # truncated bet never stashes (no hits); the mamba restore always runs.
+    # Diagnostic only.
+    SGLANG_DEBUG_DECOUPLED_BET_STAGE_MAX = EnvInt(4)
     # Decoupled spec: pre-launch the drafter fast round's extend half BEFORE
     # its commit arrives -- a host-func gate on the compute stream waits for
     # the commit's GPU landing, the scatter consumes it in-kernel, and the

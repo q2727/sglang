@@ -209,6 +209,7 @@ class DecoupledDraftManager:
         self._arm_before_restage = envs.SGLANG_ENABLE_DECOUPLED_ARM_BEFORE_RESTAGE.get()
         self._prep_keys: dict[DraftReqKey, None] = {}
         self._misaligned_ct = 0
+        self._wire_fp_ct = 0
         self._mirror_probe_ct = 0
         # Adaptive fanout: keep the round time inside the verifier's enum-wait
         # budget by halving / restoring the engine's effective width. Only
@@ -230,6 +231,17 @@ class DecoupledDraftManager:
             and data_transport == "zmq"
             else None
         )
+        # Half-bet early push (see engine._bet_enqueue_armed): the confirmed
+        # bet block's wire copy must NOT ride the main stream -- at dispatch
+        # time that stream still holds the armed sequence's ~a-block tail,
+        # which is exactly the wait the bet exists to remove. A dedicated
+        # stream gated on the block's own ready event starts the copy
+        # immediately (same no-barrier pattern as the engine's prebuild
+        # stream).
+        self._bet_push_stream: Optional[torch.cuda.Stream] = None
+        if envs.SGLANG_ENABLE_DECOUPLED_BET_PREBUILD.get():
+            self._bet_push_stream = torch.cuda.Stream(priority=0)
+            self.engine.early_push_block = self._early_push_bet_block
 
         self.ipc_block_pool = None
         if data_transport == "cuda_ipc":
@@ -493,7 +505,7 @@ class DecoupledDraftManager:
                     "decoupled drafter rounds: ct=%d avg_ms=%.1f push_ms=%.2f "
                     "idle_ms=%.2f starved=%.0f%% last_bs=%d fast=%d slow=%d "
                     "eff_fanout=%d prerun_hit=%d prerun_miss=%d merge=%d "
-                    "skips=%d lockstep=%d",
+                    "skips=%d lockstep=%d bet=%d/%d/%d",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
                     1000.0 * self._push_time_s / self._round_ct,
@@ -508,6 +520,9 @@ class DecoupledDraftManager:
                     _MERGE_STATS["merged"],
                     _MERGE_STATS["skipped_rounds"],
                     _MERGE_STATS["lockstep"],
+                    self.engine.bet_armed_ct,
+                    self.engine.bet_hit_ct,
+                    self.engine.bet_miss_ct,
                 )
                 if self.engine.profiler.enabled:
                     logger.info(
@@ -610,12 +625,39 @@ class DecoupledDraftManager:
                 verifier_rank=verifier_rank, packed=packed, speculative=True
             )
 
+    def _early_push_bet_block(self, verifier_rank: int, packed: dict) -> None:
+        """Engine hook: push a confirmed bet block at dispatch head. The
+        dedicated stream + the block's own ready event (long fired -- the
+        pack ran in the idle window) start the wire copy immediately instead
+        of queuing it behind the armed sequence still draining on the main
+        stream."""
+        with torch.cuda.stream(self._bet_push_stream):
+            torch.cuda.current_stream().wait_event(packed["ready_event"])
+            with self.engine.profiler.stage("bet-early-push"):
+                self._push_block(verifier_rank=verifier_rank, packed=packed)
+
     def _push_block(
         self, *, verifier_rank: int, packed, speculative: bool = False
     ) -> None:
-        if packed is None:
+        if packed is None or packed.get("skip_push"):
             return
         push_start = time.monotonic()
+        if envs.SGLANG_DEBUG_DECOUPLED_BET.get() and (
+            self._wire_fp_ct < 20 or self._wire_fp_ct % 20 == 0
+        ):
+            self._wire_fp_ct += 1
+            torch.cuda.synchronize()
+            units_fp = packed["units_device"]
+            logger.info(
+                "wire fp #%d: pool=%s stamp=%s sum=%d guess_col=%s",
+                self._wire_fp_ct,
+                packed["pool_indices"],
+                packed["base_committed_lens"],
+                int(units_fp.sum().item()),
+                units_fp[0, :, :, 0].reshape(-1).tolist(),
+            )
+        elif envs.SGLANG_DEBUG_DECOUPLED_BET.get():
+            self._wire_fp_ct += 1
         if self.ipc_block_pool is not None:
             # CUDA IPC data plane: D2D into the shared pool on the pool's
             # private push stream (waiting the block's own ready event, not
