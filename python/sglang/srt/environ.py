@@ -491,6 +491,10 @@ class Envs:
     # lists with one kernel launch; False restores the host per-row
     # assembly (a python slice loop + two cats on the dispatch tail).
     SGLANG_ENABLE_DECOUPLED_FUSED_ARM_COW = EnvBool(True)
+    # Decoupled spec: write the preadvance fast path's page-table row with
+    # one kernel launch; False restores the two O(base) dtype-convert +
+    # slice-store pairs.
+    SGLANG_ENABLE_DECOUPLED_FUSED_PAGE_ROW = EnvBool(True)
     # Decoupled spec: compare the drafter's GPU commit mirror against each
     # host-applied commit (a device sync per check -- debug only).
     SGLANG_DEBUG_DECOUPLED_COMMIT_MIRROR = EnvBool(False)

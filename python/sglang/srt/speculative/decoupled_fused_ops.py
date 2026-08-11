@@ -1016,6 +1016,66 @@ def prewarm_armed_cow_locs(
 
 
 @triton.jit(
+    # Per-round host ints (see _armed_cow_locs_kernel / pitfall D26).
+    do_not_specialize=["base_len", "seq_len", "row_off"]
+)
+def _page_table_row_fill_kernel(
+    row_ptr,  # int32 page-table plane; the row starts at row_ptr + row_off
+    prefix_ptr,  # [>= base_len] int64 (committed flat slots)
+    extend_ptr,  # [>= seq_len - base_len] int64 (fresh extend slots)
+    row_off,  # req row offset into the plane (idx * row stride)
+    base_len,
+    seq_len,
+    BLOCK: tl.constexpr,
+):
+    """One launch for the preadvance fast path's page-table row: the host
+    used to pay two O(base) dtype converts + two slice stores per restage
+    (row[:base] = prefix.to(int32); row[base:seq] = extend.to(int32))."""
+    w = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = w < seq_len
+    head = tl.load(prefix_ptr + w, mask=mask & (w < base_len), other=0)
+    ext_idx = tl.maximum(w - base_len, 0)
+    ext = tl.load(extend_ptr + ext_idx, mask=mask & (w >= base_len), other=0)
+    val = tl.where(w < base_len, head, ext).to(tl.int32)
+    tl.store(row_ptr + row_off + w, val, mask=mask)
+
+
+_PAGE_ROW_BLOCK = 1024
+
+
+def fill_page_table_row(
+    *,
+    plane: torch.Tensor,  # [pool, row_stride] int32 req_to_token plane
+    row_idx: int,
+    prefix: torch.Tensor,  # [base_len] int64
+    extend: torch.Tensor,  # [seq_len - base_len] int64
+    base_len: int,
+    seq_len: int,
+) -> None:
+    """Write row ``row_idx`` = prefix | extend (int64 -> int32) in one
+    launch. Same-stream semantics as the slice stores it replaces."""
+    _page_table_row_fill_kernel[(triton.cdiv(seq_len, _PAGE_ROW_BLOCK),)](
+        plane,
+        prefix,
+        extend,
+        row_idx * plane.stride(0),
+        base_len,
+        seq_len,
+        BLOCK=_PAGE_ROW_BLOCK,
+    )
+
+
+def prewarm_page_table_row_fill(*, device: torch.device) -> None:
+    """Compile the row-fill kernel at engine init (its only compile: every
+    host int is do_not_specialize'd and BLOCK is fixed -- pitfall D26)."""
+    plane = torch.zeros((1, 4), dtype=torch.int32, device=device)
+    ids = torch.zeros(4, dtype=torch.int64, device=device)
+    fill_page_table_row(
+        plane=plane, row_idx=0, prefix=ids, extend=ids, base_len=2, seq_len=4
+    )
+
+
+@triton.jit(
     # Per-round host ints (see _armed_cow_locs_kernel): without this the
     # divisibility specializer would add compile classes the old
     # device-vector signature never had.

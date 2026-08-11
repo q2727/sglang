@@ -1365,6 +1365,16 @@ class EnumDraftEngine:
                 num_steps=self.num_steps,
                 page_size=self._page_size,
             )
+        # Preadvance page-table row via one fill kernel (see
+        # fill_page_table_row); False restores the host slice stores.
+        self._fused_page_row = envs.SGLANG_ENABLE_DECOUPLED_FUSED_PAGE_ROW.get()
+        self._fused_page_row_ct = 0
+        if self._fused_page_row:
+            from sglang.srt.speculative.decoupled_fused_ops import (
+                prewarm_page_table_row_fill,
+            )
+
+            prewarm_page_table_row_fill(device=self.device)
         # Engine-lifetime constant staging planes (see _case_static_planes).
         self._case_static_planes_cache: Optional[tuple] = None
         # Full-grid position -> chain-output row maps, one per f_live (the
@@ -8155,12 +8165,35 @@ class EnumDraftEngine:
             dsv4_state_lens=_compute_dsv4_state_lens(batch, is_decode=False),
             batch=batch,
         )
-        # Page-table row: prefix + fresh extend segment, two slice stores
-        # (the generic write_cache_indices does the same two writes for
-        # bs == 1, wrapped in its batch machinery).
-        row = self.model_runner.req_to_token_pool.req_to_token[req_pool_indices[0]]
-        row[:base_len] = prefix.to(torch.int32)
-        row[base_len:seq_len] = out_cache_loc.to(torch.int32)
+        # Page-table row: prefix + fresh extend segment (the generic
+        # write_cache_indices does the same two writes for bs == 1, wrapped
+        # in its batch machinery). Fused: one launch instead of two O(base)
+        # dtype converts + two slice stores.
+        if self._fused_page_row:
+            from sglang.srt.speculative.decoupled_fused_ops import (
+                fill_page_table_row,
+            )
+
+            fill_page_table_row(
+                plane=self.model_runner.req_to_token_pool.req_to_token,
+                row_idx=req_pool_indices[0],
+                prefix=prefix,
+                extend=out_cache_loc,
+                base_len=base_len,
+                seq_len=seq_len,
+            )
+            self._fused_page_row_ct += 1
+            if self._fused_page_row_ct <= 3 or self._fused_page_row_ct % 2000 == 0:
+                logger.info(
+                    "decoupled fused page-row #%d (base=%d seq=%d)",
+                    self._fused_page_row_ct,
+                    base_len,
+                    seq_len,
+                )
+        else:
+            row = self.model_runner.req_to_token_pool.req_to_token[req_pool_indices[0]]
+            row[:base_len] = prefix.to(torch.int32)
+            row[base_len:seq_len] = out_cache_loc.to(torch.int32)
         req.kv_committed_len = seq_len
         req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
         # Field set the generic prepare_for_extend leaves behind.
