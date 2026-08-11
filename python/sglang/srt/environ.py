@@ -501,7 +501,12 @@ class Envs:
     # budget, same fallback); unlike the memop doorbell, the gate holds no
     # driver-level parking state, so same-process host CUDA calls (the
     # landing scatter, event records, allocs) keep working while it blocks.
-    SGLANG_ENABLE_DECOUPLED_STREAM_GATE = EnvBool(False)
+    # DEFAULT ON (2026-08-11): strictly dominant on both pairs -- the block's
+    # arrival deadline moves from "scheduler wakes" to "GPU consumes", so the
+    # whole launch span becomes extra arrival window. H200 s1: 546 vs 543
+    # tok/s, select hit 0.960 vs 0.788; B200 397B: 431.5 vs 425.8, hit 0.845
+    # vs 0.781; TEXT_EXACT both.
+    SGLANG_ENABLE_DECOUPLED_STREAM_GATE = EnvBool(True)
     # Decoupled spec: replay the drafter fast round's fused extend as one
     # captured DRAFT_EXTEND_V2 CUDA graph -- every fused row padded to the
     # static width W = 2K+1 -- instead of launching it eagerly. Requires the
