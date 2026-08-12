@@ -4211,21 +4211,44 @@ class EnumDraftEngine:
         """Skewed per-case guess-column budget for fast rounds, or None (one
         uniform width for every case) when the knob is off / F == 1.
 
-        Case a < K is only ever reached by verify REJECTING backbone token
-        c_{a+1}, so that case's bonus is a rank-2+ candidate by construction
-        (the exclusion already hands it the slot) -- worth one column. Case K's
-        bonus is the unconstrained full-accept continuation, worth the whole
-        width. Budget: case K -> F, case K-1 -> min(2, F), every shallower
-        case -> 1; at K=3, F=4 that is [1, 1, 2, 4] = 8 branch rows, exactly
-        the uniform-F2 row cost. The wire block stays (K+1) x F with the
-        unbudgeted cells poisoned, so the verifier is oblivious.
+        The columns go to CASE 0 first. Case 0 is where every miss lands: a
+        missed round commits a single bonus, so the next round collapses to
+        case 0 (``_case0_round``) and its guesses are the only way back out --
+        starve it and one miss begets the next. Case K, the unconstrained
+        full-accept continuation, takes two; the middle cases are both rarer
+        and cheaper to give up. Budget: case 0 -> F, case K -> min(2, F), the
+        rest -> 1; at K=3, F=4 that is [4, 1, 1, 2] = 8 branch rows, exactly
+        the uniform-F2 row cost.
+
+        Measured on H200 397B + 0.8B, K=3, one_batch 1k/1k, 4 reps each
+        (tok/s / acc / select hit):
+          uniform F=2   ( 8 rows)  289.8 / 2.52 / .733
+          uniform F=4   (16 rows)  296.3 / 2.66 / .806
+          [4, 1, 1, 4]  (10 rows)  298.6 / 2.64 / .775
+          [4, 1, 1, 2]  ( 8 rows)  297.3 / 2.64 / .771   <- this shape
+        i.e. uniform-F2 cost with near-F4 accept length. The previous shape
+        ([1, 1, 2, 4]: case K -> F, K-1 -> 2, rest -> 1) starved case 0 and
+        measured worst of all at the same 8 rows: 280.7 / 2.48 / .714.
+
+        The wire block stays (K+1) x F with the unbudgeted cells poisoned, so
+        the verifier is oblivious; only the drafter's branch rows shrink.
         """
-        if self.fanout < 2 or not envs.SGLANG_ENABLE_DECOUPLED_PER_CASE_FANOUT.get():
+        if self.fanout < 2:
+            return None
+        explicit = envs.SGLANG_DECOUPLED_PER_CASE_FANOUT_BUDGETS.get().strip()
+        if explicit:
+            parts = [int(x) for x in explicit.split(",")]
+            if len(parts) != self.num_steps + 1:
+                raise ValueError(
+                    f"SGLANG_DECOUPLED_PER_CASE_FANOUT_BUDGETS needs "
+                    f"{self.num_steps + 1} entries (cases 0..K), got {len(parts)}"
+                )
+            return [max(1, min(self.fanout, p)) for p in parts]
+        if not envs.SGLANG_ENABLE_DECOUPLED_PER_CASE_FANOUT.get():
             return None
         budgets = [1] * (self.num_steps + 1)
-        budgets[self.num_steps] = self.fanout
-        if self.num_steps >= 1:
-            budgets[self.num_steps - 1] = min(2, self.fanout)
+        budgets[self.num_steps] = min(2, self.fanout)
+        budgets[0] = self.fanout
         return budgets
 
     def _build_fanout_variant(

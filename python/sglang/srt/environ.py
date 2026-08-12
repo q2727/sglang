@@ -626,15 +626,23 @@ class Envs:
     # not predictable enough to ship. Do not enable outside experiments.
     SGLANG_ENABLE_DECOUPLED_DOORBELL = EnvBool(False)
     # Decoupled spec: spend the drafter's enumeration columns per accept case
-    # instead of uniformly. Case a < K is only reached by verify REJECTING
-    # backbone token c_{a+1}, so its bonus is a rank-2+ candidate, while case
-    # K's bonus (the full-accept continuation) is unconstrained: budget case
-    # K -> F, case K-1 -> min(2, F), shallower cases -> 1 column each. The
-    # block keeps its (K+1) x F wire shape with the unbudgeted cells poisoned,
-    # so the verifier is unchanged; at K=3, F=4 the branch phase costs exactly
-    # what uniform F=2 costs. Full width only -- when the adaptive-fanout
-    # controller lowers the width, the round falls back to uniform.
+    # instead of uniformly. Case 0 -- where every miss lands, and whose guesses
+    # are the only way back out -- takes F; case K (the unconstrained
+    # full-accept continuation) takes 2; the middle cases take 1. The block
+    # keeps its (K+1) x F wire shape with the unbudgeted cells poisoned, so the
+    # verifier is unchanged; at K=3, F=4 the branch phase costs 8 rows, exactly
+    # what uniform F=2 costs, for near-uniform-F4 accept length (measured
+    # 297.3 tok/s / acc 2.64 vs uniform F2's 289.8 / 2.52 on H200 397B).
+    # Full width only -- when the adaptive-fanout controller lowers the width,
+    # the round falls back to uniform.
     SGLANG_ENABLE_DECOUPLED_PER_CASE_FANOUT = EnvBool(False)
+    # Decoupled spec: explicit per-case column budget, comma separated, one
+    # entry per accept case 0..K (e.g. "4,1,1,4"). Overrides the skew above
+    # when set; entries are clamped to [1, F]. Exists because the default skew
+    # spends its widest budget on case K while measured misses concentrate on
+    # case 0 -- a miss collapses the next round to case 0, whose bonus is a
+    # rank-2+ candidate, so case 0 is the escape hatch out of that state.
+    SGLANG_DECOUPLED_PER_CASE_FANOUT_BUDGETS = EnvStr("")
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
