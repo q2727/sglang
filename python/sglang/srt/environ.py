@@ -1233,6 +1233,17 @@ class Envs:
     # the down_proj rides the deepgemm w8a8-block lane on UE8M0-scale
     # hardware (SM100). False restores act -> separate quant.
     SGLANG_OPT_USE_FUSED_SILU_MUL_QUANT = EnvBool(True)
+    # GDN layers: fuse the gated RMSNorm on the linear-attention output
+    # with the out_proj's per-token-group fp8 quant (bit-faithful; norm
+    # row == quant group). Same deepgemm/SM100 eligibility as above.
+    # Default OFF: bit-exact and per-op faster, but under decoupled spec
+    # the slightly faster verify step shifts the ring phase and costs
+    # select hits (accept length 3.21 -> 2.55 measured); enable only
+    # outside decoupled-spec serving until the gate pacing absorbs it.
+    SGLANG_OPT_USE_FUSED_GDN_NORM_QUANT = EnvBool(False)
+    # Debug: run the unfused norm+quant next to the fused one and compare
+    # q/s on device (a sync per layer call -- debug only).
+    SGLANG_DEBUG_FUSED_GDN_NORM_QUANT_CHECK = EnvBool(False)
     SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================

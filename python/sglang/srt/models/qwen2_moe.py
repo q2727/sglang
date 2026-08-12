@@ -173,38 +173,14 @@ _fused_silu_quant_logged = False
 
 def _fused_silu_mul_quant_group(down_proj: RowParallelLinear) -> Optional[int]:
     """Quant group size for the fused silu_and_mul + per-token-group fp8
-    quant producer, or None when the down_proj is not guaranteed to ride
-    the deepgemm w8a8-block lane with UE8M0 scales (SM100).
-
-    The guards mirror deepgemm_w8a8_block_fp8_linear_with_fallback's own
-    dtype/shape fallback conditions: the producer must never hand a
-    pre-quantized tuple to a lane that would route it to triton/cutlass.
-    """
-    from sglang.srt.layers import deep_gemm_wrapper
-    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-    from sglang.srt.layers.quantization.fp8_utils import (
-        deepgemm_w8a8_block_fp8_linear_with_fallback,
-    )
+    quant producer, or None when the down_proj cannot consume the
+    pre-quantized tuple (see deepgemm_prequant_group)."""
+    from sglang.srt.layers.quantization.fp8_utils import deepgemm_prequant_group
 
     if not envs.SGLANG_OPT_USE_FUSED_SILU_MUL_QUANT.get():
         return None
-    quant_method = down_proj.quant_method
-    if not isinstance(quant_method, Fp8LinearMethod) or not quant_method.block_quant:
-        return None
-    if (
-        quant_method.w8a8_block_fp8_linear
-        is not deepgemm_w8a8_block_fp8_linear_with_fallback
-    ):
-        return None
-    # The fused-silu quant kernel is only instantiated for column-major
-    # UE8M0 scales (the deepgemm SM100 recipe).
-    if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        return None
-    weight = down_proj.weight
-    if weight.shape[0] % 64 != 0 or weight.shape[1] % 128 != 0:
-        return None
-    group_size = quant_method.weight_block_size[1]
-    if group_size not in (16, 32, 64, 128):
+    group_size = deepgemm_prequant_group(down_proj)
+    if group_size is None:
         return None
     global _fused_silu_quant_logged
     if not _fused_silu_quant_logged:

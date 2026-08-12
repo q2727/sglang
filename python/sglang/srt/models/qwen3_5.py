@@ -39,6 +39,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -63,6 +64,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import deepgemm_prequant_group
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -320,6 +322,63 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+        # Fused gated RMSNorm + per-token-group fp8 quant feeding out_proj
+        # as a pre-quantized (fp8, scale) tuple (bit-faithful; see the
+        # kernel). Requires one norm row == one quant group and the
+        # default swish-after-norm form the fused kernel reproduces.
+        self._fused_norm_quant = (
+            envs.SGLANG_OPT_USE_FUSED_GDN_NORM_QUANT.get()
+            and self.output_gate_type is None
+            and deepgemm_prequant_group(self.out_proj) == self.head_v_dim
+        )
+        if self._fused_norm_quant and layer_id == 0:
+            logger.info(
+                "fused gated-RMSNorm + fp8 group quant armed for GDN out_proj "
+                "(deepgemm lane, group=%d)",
+                self.head_v_dim,
+            )
+
+    _fused_nq_check_ct = 0
+
+    def _check_fused_norm_quant(self, core_attn_out, z, num_tokens, q, s) -> None:
+        """Debug twin (SGLANG_DEBUG_FUSED_GDN_NORM_QUANT_CHECK): unfused
+        norm+quant next to the fused kernel, logged for the first calls."""
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        cls = Qwen3_5GatedDeltaNet
+        if cls._fused_nq_check_ct >= 4000:
+            return
+        cls._fused_nq_check_ct += 1
+        ref = self.norm(core_attn_out, z)
+        ref2d = ref.reshape(num_tokens, -1).contiguous()
+        q_ref, s_ref = sglang_per_token_group_quant_fp8(
+            ref2d,
+            self.head_v_dim,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        torch.cuda.synchronize()
+        q_bad = int((q_ref.float() - q.float()).abs().gt(0).sum().item())
+        s_bad = 0 if torch.equal(s_ref.contiguous(), s.contiguous()) else 1
+        if (
+            q_bad
+            or s_bad
+            or core_attn_out.shape[0] != 4096
+            or (cls._fused_nq_check_ct % 200 == 1)
+        ):
+            logger.info(
+                "fused-nq check #%d layer=%d rows=%s tokens=%d q_bad=%d/%d s_bad=%d",
+                cls._fused_nq_check_ct,
+                self.layer_id,
+                tuple(core_attn_out.shape),
+                num_tokens,
+                q_bad,
+                q.numel(),
+                s_bad,
+            )
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -585,6 +644,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad = torch.zeros_like(z)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
+
+        if self._fused_norm_quant and core_attn_out.dtype == torch.bfloat16:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                gated_rmsnorm_group_quant_fp8_ue8m0,
+            )
+
+            num_tokens = core_attn_out.shape[0] // z_shape_og[-2]
+            q, s = gated_rmsnorm_group_quant_fp8_ue8m0(
+                core_attn_out.contiguous(),
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                num_tokens,
+            )
+            if (
+                envs.SGLANG_DEBUG_FUSED_GDN_NORM_QUANT_CHECK.get()
+                and not get_is_capture_mode()
+            ):
+                self._check_fused_norm_quant(core_attn_out, z, num_tokens, q, s)
+            output, _ = self.out_proj((q, s))
+            return output
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)

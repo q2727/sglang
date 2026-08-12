@@ -711,6 +711,126 @@ def silu_and_mul_group_quant_fp8_ue8m0(
     return x_q, x_s
 
 
+@triton.jit
+def _gated_rmsnorm_group_quant_ue8m0_kernel(
+    x_ptr,  # [M, N] input rows (one norm group each)
+    z_ptr,  # [M, N] gate rows
+    w_ptr,  # [N] norm weight
+    y_q_ptr,  # [M, N] fp8_e4m3 (viewed [tokens, N*groups_per_token])
+    y_s_u8_ptr,  # uint8 alias of the packed int32 col-major UE8M0 storage
+    M,
+    groups_per_token,
+    aligned_mn,
+    eps,
+    q_eps,
+    fp8_max,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+):
+    """Fused gated RMSNorm (fla layernorm_gated: IS_RMS_NORM, gate after
+    norm, silu gate) + per-group UE8M0 fp8 quant, BIT-IDENTICAL to the
+    unfused (RMSNormGated -> v2 group-quant) pair. The norm half is a
+    VERBATIM transcription of _layer_norm_fwd_1pass_kernel's tile shape,
+    op order, warp count and reduction geometry -- a 1D rewrite with
+    default warps produced rare 1-ulp rstd differences on deep-layer
+    activations (different reduction tree), which the bf16 rounding then
+    amplified into quant-bucket flips. The epilogue adds ONE explicit
+    bf16 rounding (the pair's intermediate tensor) and the exact v2 quant
+    arithmetic; the UE8M0 power-of-two scale keeps its division a
+    lossless exponent shift, and the amax reduction is order-invariant.
+    Scale packing: see _silu_and_mul_group_quant_ue8m0_kernel. Applies
+    when the norm group width equals the quant group width (one norm row
+    == one quant group; a partial final scale pack is pre-zeroed by the
+    wrapper)."""
+    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    cols = tl.arange(0, BLOCK_N)
+    row_mask = rows[:, None] < M
+    col_mask = cols[None, :] < N
+    mask = row_mask & col_mask
+    x = tl.load(x_ptr + rows[:, None] * N + cols[None, :], mask=mask, other=0.0).to(
+        tl.float32
+    )
+    xbar = tl.where(mask, x, 0.0)
+    var = tl.sum(xbar * xbar, axis=1) / N
+    rstd = tl.rsqrt(var + eps)
+    w = tl.load(w_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+    x_hat = x * rstd[:, None]
+    y = x_hat * w[None, :]
+    z = tl.load(z_ptr + rows[:, None] * N + cols[None, :], mask=mask, other=0.0).to(
+        tl.float32
+    )
+    y *= z * tl.sigmoid(z)
+    yb = y.to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(tl.where(mask, yb, 0.0)), axis=1), q_eps)
+    bits = (amax / fp8_max).to(tl.int32, bitcast=True)
+    exp_ceil = ((bits >> 23) & 0xFF) - 127 + tl.where((bits & 0x7FFFFF) != 0, 1, 0)
+    scale = ((exp_ceil + 127) << 23).to(tl.float32, bitcast=True)
+    y_q = tl.clamp(yb / scale[:, None], -fp8_max, fp8_max).to(y_q_ptr.dtype.element_ty)
+    tl.store(y_q_ptr + rows[:, None] * N + cols[None, :], y_q, mask=mask)
+    t = rows // groups_per_token
+    g = rows % groups_per_token
+    s_off = (g // 4) * aligned_mn * 4 + t * 4 + (g % 4)
+    tl.store(y_s_u8_ptr + s_off, (exp_ceil + 127).to(tl.uint8), mask=rows < M)
+
+
+def gated_rmsnorm_group_quant_fp8_ue8m0(
+    x: torch.Tensor,  # [rows, N] one norm group per row, contiguous
+    z: torch.Tensor,  # [rows, N] gate, contiguous
+    weight: torch.Tensor,  # [N]
+    eps: float,
+    num_tokens: int,
+    q_eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Bit-faithful fused gated-RMSNorm + per-token-group fp8 quant with
+    packed col-major UE8M0 scales; the (q, s) tuple matches what the
+    unfused pair feeds the deepgemm w8a8-block lane, with q viewed as
+    [num_tokens, rows // num_tokens * N]. Launch geometry (BLOCK_N, rows
+    per block, num_warps) mirrors _layer_norm_fwd exactly -- the
+    bit-identity contract depends on it (see the kernel docstring)."""
+    from sglang.kernels.ops.attention.fla.layernorm_gated import calc_rows_per_block
+
+    rows, n = x.shape
+    assert x.is_contiguous() and z.shape == x.shape and z.is_contiguous()
+    assert weight.shape == (n,) and rows % max(num_tokens, 1) == 0
+    groups_per_token = rows // max(num_tokens, 1)
+    hidden = groups_per_token * n
+    x_q = torch.empty((num_tokens, hidden), device=x.device, dtype=fp8_dtype)
+    aligned_mn = ceil_align(num_tokens, 4)
+    aligned_k = ceil_align(groups_per_token, 4)
+    storage = torch.empty(
+        (aligned_k // 4, aligned_mn), device=x.device, dtype=torch.int32
+    )
+    x_s = storage.transpose(-1, -2)[:num_tokens, :]
+    if rows > 0:
+        if groups_per_token % 4 != 0:
+            # Partial final pack: pre-zero its tail bytes (v2 kernel
+            # parity); the kernel's own stores land after, stream-ordered.
+            storage[-1:].zero_()
+        block_n = triton.next_power_of_2(n)
+        num_warps = min(max(block_n // 256, 1), 8)
+        rows_per_block = calc_rows_per_block(rows, x.device)
+        _gated_rmsnorm_group_quant_ue8m0_kernel[(triton.cdiv(rows, rows_per_block),)](
+            x,
+            z,
+            weight,
+            x_q,
+            storage.view(torch.uint8),
+            rows,
+            groups_per_token,
+            aligned_mn,
+            eps,
+            q_eps,
+            fp8_max,
+            N=n,
+            BLOCK_N=block_n,
+            ROWS_PER_BLOCK=rows_per_block,
+            num_warps=num_warps,
+        )
+    return x_q, x_s
+
+
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,

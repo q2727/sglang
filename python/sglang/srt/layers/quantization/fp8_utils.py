@@ -784,6 +784,36 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+def deepgemm_prequant_group(linear) -> Optional[int]:
+    """Quant group size a fused act/norm+quant producer may use to hand
+    this linear a pre-quantized (fp8, scale) tuple, or None when the
+    layer is not guaranteed to ride the deepgemm w8a8-block lane with
+    UE8M0 scales (SM100). Mirrors this lane's own dtype/shape fallback
+    guards: a tuple must never reach a lane that would route it to
+    triton/cutlass."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    quant_method = linear.quant_method
+    if not isinstance(quant_method, Fp8LinearMethod) or not quant_method.block_quant:
+        return None
+    if (
+        quant_method.w8a8_block_fp8_linear
+        is not deepgemm_w8a8_block_fp8_linear_with_fallback
+    ):
+        return None
+    # The bit-faithful fused producers emit packed col-major UE8M0 scales
+    # (the deepgemm SM100 recipe) only.
+    if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return None
+    weight = linear.weight
+    if weight.shape[0] % 64 != 0 or weight.shape[1] % 128 != 0:
+        return None
+    group_size = quant_method.weight_block_size[1]
+    if group_size not in (16, 32, 64, 128):
+        return None
+    return group_size
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
