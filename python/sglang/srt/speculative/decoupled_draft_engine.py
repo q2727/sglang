@@ -1182,8 +1182,33 @@ class EnumDraftEngine:
         # convention (CUDA: lower number = higher priority, 0 = default).
         self._prebuild_stream = torch.cuda.Stream(priority=0)
         self._chain_plan = envs.SGLANG_ENABLE_DECOUPLED_CHAIN_PLAN.get()
+        # TODO(D28): the armed (pre-launched) consume path drafts wrong
+        # VALUES on pure-attention draft models -- every mechanism is green
+        # (select hit >0.9) but node-0 guesses are ~75% wrong and accept
+        # length collapses 3.9 -> 1.5; the chain graph additionally hangs
+        # when combined with host rounds on these models. Bisect: the eager
+        # consume and the extend/fused/topk graphs are all clean; no
+        # companion switch (topk/judge/device-pack/step-5/fast-alloc)
+        # restores the armed path. Until the value path is fixed, pure-attn
+        # drafters fall back to host fast rounds with the extend/topk
+        # graphs on: measured 300.8 tok/s / acc 3.92 on the 32B+0.6B pair
+        # vs 117 / 1.54 armed and 224 colocated.
+        self._d28_pure_attn_fallback = not self._hybrid and (
+            envs.SGLANG_ENABLE_DECOUPLED_DRAFT_PRELAUNCH.get()
+            or envs.SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH.get()
+        )
+        if self._d28_pure_attn_fallback:
+            logger.warning(
+                "decoupled drafter: pre-launch + chain graph disabled for "
+                "pure-attention draft models (known wrong-value defect, "
+                "D28); host fast rounds with extend/topk graphs stay on"
+            )
         self._chain_graph = None
-        if self._chain_plan and envs.SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH.get():
+        if (
+            self._chain_plan
+            and envs.SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH.get()
+            and not self._d28_pure_attn_fallback
+        ):
             from sglang.srt.speculative.decoupled_chain_graph import (
                 ChainGraphRunner,
             )
@@ -1221,7 +1246,10 @@ class EnumDraftEngine:
         self._scatter_consume = envs.SGLANG_ENABLE_DECOUPLED_SCATTER_CONSUME.get()
         # Pre-launch (see pre_launch_extend): the extend half of the NEXT
         # fast round enqueued behind a commit gate at this round's tail.
-        self._prelaunch_enabled = envs.SGLANG_ENABLE_DECOUPLED_DRAFT_PRELAUNCH.get()
+        self._prelaunch_enabled = (
+            envs.SGLANG_ENABLE_DECOUPLED_DRAFT_PRELAUNCH.get()
+            and not self._d28_pure_attn_fallback
+        )
         self._prelaunch_gate = None
         if self._prelaunch_enabled:
             try:
