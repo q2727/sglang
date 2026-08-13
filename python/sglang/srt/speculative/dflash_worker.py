@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import deepcopy
@@ -105,6 +106,10 @@ class DFlashWorker:
             server_args.speculative_dflash_microbatch_overlap
         )
         self.microbatch_pipeline = self.microbatch_serial or self.microbatch_overlap
+        self.microbatch_timing = (
+            os.environ.get("SGLANG_DFLASH_MICROBATCH_TIMING", "0") == "1"
+        )
+        self._microbatch_timing_round = 0
         self._microbatch_executor: Optional[ThreadPoolExecutor] = None
         self._draft_overlap_stream: Optional[torch.cuda.Stream] = None
         self._draft_overlap_scratch: Optional[torch.Tensor] = None
@@ -1266,6 +1271,7 @@ class DFlashWorker:
         draft_input: DFlashDraftInput,
         ready_event: Optional[torch.cuda.Event] = None,
     ) -> DFlashVerifyInput:
+        wall_start = time.perf_counter()
         stream = self._draft_overlap_stream
         stream_context = (
             torch.cuda.stream(stream) if stream is not None else nullcontext()
@@ -1279,6 +1285,8 @@ class DFlashWorker:
             assert isinstance(proposal, DFlashVerifyInput)
             if stream is not None:
                 stream.synchronize()
+            proposal._microbatch_wall_start = wall_start
+            proposal._microbatch_wall_end = time.perf_counter()
             return proposal
 
     def _launch_draft_microbatch(
@@ -1315,7 +1323,10 @@ class DFlashWorker:
         List[int],
         object,
         bool,
+        float,
+        float,
     ]:
+        wall_start = time.perf_counter()
         self._prepare_existing_proposal(batch, proposal)
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
@@ -1358,6 +1369,43 @@ class DFlashWorker:
             accept_length_per_req_cpu,
             logits_output,
             batch_result.can_run_cuda_graph,
+            wall_start,
+            time.perf_counter(),
+        )
+
+    def _log_microbatch_stage_timing(
+        self,
+        *,
+        name: str,
+        stage_start: float,
+        stage_end: float,
+        verify_start: float,
+        verify_end: float,
+        proposal: DFlashVerifyInput,
+    ) -> None:
+        if not self.microbatch_timing:
+            return
+        draft_start = float(proposal._microbatch_wall_start)
+        draft_end = float(proposal._microbatch_wall_end)
+        stage_ms = (stage_end - stage_start) * 1e3
+        verify_ms = (verify_end - verify_start) * 1e3
+        draft_ms = (draft_end - draft_start) * 1e3
+        interval_overlap_ms = max(
+            0.0, min(verify_end, draft_end) - max(verify_start, draft_start)
+        ) * 1e3
+        hidden_ms = max(0.0, verify_ms + draft_ms - stage_ms)
+        logger.info(
+            "DFLASH microbatch timing round=%d stage=%s mode=%s "
+            "stage_ms=%.3f verify_ms=%.3f draft_ms=%.3f "
+            "interval_overlap_ms=%.3f hidden_ms=%.3f",
+            self._microbatch_timing_round,
+            name,
+            "overlap" if self.microbatch_overlap else "serial",
+            stage_ms,
+            verify_ms,
+            draft_ms,
+            interval_overlap_ms,
+            hidden_ms,
         )
 
     def _scatter_microbatch_metadata(
@@ -1423,6 +1471,7 @@ class DFlashWorker:
             spec_info=micro_state.get_draft_input(group_b),
         )
 
+        stage_a_start = time.perf_counter()
         with _dflash_timeline_range("dflash::pipeline_stage_a_verify_b_draft"):
             if self.microbatch_overlap:
                 draft_b_future = self._launch_draft_microbatch(
@@ -1439,9 +1488,27 @@ class DFlashWorker:
                 proposal_b = self._run_draft_microbatch_serial(
                     draft_b_batch, draft_b_batch.spec_info
                 )
+        stage_a_end = time.perf_counter()
         micro_state.set_draft_input(group_b, draft_b_batch.spec_info)
 
-        new_a, commit_a, hidden_a, accept_a, logits_a, graph_a = verify_a
+        (
+            new_a,
+            commit_a,
+            hidden_a,
+            accept_a,
+            logits_a,
+            graph_a,
+            verify_a_start,
+            verify_a_end,
+        ) = verify_a
+        self._log_microbatch_stage_timing(
+            name="verify_a_draft_b",
+            stage_start=stage_a_start,
+            stage_end=stage_a_end,
+            verify_start=verify_a_start,
+            verify_end=verify_a_end,
+            proposal=proposal_b,
+        )
         next_draft_a = DFlashDraftInput(
             verified_id=new_a,
             target_hidden=hidden_a,
@@ -1464,6 +1531,7 @@ class DFlashWorker:
             spec_info=micro_state.get_draft_input(group_a),
         )
 
+        stage_b_start = time.perf_counter()
         with _dflash_timeline_range("dflash::pipeline_stage_b_verify_a_draft"):
             if self.microbatch_overlap:
                 draft_a_future = self._launch_draft_microbatch(
@@ -1480,9 +1548,28 @@ class DFlashWorker:
                 proposal_a_next = self._run_draft_microbatch_serial(
                     next_draft_a_batch, next_draft_a_batch.spec_info
                 )
+        stage_b_end = time.perf_counter()
         micro_state.set_draft_input(group_a, next_draft_a_batch.spec_info)
 
-        new_b, commit_b, hidden_b, accept_b, logits_b, graph_b = verify_b
+        (
+            new_b,
+            commit_b,
+            hidden_b,
+            accept_b,
+            logits_b,
+            graph_b,
+            verify_b_start,
+            verify_b_end,
+        ) = verify_b
+        self._log_microbatch_stage_timing(
+            name="verify_b_draft_a",
+            stage_start=stage_b_start,
+            stage_end=stage_b_end,
+            verify_start=verify_b_start,
+            verify_end=verify_b_end,
+            proposal=proposal_a_next,
+        )
+        self._microbatch_timing_round += 1
         next_draft_b = DFlashDraftInput(
             verified_id=new_b,
             target_hidden=hidden_b,
