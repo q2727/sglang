@@ -220,9 +220,25 @@ class DFlashWorker:
                     f"slots: requested={scratch_tokens}."
                 )
             self._draft_overlap_scratch = scratch
+            # The scratch slots live in the target allocator's physical pool, so
+            # remove them from the capacity advertised to the scheduler. This
+            # prevents normal KV allocation from consuming scratch and keeps the
+            # scheduler's idle/busy memory accounting exact.
+            target_worker.max_total_num_tokens -= scratch_tokens
+            target_worker.max_req_len = min(
+                target_worker.max_req_len, target_worker.max_total_num_tokens - 1
+            )
+            target_worker.max_req_input_len = target_worker.max_req_len - 5
+            if target_worker.max_total_num_tokens <= 0:
+                raise RuntimeError(
+                    "DFLASH draft scratch KV reservation exhausted the target "
+                    f"token pool: reserved={scratch_tokens}."
+                )
             logger.info(
-                "Reserved %d DFLASH draft scratch KV slots for microbatch overlap.",
+                "Reserved %d DFLASH draft scratch KV slots; scheduler token "
+                "capacity reduced to %d.",
                 scratch_tokens,
+                target_worker.max_total_num_tokens,
             )
 
         self._mask_token = draft_config.mask_token
