@@ -645,6 +645,7 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
+    speculative_dflash_microbatch_serial: bool = False
     speculative_dflash_microbatch_overlap: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
@@ -2837,7 +2838,18 @@ class ServerArgs:
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
                 )
 
-            if self.speculative_dflash_microbatch_overlap:
+            if (
+                self.speculative_dflash_microbatch_serial
+                and self.speculative_dflash_microbatch_overlap
+            ):
+                raise ValueError(
+                    "DFLASH microbatch serial and overlap modes are mutually exclusive."
+                )
+
+            if (
+                self.speculative_dflash_microbatch_serial
+                or self.speculative_dflash_microbatch_overlap
+            ):
                 if self.page_size not in (None, 1):
                     raise ValueError(
                         "--speculative-dflash-microbatch-overlap currently "
@@ -4696,6 +4708,13 @@ class ServerArgs:
             "local cache (paged backends may retain up to one extra page on the left "
             "for alignment). Default is full context.",
             default=ServerArgs.speculative_dflash_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-microbatch-serial",
+            action="store_true",
+            help="DFLASH only. Use the same two-microbatch pipeline state machine "
+            "as the overlap experiment, but execute draft and target stages "
+            "sequentially as a controlled baseline.",
         )
         parser.add_argument(
             "--speculative-dflash-microbatch-overlap",
