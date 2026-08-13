@@ -1445,6 +1445,9 @@ class DFlashWorker:
         self._scatter_microbatch_metadata(batch, verify_b_batch, group_b)
 
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        batch.out_cache_loc = torch.cat(
+            [verify_a_batch.out_cache_loc, verify_b_batch.out_cache_loc], dim=0
+        )
         batch.spec_info = micro_state
         batch.forward_mode = ForwardMode.DECODE
 
@@ -1542,15 +1545,21 @@ class DFlashWorker:
 
         # Decode / target-verify stage.
         draft_input = batch.spec_info
+        serial_micro_state: Optional[DFlashMicrobatchInput] = None
         if self.microbatch_overlap and isinstance(
             draft_input, (DFlashDraftInput, DFlashMicrobatchInput)
         ):
             if batch.batch_size() < 2:
                 if isinstance(draft_input, DFlashMicrobatchInput):
+                    serial_micro_state = draft_input
                     draft_input = draft_input.get_draft_input(
                         range(len(draft_input.draft_states))
                     )
-                    batch.spec_info = draft_input
+                else:
+                    serial_micro_state = DFlashMicrobatchInput.from_draft_input(
+                        draft_input, draft_token_num=self.block_size
+                    )
+                batch.spec_info = draft_input
                 if not self._warned_microbatch_single_request:
                     logger.warning(
                         "DFLASH microbatch overlap needs at least two active requests; "
@@ -1617,7 +1626,13 @@ class DFlashWorker:
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
-        batch.spec_info = draft_input
+        if serial_micro_state is not None:
+            indices = range(batch.batch_size())
+            serial_micro_state.set_draft_input(indices, draft_input)
+            serial_micro_state.clear_proposal(indices)
+            batch.spec_info = serial_micro_state
+        else:
+            batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
