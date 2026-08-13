@@ -34,6 +34,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -71,6 +72,27 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+_KT_TIMELINE_NVTX = os.environ.get("SGLANG_KT_TIMELINE_NVTX") == "1"
+
+
+def _kt_timeline_range(name: str):
+    """Return a profiling-only NVTX range without synchronizing CUDA."""
+    if not _KT_TIMELINE_NVTX:
+        return nullcontext()
+    return torch.cuda.nvtx.range(name)
+
+
+def _kt_timeline_start(name: str):
+    """Start a non-nesting range for asynchronous CPU expert service."""
+    if not _KT_TIMELINE_NVTX:
+        return None
+    return torch.cuda.nvtx.range_start(name)
+
+
+def _kt_timeline_end(range_id) -> None:
+    if range_id is not None:
+        torch.cuda.nvtx.range_end(range_id)
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
@@ -3100,6 +3122,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        _kt_layer_idx = int(getattr(self.kt_config, "layer_idx", -1))
+        _kt_layer_prefix = f"kt::layer_{_kt_layer_idx:02d}"
+        _kt_cpu_service_range_id = None
         from sglang.srt.debug_utils.component_timing import (
             cpu_isolation_enabled as _component_cpu_isolation_enabled,
             is_active as _component_timing_is_active,
@@ -3228,7 +3253,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
 
             # Copy to staging buffer on main stream
-            staging_buffer.copy_(x, non_blocking=True)
+            with _kt_timeline_range(f"{_kt_layer_prefix}::staging_copy"):
+                staging_buffer.copy_(x, non_blocking=True)
 
             # SGLANG_KT_HYBRID_NO_CPU_STREAM=1 collapses cpu_stream onto main stream.
             _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
@@ -3239,12 +3265,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
+                _kt_cpu_service_range_id = _kt_timeline_start(
+                    f"{_kt_layer_prefix}::cpu_moe_service"
+                )
                 if _component_timing:
                     _component_cpu_service_start.record(self._cpu_stream)
                     _component_submit_start = time.perf_counter()
-                self._submit_with_staged_input(
-                    layer, dispatch_output, staging_buffer
-                )
+                with _kt_timeline_range(f"{_kt_layer_prefix}::cpu_submit"):
+                    self._submit_with_staged_input(
+                        layer, dispatch_output, staging_buffer
+                    )
                 if _component_timing:
                     _component_submit_ms = (
                         time.perf_counter() - _component_submit_start
@@ -3281,9 +3311,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 flat_topk_ids,
                 torch.ones_like(flat_topk_ids, dtype=torch.int32),
             )
-        masked_topk_ids = mask_and_remap_expert_ids(
-            topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
-        )
+        with _kt_timeline_range(f"{_kt_layer_prefix}::route_mask"):
+            masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
+            )
 
         # Create modified dispatch output for GPU computation
         masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
@@ -3326,6 +3357,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Flash + --kt-num-gpu-experts=0), which defeats the
         # num_gpu_experts==0 short-circuit. The env var lets the operator
         # force the bypass without untangling the mask generator.
+        _kt_gpu_expert_range_id = _kt_timeline_start(
+            f"{_kt_layer_prefix}::gpu_routed_experts"
+        )
         if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
             gpu_combine_input = None
             output = torch.zeros_like(x)
@@ -3343,6 +3377,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
+        _kt_timeline_end(_kt_gpu_expert_range_id)
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -3357,7 +3392,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 with _stream_ctx:
                     # Use staging_buffer for sync to get correct buffer reference
                     _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                    cpu_output = self._sync_with_staged_input(staging_buffer)
+                    with _kt_timeline_range(
+                        f"{_kt_layer_prefix}::cpu_sync_receive"
+                    ):
+                        cpu_output = self._sync_with_staged_input(staging_buffer)
                     if _component_timing:
                         _component_cpu_service_end.record(self._cpu_stream)
                     if _kt_t_sync_pre is not None:
@@ -3366,6 +3404,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         self._sync_done_event.record(self._cpu_stream)
             else:
                 cpu_output = _component_cpu_output
+            _kt_timeline_end(_kt_cpu_service_range_id)
+            _kt_cpu_service_range_id = None
             if _kt_timing:
                 _kt_t_after_sync = time.perf_counter()
 
@@ -3380,7 +3420,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 _component_residual_wait_end.record(
                     torch.cuda.current_stream(x.device)
                 )
-            output = output + cpu_output
+            with _kt_timeline_range(f"{_kt_layer_prefix}::merge"):
+                output = output + cpu_output
             if _component_timing:
                 _component_hybrid_end.record(torch.cuda.current_stream(x.device))
         if _kt_timing:
@@ -3436,6 +3477,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 hybrid_critical_start=_component_hybrid_start,
                 hybrid_critical_end=_component_hybrid_end,
             )
+        _kt_timeline_end(_kt_cpu_service_range_id)
         return StandardCombineInput(hidden_states=output)
 
     def _update_gpu_experts_from_batch(

@@ -432,21 +432,24 @@ class NgramVerifyInput(SpecInput):
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            self._greedy_verify(batch, logits_output)
-        else:
-            # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
-            self._sampling_verify(batch, logits_output, sampling_info)
+        with torch.cuda.nvtx.range("ssd_accept_compute"):
+            if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+                self._greedy_verify(batch, logits_output)
+            else:
+                # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
+                self._sampling_verify(batch, logits_output, sampling_info)
 
-        self._fill_requests(batch, logits_output)
+            self._fill_requests(batch, logits_output)
 
-        accept_length_cpu = self.accept_length.cpu()
-        num_accepted_tokens = accept_length_cpu.sum().item()
+        with torch.cuda.nvtx.range("ssd_accept_d2h"):
+            accept_length_cpu = self.accept_length.cpu()
+            num_accepted_tokens = accept_length_cpu.sum().item()
 
-        self._free_cache(batch, page_size, accept_length_cpu)
+        with torch.cuda.nvtx.range("ssd_kv_commit"):
+            self._free_cache(batch, page_size, accept_length_cpu)
 
-        batch.seq_lens.add_(self.accept_length + 1)
-        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+            batch.seq_lens.add_(self.accept_length + 1)
+            batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
         return logits_output, self.verified_id, num_accepted_tokens
 

@@ -592,9 +592,10 @@ class SSDWorker:
             )
 
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
-        logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
-            batch, batch_result.logits_output, self.page_size
-        )
+        with torch.cuda.nvtx.range("ssd_accept_and_kv_commit"):
+            logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
+                batch, batch_result.logits_output, self.page_size
+            )
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
 
