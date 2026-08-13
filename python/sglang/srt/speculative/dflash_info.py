@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -142,6 +142,203 @@ class DFlashDraftInput(SpecInput):
             self.target_hidden = torch.cat(
                 [self.target_hidden, spec_info.target_hidden], dim=0
             )
+
+
+def _split_dflash_draft_input(
+    draft_input: DFlashDraftInput,
+) -> List[DFlashDraftInput]:
+    """Split a batched draft state into request-local states.
+
+    DFlash stores target hidden states in a flattened, variable-length tensor.
+    Keeping request-local slices makes microbatch filtering and merging independent
+    of the current A/B partition.
+    """
+
+    ctx_lens_cpu = [int(value) for value in draft_input.ctx_lens.tolist()]
+    states: List[DFlashDraftInput] = []
+    offset = 0
+    for index, ctx_len in enumerate(ctx_lens_cpu):
+        next_offset = offset + ctx_len
+        states.append(
+            DFlashDraftInput(
+                verified_id=draft_input.verified_id[index : index + 1],
+                target_hidden=draft_input.target_hidden[offset:next_offset],
+                ctx_lens=draft_input.ctx_lens[index : index + 1],
+                draft_seq_lens=draft_input.draft_seq_lens[index : index + 1],
+            )
+        )
+        offset = next_offset
+
+    if offset != int(draft_input.target_hidden.shape[0]):
+        raise RuntimeError(
+            "DFLASH draft state has inconsistent ctx_lens and target_hidden: "
+            f"sum(ctx_lens)={offset}, target_hidden_rows={draft_input.target_hidden.shape[0]}."
+        )
+    return states
+
+
+def _merge_dflash_draft_states(
+    states: Sequence[DFlashDraftInput],
+) -> DFlashDraftInput:
+    if not states:
+        raise ValueError("Cannot merge an empty list of DFLASH draft states.")
+
+    hidden_parts = [
+        state.target_hidden
+        for state in states
+        if state.target_hidden is not None and state.target_hidden.numel() > 0
+    ]
+    empty_hidden = states[0].target_hidden[:0]
+    return DFlashDraftInput(
+        verified_id=torch.cat([state.verified_id for state in states], dim=0),
+        target_hidden=(torch.cat(hidden_parts, dim=0) if hidden_parts else empty_hidden),
+        ctx_lens=torch.cat([state.ctx_lens for state in states], dim=0),
+        draft_seq_lens=torch.cat(
+            [state.draft_seq_lens for state in states], dim=0
+        ),
+    )
+
+
+@dataclass
+class DFlashMicrobatchInput(SpecInput):
+    """Persistent state for two-microbatch DFlash pipelining.
+
+    Each request owns its draft-side state and optionally one prepared proposal.
+    A steady-state iteration verifies requests with prepared proposals while the
+    draft stream prepares proposals for the complementary microbatch.
+    """
+
+    draft_states: List[DFlashDraftInput]
+    prepared_proposals: List[Optional["DFlashVerifyInput"]]
+    draft_token_num: int
+
+    def __post_init__(self):
+        super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
+        if len(self.draft_states) != len(self.prepared_proposals):
+            raise ValueError(
+                "DFLASH microbatch state length mismatch: "
+                f"draft_states={len(self.draft_states)}, "
+                f"prepared_proposals={len(self.prepared_proposals)}."
+            )
+
+    @classmethod
+    def from_draft_input(
+        cls, draft_input: DFlashDraftInput, draft_token_num: int
+    ) -> "DFlashMicrobatchInput":
+        states = _split_dflash_draft_input(draft_input)
+        return cls(
+            draft_states=states,
+            prepared_proposals=[None] * len(states),
+            draft_token_num=int(draft_token_num),
+        )
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return (1, 1)
+
+    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        del has_been_filtered
+        indices = [int(index) for index in new_indices.tolist()]
+        self.draft_states = [self.draft_states[index] for index in indices]
+        self.prepared_proposals = [
+            self.prepared_proposals[index] for index in indices
+        ]
+
+    def merge_batch(self, spec_info: SpecInput):
+        if isinstance(spec_info, DFlashDraftInput):
+            other_states = _split_dflash_draft_input(spec_info)
+            other_proposals: List[Optional[DFlashVerifyInput]] = [None] * len(
+                other_states
+            )
+        elif isinstance(spec_info, DFlashMicrobatchInput):
+            if int(spec_info.draft_token_num) != int(self.draft_token_num):
+                raise ValueError(
+                    "Cannot merge DFLASH microbatch states with different block sizes: "
+                    f"{self.draft_token_num} vs {spec_info.draft_token_num}."
+                )
+            other_states = spec_info.draft_states
+            other_proposals = spec_info.prepared_proposals
+        else:
+            raise TypeError(
+                "DFLASH microbatch state can only merge DFlashDraftInput or "
+                f"DFlashMicrobatchInput, got {type(spec_info).__name__}."
+            )
+
+        self.draft_states.extend(other_states)
+        self.prepared_proposals.extend(other_proposals)
+
+    def prepared_indices(self) -> List[int]:
+        return [
+            index
+            for index, proposal in enumerate(self.prepared_proposals)
+            if proposal is not None
+        ]
+
+    def unprepared_indices(self) -> List[int]:
+        return [
+            index
+            for index, proposal in enumerate(self.prepared_proposals)
+            if proposal is None
+        ]
+
+    def get_draft_input(self, indices: Sequence[int]) -> DFlashDraftInput:
+        return _merge_dflash_draft_states(
+            [self.draft_states[int(index)] for index in indices]
+        )
+
+    def set_draft_input(
+        self, indices: Sequence[int], draft_input: DFlashDraftInput
+    ) -> None:
+        states = _split_dflash_draft_input(draft_input)
+        if len(states) != len(indices):
+            raise ValueError(
+                "DFLASH draft-state update length mismatch: "
+                f"indices={len(indices)}, states={len(states)}."
+            )
+        for index, state in zip(indices, states, strict=True):
+            self.draft_states[int(index)] = state
+
+    def get_proposal(self, indices: Sequence[int]) -> "DFlashVerifyInput":
+        proposals = [self.prepared_proposals[int(index)] for index in indices]
+        if not proposals or any(proposal is None for proposal in proposals):
+            raise RuntimeError("Requested an unprepared DFLASH microbatch proposal.")
+        typed_proposals = [proposal for proposal in proposals if proposal is not None]
+        return DFlashVerifyInput(
+            draft_token=torch.cat(
+                [proposal.draft_token for proposal in typed_proposals], dim=0
+            ),
+            positions=torch.cat(
+                [proposal.positions for proposal in typed_proposals], dim=0
+            ),
+            draft_token_num=self.draft_token_num,
+        )
+
+    def set_proposal(
+        self, indices: Sequence[int], proposal: "DFlashVerifyInput"
+    ) -> None:
+        if int(proposal.draft_token_num) != int(self.draft_token_num):
+            raise ValueError(
+                "DFLASH proposal block-size mismatch: "
+                f"{proposal.draft_token_num} vs {self.draft_token_num}."
+            )
+        expected = len(indices) * self.draft_token_num
+        if proposal.draft_token.numel() != expected or proposal.positions.numel() != expected:
+            raise ValueError(
+                "DFLASH proposal shape mismatch: "
+                f"expected={expected}, draft_token={proposal.draft_token.numel()}, "
+                f"positions={proposal.positions.numel()}."
+            )
+        tokens = proposal.draft_token.view(len(indices), self.draft_token_num)
+        positions = proposal.positions.view(len(indices), self.draft_token_num)
+        for row, index in enumerate(indices):
+            self.prepared_proposals[int(index)] = DFlashVerifyInput(
+                draft_token=tokens[row].reshape(-1),
+                positions=positions[row].reshape(-1),
+                draft_token_num=self.draft_token_num,
+            )
+
+    def clear_proposal(self, indices: Sequence[int]) -> None:
+        for index in indices:
+            self.prepared_proposals[int(index)] = None
 
 
 @dataclass

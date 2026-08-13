@@ -645,6 +645,7 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
+    speculative_dflash_microbatch_overlap: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -2836,6 +2837,20 @@ class ServerArgs:
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
                 )
 
+            if self.speculative_dflash_microbatch_overlap:
+                if self.page_size not in (None, 1):
+                    raise ValueError(
+                        "--speculative-dflash-microbatch-overlap currently "
+                        "requires --page-size 1."
+                    )
+                self.page_size = 1
+                if not self.disable_cuda_graph:
+                    self.disable_cuda_graph = True
+                    logger.warning(
+                        "CUDA graphs are disabled for DFLASH microbatch overlap "
+                        "because draft and target execute on independent streams."
+                    )
+
             # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
             # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
             # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
@@ -4681,6 +4696,14 @@ class ServerArgs:
             "local cache (paged backends may retain up to one extra page on the left "
             "for alignment). Default is full context.",
             default=ServerArgs.speculative_dflash_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-microbatch-overlap",
+            action="store_true",
+            help="DFLASH only. Split each decode batch into two microbatches and "
+            "pipeline target verification of one microbatch with drafting of the "
+            "other. The initial experimental path requires batch size >= 2, "
+            "greedy sampling, page size 1, and CUDA graphs disabled.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
