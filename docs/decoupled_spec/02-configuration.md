@@ -29,14 +29,14 @@
 
 ### 自动生效的角色默认值
 
-| 项 | verifier | drafter | 出处 |
-|---|---|---|---|
-| `max_running_requests` | 64 | 512 | `:243-250`(drafter 需要更多 `req_to_token` 行放 transient backbone 与 (K+1)×F 分支链暂存) |
-| `disable_radix_cache` | 不动 | **True** | `:271`(逐 commit 的截断释放走非 refcount-aware 的 allocator free) |
-| `mamba_radix_cache_strategy` | 不动 | `"no_buffer"` | `:274` |
-| `enable_mixed_chunk` | False | False | `:282-286` |
-| `speculative_algorithm` | 保留 | **清成 None** | `:164-181`(drafter 的 ModelRunner 必须按纯 decode 引擎定尺,否则 decode graph 会按 num_draft_tokens 个位置回放、破坏枚举 harness 的 1-token 步) |
-| `speculative_num_draft_tokens` | K+1 | **清成 None** | 同上(hybrid draft 上 mamba 池否则会按 `[层, slot, num_draft_tokens, heads, dk, dv]` fp32 分配,有用缓存尺寸下达数百 GB) |
+| 项 | verifier | drafter | 覆盖语义 | 出处 |
+|---|---|---|---|---|
+| `max_running_requests` | 64 | 512 | **仅当你没显式设置**(`is None` 才填) | `:243-250`(drafter 需要更多 `req_to_token` 行放 transient backbone 与 (K+1)×F 分支链暂存) |
+| `disable_radix_cache` | 不动 | **True** | 强制覆盖 + WARNING | `:271`(逐 commit 的截断释放走非 refcount-aware 的 allocator free) |
+| `mamba_radix_cache_strategy` | 不动 | `"no_buffer"` | 强制覆盖 + WARNING | `:274` |
+| `enable_mixed_chunk` | False | False | 强制覆盖 + WARNING | `:282-286` |
+| `speculative_algorithm` | 保留 | **清成 None** | 强制覆盖 | `:164-181`(drafter 的 ModelRunner 必须按纯 decode 引擎定尺,否则 decode graph 会按 num_draft_tokens 个位置回放、破坏枚举 harness 的 1-token 步) |
+| `speculative_num_draft_tokens` | K+1 | **清成 None** | 强制覆盖 | 同上(hybrid draft 上 mamba 池否则会按 `[层, slot, num_draft_tokens, heads, dk, dv]` fp32 分配,有用缓存尺寸下达数百 GB) |
 
 ### 直接拒绝的组合
 
@@ -124,6 +124,15 @@ SGLANG_DECOUPLED_ENUM_WAIT_MS=200          # ▸ 默认 200
 投机式提前推送,机制全通但被判"空窗不免费",见 [07-open-questions S2](07-open-questions.md#s2)。
 两者都**只在 zmq 数据面下可用**。
 
+### 2.6b 其余非调试变量(完整性)
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `SGLANG_ENABLE_DECOUPLED_EVENTED_PUSH` | `True` ✅ | 块推送走 pinned staging ring + CUDA event(**仅 zmq 数据面**) |
+| `SGLANG_ENABLE_DECOUPLED_ARM_BEFORE_RESTAGE` | `True` ✅ | arm 与 restage 的先后次序(A/B 用) |
+| `SGLANG_ENABLE_DECOUPLED_BET_EARLY_PUSH` | `True` ✅ | bet 族的子开关;bet 本身默认关时不起作用 |
+| `SGLANG_DECOUPLED_CASCADE_MIN_PREFIX_LEN` | `0` ▸ | branch decode 启用两级 cascade attention 的最小共享前缀;`0` = 关闭 |
+
 ### 2.7 调试与观测(全部默认关)
 
 | 变量 | 作用 |
@@ -133,6 +142,12 @@ SGLANG_DECOUPLED_ENUM_WAIT_MS=200          # ▸ 默认 200
 | `SGLANG_DEBUG_DECOUPLED_SELECT_GRAPH_CHECK` | 逐轮 eager 重算对拍 select 图 |
 | `SGLANG_DEBUG_DECOUPLED_BET` | miss 取证 dump(限流) |
 | `SGLANG_TEST_DECOUPLED_LOOPBACK` | 单进程假 mesh + 脚本化 drafter(`"garbage"` / `"stale"`),**测正确性兜底用** |
+| `SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE` | drafter 逐轮阶段分解 |
+| `SGLANG_DEBUG_DECOUPLED_COMMIT_MIRROR`<br>`SGLANG_DEBUG_DECOUPLED_GPU_MATCH`<br>`SGLANG_DEBUG_DECOUPLED_GPU_SCATTER`<br>`SGLANG_DEBUG_DECOUPLED_JUDGE_CHECK` | 设备值平面各环节的逐轮对拍 |
+| `SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_DIFF`<br>`SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_FULLSCAN`<br>`SGLANG_DEBUG_DECOUPLED_EXTEND_GRAPH_NANCHECK` | extend 图的对拍 / 全扫 / NaN 检查(**DIFF 与 armed 机构会死锁**,见 [D28](05-pitfalls.md#d28)) |
+| `SGLANG_DEBUG_DECOUPLED_PRELAUNCH_JUNK`<br>`SGLANG_DEBUG_DECOUPLED_STALE_INJECT`<br>`SGLANG_DEBUG_DECOUPLED_BLOCK_HASH`<br>`SGLANG_DEBUG_DECOUPLED_DUMP_BASE`<br>`SGLANG_DEBUG_DECOUPLED_BET_STAGE_MAX` | 故障注入与取证 |
+
+> 至此 51 个 `SGLANG_*DECOUPLED*` 变量已全部覆盖(调试类以族为单位列出)。
 
 ### 2.8 与解耦联动的融合开关(不带 DECOUPLED 前缀)
 

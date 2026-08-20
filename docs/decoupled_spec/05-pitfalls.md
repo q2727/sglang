@@ -152,7 +152,7 @@ host fast-path 不是图命中,所以常规日志面上完全看不出来。
 
 | 陷阱 | 数据 | 纪律 |
 |---|---|---|
-| 首跑偏低 | one_batch rep1 系统性比 rep2-4 低 8–13% | 至少 2 次,判精细差异用 3–4 次取稳态 |
+| 首跑偏低 | **仅 decoupled 397B pair**:rep1 比 rep2 低 8–11%(环相位建立);其余 15/17 条腿 rep1≈rep2(±3.5%) | 统一取 run2;判精细差异用 3–4 次。**用均值会只低估 decoupled**,见 [04 §0.2](04-results.md#caliber) |
 | gsm8k 单跑离群 | 曾测出 −17% 的假差异,复验不复现 | 判大差必复跑;两次复测互差应 <1% |
 | 跨 K 不可比 | 不同 K 的 verify 窗口 kernel 形状不同 → 数值差 → 输出 token 数变(K5 多输出 3.2%) | 判 K/F **只认固定输出长度的 one_batch** |
 | acc_server 是累计值 | 三个配置在 serving-8k 上都报 4.000(理论上限) | 用 one_batch 的 acc_length |

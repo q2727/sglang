@@ -63,6 +63,8 @@ armed 停在"预发射不预推送"这一档,是实测的收益/风险平衡点�
 **为什么 default OFF**:带图 e2e acc 3.21→2.55、hit −8pp,而轮周期不变——
 verify 侧 −50µs 级提速本身移动环相位。**留了 OPEN 问题:gate pacing 为何不吸收这个提速。**
 
+<a id="s4"></a>
+
 ### S4 · doorbell(设备侧 `cuStreamWaitValue32` 门)
 代码在(`decoupled_doorbell.py`),但环境变量注释里写明 **"verified UNSAFE on driver 580.126.09"**,默认关。
 C6 host-func 门是当前方案。

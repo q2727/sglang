@@ -8,12 +8,19 @@ verifier 在 GPU 上选出匹配的那一行——命中则零等待,未命中�
 
 | 形态 | decode 吞吐 | 相对无投机 |
 |---|---|---|
-| MTP(target 自带头) | 484.1 tok/s | 2.47× |
-| **decoupled(本工作)** | **430.8 tok/s** | **2.20×** |
+| MTP(target 自带头) | 484.2 tok/s | ⚠️ 2.47× |
+| **decoupled(本工作)** | **430.8 tok/s** | ⚠️ **2.20×** |
 | 无投机 | 196.1 tok/s | 1.00× |
-| colocated STANDALONE | 148.8 tok/s | 0.76×(负优化) |
+| colocated STANDALONE | 146.9 tok/s | ⚠️ 0.75×(负优化) |
 
-decoupled = MTP 的 **89%**、colocated 的 **2.90×**。三个 model pair、三台机器上 decoupled 全面胜过 colocated。
+**decoupled = MTP 的 89%、colocated 的 2.93×**(同盒同期,可直接比)。
+三个 model pair、三台机器上 decoupled 全面胜过 colocated。
+
+> ⚠️ 无投机 196.1 采自**另一台** B200(原盒没跑无 spec 腿),所以"相对无投机"这一列是跨盒的,只作量级参考
+> ——本文档集自己的规矩是跨盒不可比([04 §0.4](04-results.md#caliber))。
+> 需要同盒证据时看新盒:无 spec 196.1 vs colocated 141.2(同盒同期),比值 0.72×,负优化的结论不依赖跨盒。
+> 另注:decoupled 用 5 张卡(TP4 verifier + 1 张 drafter),其余形态 4 张;
+> 按**每卡**归一,2.93× 折算为 2.34×([04 §0.5](04-results.md#caliber))。
 
 ---
 
@@ -21,6 +28,7 @@ decoupled = MTP 的 **89%**、colocated 的 **2.90×**。三个 model pair、三
 
 | 你想做的事 | 读这篇 |
 |---|---|
+| 看不懂 seat / carrier / glue / stamp 这些词 | **[01-architecture §0 术语表](01-architecture.md)** — 先看这个,两分钟 |
 | 理解设计与取舍 | **[01-architecture](01-architecture.md)** — 原理→实现→契约,逐机制展开 |
 | 查一个 flag / 环境变量 | **[02-configuration](02-configuration.md)** — 51 个 env + 全部 CLI 的速查表 |
 | 自己跑一遍 benchmark | **[03-benchmarking](03-benchmarking.md)** — 可照抄的命令 + 判读纪律 |
@@ -87,6 +95,6 @@ verifier 进程(target, TP=N)                    drafter 进程(draft, TP=1, 独
 | 资产 | 位置 |
 |---|---|
 | 逐腿原始 JSONL | `~/Desktop/b200_backup_0813/{newbox,oldbox}/bench/`、`h200/bench_h200.tgz` |
-| benchmark harness(终版) | `~/Desktop/b200_backup_0813/newbox/bench/bench_matrix.py` |
+| benchmark harness | **`benchmark/decoupled_spec/bench_matrix.py`(在本仓库里)** |
 | profile traces | `~/Desktop/h200_prof397/`(397B dec vs MTP)、`~/Desktop/b200_prof27/`(27B) |
 | 机器重建手册 | `~/Desktop/b200_restore_kit/RESTORE.md` |

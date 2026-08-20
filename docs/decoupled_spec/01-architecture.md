@@ -4,6 +4,30 @@
 >
 > 全文一个颜色约定:**GPU 侧**(kernel / graph / 显存)与 **host 侧**(Python 发射 / 轮询 / 跨进程)要分开看——
 > 这套设计的全部要点,就是把 host 从关键路径上挪走。
+>
+> **路径约定**:除非另行注明,所有 `xxx/yyy.py` 都相对于 **`python/sglang/srt/`**。
+> 例外只有一个:`arg_groups/speculative_hook.py` 也在该根下,但它常被误当成 `speculative/` 的一部分。
+
+## 0 · 术语表(本线自造词,先看这个)
+
+| 术语 | 含义 |
+|---|---|
+| **K** | `--speculative-num-steps`,一次投机往前画几步 |
+| **F** | `--speculative-fanout`,每个 accept case 枚举几个 bonus 猜测 |
+| **accept case**(简称 case) | 上一轮被接受的 **draft token 数**,取值 `{0..K}`;枚举网格的行号 |
+| **bonus token** | verify 在接受段之后采样出的那个 token,恒被提交;枚举网格的列由它的 top-F 猜测张成 |
+| **block(枚举块)** | drafter 一轮的产物:整个 (K+1)×F 网格打成一条线材消息 |
+| **commit** | verifier 一轮的产物:`accept_lens` + 已提交 token,推回 drafter |
+| **stamp** | 块携带的"我是从哪个已提交长度枚举出来的",select 用它做**严格相等**的版本判定 |
+| **seat(座位)** | 一个请求在 drafter 侧的常驻位置(对应 verifier 的 `req_pool_idx`) |
+| **carrier(载体)** | 一个 seat 名下用于跑枚举网格的那批固定 `req_to_token` 行 |
+| **backbone** | 各 case 共享的、已提交前缀的 KV |
+| **glue** | 某个 case 假设"被接受"的那几个 draft token,写进 carrier 的私有页行 |
+| **branch** | 以某个 bonus 猜测为根、往后画 K 步的那条链 |
+| **armed(预发射)** | 在等 commit 的空窗里,用假设值把下一轮准备并发射到流上;commit 到达后只做 COW 修正 |
+| **fast / slow 轮** | fast = 稳态轮;slow = 请求生命周期事件(bootstrap) |
+| **band** | host 侧的一段计时区间,可注入 profiler trace |
+| **C6 门** | 等枚举块到达的那道门(第 6 类跨进程竞争,故名) |
 
 ---
 
@@ -66,8 +90,14 @@ verify-only worker 的 `draft_worker` 恒为 `None`,基类里所有 draft 感知
 
 可行的原因是结果空间小且可枚举——一轮 verify 后的状态由两个变量完全决定:
 
-- **接受长度** `a ∈ {1..K+1}`,共 K+1 种(称 accept case)
+- **accept case** `c ∈ {0..K}`,共 K+1 种。**c = 上一轮被接受的 draft token 数**
+  (`prev_accept_lens`,见 `speculative/verify_worker.py:18` 的模块 docstring)
 - **bonus token**:理论上是整个词表,但真实分布高度集中,取 draft 的 **top-F** 覆盖大部分概率质量
+
+> ⚠️ **代码里有两个 `accept_lens`,差 1,别混**:select 用的 `prev_accept_lens` 是**被接受的 draft 数**
+> (`{0..K}`,直接就是 case 行号);commit 线材里的 `accept_lens` 是**提交长度**(`{1..K+1}`,
+> 含恒被提交的 bonus,`verifier_ipc_thread.py:303` 用它切 token)。关系:`case = 提交长度 − 1`。
+> 所以"miss 只提交 1 个 bonus"对应的正是 **case 0**。
 
 于是 drafter 枚举一个 **(K+1) × F 的网格**,每格是"若 verify 接受 a 个、bonus 是第 f 个猜测"世界线下的一条 K 步链。
 verifier 收到块后,等真实结果落地,**在 GPU 上选出匹配行**:命中则零等待;未命中则退化为一次普通 decode
@@ -92,16 +122,18 @@ carrier 的私有页行)+ **branch**(以 bonus 猜测为根的新 K 步链)。
 **实现**——`speculative/verify_worker.py:124` `select_enum_units`,三步张量运算:
 
 ```python
-# verify_worker.py:153-171
-gen_matches = stamps.eq(base_committed_lens.unsqueeze(1))  # ① 新鲜度:stamp 严格相等
-fresh = gen_matches.any(dim=1)
+# speculative/verify_worker.py:150-171(省略 units / bonus_tokens / batch_arange 三行准备)
+gen_matches = stamps.eq(base_committed_lens.unsqueeze(1))   # [bs, gen_count]
+fresh = gen_matches.any(dim=1)                              # ① 新鲜度:stamp 严格相等
 gen_indices = gen_matches.to(torch.int64).argmax(dim=1)
-cases = prev_accept_lens.clamp(min=0, max=num_cases - 1)   # ② 用上轮接受长度定位 case 行
-
-case_units = units[batch_arange, gen_indices, cases]       # [bs, F, unit_width]
-guesses = case_units[:, :, 0]        # unit 的第 0 元素 = 猜的 bonus = 匹配键
-guess_matches = guesses.eq(bonus_tokens.unsqueeze(1))
-hits = fresh & guess_matches.any(dim=1)                    # ③ 命中 = 新鲜 ∧ 猜中
+cases = prev_accept_lens.clamp(min=0, max=num_cases - 1)    # ② 用上轮 accepted-draft 数定位 case 行
+...
+case_units = units[batch_arange, gen_indices, cases]        # [bs, F, unit_width]
+guesses = case_units[:, :, 0]         # unit 的第 0 元素 = 猜的 bonus = 匹配键
+guess_matches = guesses.eq(bonus_tokens.unsqueeze(1))       # [bs, F]
+hits = fresh & guess_matches.any(dim=1)                     # ③ 命中 = 新鲜 ∧ 猜中
+guess_indices = guess_matches.to(torch.int64).argmax(dim=1)
+selected = case_units[batch_arange, guess_indices]          # 取中的那一行 = verify 输入
 
 fallback_units = bonus_tokens.unsqueeze(1).expand(bs, unit_width)
 selected = torch.where(hits.unsqueeze(1), selected, fallback_units)
@@ -359,7 +391,7 @@ self._d28_pure_attn_fallback = not self._hybrid and (
 
 命中守卫时**只关** `_prelaunch_enabled` 与链图 runner 的构造(`:1206-1211`、`:1249-1252`);
 `_chain_plan` 与 `_case0_chain_graph` 在它之前读取、保持开启,所以 eager 的逐步链循环照常跑。
-守卫后 32B/235B 恢复满接受长度(3.94/3.96)。
+守卫后 32B/235B 恢复满接受长度(代码注释记的是 32B pair 300.8 tok/s / acc 3.92,`decoupled_draft_engine.py:1194`;本文档矩阵腿的读数见 [04 §3](04-results.md))。
 
 ### 6.3 case-0 吸收态与列预算
 

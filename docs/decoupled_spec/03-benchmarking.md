@@ -55,20 +55,27 @@ env SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH=1 \
   --attention-backend trtllm_mha --page-size 64 --max-mamba-cache-size 1024 \
   --speculative-algorithm STANDALONE --speculative-draft-model-path $D \
   --speculative-num-steps 3 --speculative-fanout 2 \
-  --cuda-graph-bs-decode 1 2 4 8 --max-running-requests 2048 \
+  --cuda-graph-bs-decode 1 2 4 8 12 16 24 32 --max-running-requests 2048 \
   --decoupled-spec-role drafter --decoupled-spec-rank 0 \
   --decoupled-spec-data-transport zmq \
   --decoupled-spec-bind-endpoint ipc:///tmp/bm_d \
   --decoupled-spec-connect-endpoints '["ipc:///tmp/bm_v"]'
 ```
 
-四个要点:
+五个要点:
+- **K 与 F 两侧必须逐字相同**。`--speculative-num-steps` 与 `--speculative-fanout` 在两个进程里各自解析,
+  没有任何握手校验。不一致时 verifier 的 **recv 守护线程**会在
+  `decoupled_enum_buffer.py:193` 抛 `enumeration block dims differ from the buffer's config`,
+  **该线程直接死掉**(文件自己在 `:179` 注明了这个 TODO),而 server 继续正常服务——
+  于是你得到一台健康、能出结果、**全程 fallback** 的机器,吞吐看起来只是"偏低"。
+  这是本形态最阴的故障模式,排查见 [06 §6](06-reproduction.md)。
 - **endpoint 交叉**:一侧的 `bind` 是另一侧的 `connect`。`connect_endpoints` 是 **JSON 数组**,
   在 shell 里要用单引号包住(`'["ipc:///tmp/bm_d"]'`),否则 shlex 会拆坏。
 - **`--speculative-draft-model-path` 两侧都要给**:verifier 用它定枚举形状,drafter 用它当自己的模型。
 - **`--max-mamba-cache-size 1024` 仅 hybrid draft 模型需要**(如 Qwen3.5-0.8B);纯 attention draft 去掉。
 - **`--cuda-graph-bs-decode` 的最大值必须 ≥ (K+1)×F**,否则链图静默降级(见 [D29](05-pitfalls.md#d29))。
-  K3F2 → 8 够用;K3F4 → 需要 16;K5F4 → 需要 24。保险起见扫描时统一用 `1 2 4 8 12 16 24 32`。
+  模板里直接用了宽列表 `1 2 4 8 12 16 24 32`,K3F2/K3F4/K5F4 都覆盖得到;
+  实测宽列表对 K3F2 无副作用(267/280.7 vs 窄列表 265.7/280.5),所以没有理由用窄的。
 
 ### 2.2 colocated STANDALONE(单进程)
 
@@ -108,7 +115,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m sglang.launch_server \
 ### 3.1 one_batch —— decode-only 吞吐(判 K/F 与 kernel 改动的**唯一**可信口径)
 
 ```bash
-python3 -m sglang.bench_one_batch_server \
+python3 -m sglang.benchmark.one_batch_server \
   --base-url http://127.0.0.1:33700 --model-path $V \
   --batch-size 1 --input-len 1024 --output-len 1024 --skip-warmup \
   --dataset-path /path/to/sharegpt_v3.json      # 无外网时必须给
@@ -154,8 +161,8 @@ python3 benchmark/gsm8k/bench_sglang.py \
 
 ## 4 · 测量协议(harness 里编码的规矩)
 
-矩阵驱动脚本:`~/Desktop/b200_backup_0813/newbox/bench/bench_matrix.py`(**打过 5 个补丁的终版**,
-比 restore kit 里的原件新)。它对每个配置做的事:
+矩阵驱动脚本已在仓库里:**`benchmark/decoupled_spec/bench_matrix.py`**(用法见 [06 §5](06-reproduction.md))。
+它对每个配置做的事:
 
 1. `kill_all()` → 清残留进程 **+ 删 stale ipc socket**(`/tmp/bm_v`、`/tmp/bm_d`)
 2. 起 verifier(+ drafter),`wait_health` 轮询 `/health`(超时 2400s;boot 日志出现
@@ -176,7 +183,7 @@ python3 benchmark/gsm8k/bench_sglang.py \
 
 | 规矩 | 原因 |
 |---|---|
-| one_batch 至少 2 次,判精细差异用 3–4 次取稳态 | rep1 系统性低 8–13% |
+| one_batch 至少 2 次,取 run2;判精细差异用 3–4 次 | rep1 只在 **decoupled 397B pair** 上偏冷 8–11%(环相位建立),其余 15/17 条腿 rep1≈rep2。用均值会**只低估 decoupled**,见 [04 §0.2](04-results.md#caliber) |
 | gsm8k 大差异必须复跑 | 单跑可出 15% 级离群;两次复测应互差 <1% |
 | 判 K/F **只认 one_batch** | 不同 K 的输出 token 数会变,gsm8k 分子分母同时漂 |
 | acc 用 one_batch 的 `acc_length` | `acc_server` 是自启动累计值,serving 腿上会顶到理论上限 |
