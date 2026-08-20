@@ -1,3 +1,8 @@
+> **[STALE LINE NUMBERS · 2026-08]** 本文对上游 overlap 调度器的机制描述仍然成立,可作为背景阅读;
+> 但基线落后 95 个 commit,**其中全部 file:line 已漂移**(抽查漂了 40–300 行,部分符号已不存在)。
+> 另注:文中列为"未来工作"的 `read_done` 门拓宽**已经落地**。
+> 解耦侧的当前设计见 [`docs/decoupled_spec/`](../../../../docs/decoupled_spec/README.md)。
+
 # Spec-V2 Overlap Schedule 全景（深挖版）
 
 > 为「解耦投机解码迁移到 overlap schedule」建立的运行时全景：几条流、每个节点在干什么、有哪些同步——本版把 WAR 读写两端、schedule_stream 的逐 op 清单、token buffer 的写读闭环全部下钻到 kernel/行级。

@@ -638,10 +638,11 @@ class Envs:
     SGLANG_ENABLE_DECOUPLED_PER_CASE_FANOUT = EnvBool(False)
     # Decoupled spec: explicit per-case column budget, comma separated, one
     # entry per accept case 0..K (e.g. "4,1,1,4"). Overrides the skew above
-    # when set; entries are clamped to [1, F]. Exists because the default skew
-    # spends its widest budget on case K while measured misses concentrate on
-    # case 0 -- a miss collapses the next round to case 0, whose bonus is a
-    # rank-2+ candidate, so case 0 is the escape hatch out of that state.
+    # when set -- and it is read BEFORE the enable flag, so setting it turns
+    # per-case budgets on by itself; entries are clamped to [1, F]. Exists to
+    # measure other allocations without a rebuild: the shipped skew was chosen
+    # from such a sweep ([4,1,1,2] beat uniform F=2 at the same 8 rows, and
+    # the [1,1,2,4] shape it replaced measured worst of all).
     SGLANG_DECOUPLED_PER_CASE_FANOUT_BUDGETS = EnvStr("")
 
     # Scheduler: memory leak test

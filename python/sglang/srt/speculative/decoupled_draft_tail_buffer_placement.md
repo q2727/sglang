@@ -1,3 +1,9 @@
+> **[SUPERSEDED · 2026-08]** 本文讨论的 `DraftTailBuffer` 与其响应式逐 token 数据平面
+> **在当前代码中已完全不存在**(被枚举式数据平面取代),文中的 C6 结论("门绝不与 device fence 耦合")
+> 也已被现在默认启用的 `StreamGate`(forward 流上的 host-func 节点)推翻。
+> 保留本文是为其推理过程:值依赖的对账不应变成设备分支——这仍是"GPU select + fallback"的理由。
+> **任何 file:line 都不要直接采信。** 当前设计见 [`docs/decoupled_spec/`](../../../../docs/decoupled_spec/README.md)。
+
 # Decoupled DraftTailBuffer 放置权衡:CPU vs GPU
 
 > 决策记录:decoupled verifier 的 `DraftTailBuffer` 放 CPU 还是 GPU,以及各自能拿到多少 overlap。
