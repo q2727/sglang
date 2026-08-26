@@ -449,6 +449,7 @@ class DecoupledDraftManager:
                 self.engine.open(
                     sync.draft_key,
                     req_pool_idx=int(sync.req_pool_idx),
+                    epoch=int(sync.epoch),
                     prompt_tokens=list(sync.prompt_token_ids),
                     committed_outputs=list(sync.committed_outputs),
                 )
@@ -644,6 +645,10 @@ class DecoupledDraftManager:
         if packed is None:
             return
         push_start = time.monotonic()
+        epochs = [
+            self.engine.epoch_of_seat(pool_idx)
+            for pool_idx in packed["pool_indices"]
+        ]
         if envs.SGLANG_DEBUG_DECOUPLED_BET.get() and (
             self._wire_fp_ct < 20 or self._wire_fp_ct % 20 == 0
         ):
@@ -680,6 +685,7 @@ class DecoupledDraftManager:
             fanout=self.fanout,
             pool_indices=packed["pool_indices"],
             base_committed_lens=packed["base_committed_lens"],
+            epochs=epochs,
             speculative=speculative,
         )
         units = packed["units_device"]

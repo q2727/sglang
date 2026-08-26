@@ -30,6 +30,7 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftEnumerationBufferBatch,
     DraftMeshMessage,
     DraftMeshMessageType,
+    DraftSync,
     VerifyCommit,
 )
 from sglang.srt.speculative.decoupled_spec_transport import (
@@ -92,7 +93,13 @@ class VerifierIpcThread:
         *,
         transport: BaseDecoupledSpecTransport,
         enum_buffer: DecoupledEnumBuffer,
+        filter_block: Optional[
+            Callable[
+                [DraftEnumerationBufferBatch], Optional[DraftEnumerationBufferBatch]
+            ]
+        ] = None,
         on_land: Optional[Callable[[DraftEnumerationBufferBatch], None]] = None,
+        on_resync_sent: Optional[Callable[[DraftSync], None]] = None,
         num_drafters: int = 1,
         src_verifier_rank: int = 0,
         land_stream: Optional[torch.cuda.Stream] = None,
@@ -107,9 +114,16 @@ class VerifierIpcThread:
         # routed to another verifier, so this thread does no rank check of its
         # own -- only envelope validation.
         self.enum_buffer = enum_buffer
+        # Runs before land(): stale rows must never overwrite the current
+        # seat's GPU buffer, even briefly.
+        self._filter_block = filter_block
         # Post-land hook (runs on this thread, after the scatter is enqueued);
         # the verify manager mirrors arrival stamps here for the sync-mode gate.
         self._on_land = on_land
+        # A desync sync is rewritten from this thread's wire ledger just
+        # before send. Notify the manager of that exact high-water mark so
+        # its next expected block uses the same base.
+        self._on_resync_sent = on_resync_sent
         self._send_queue: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()
         # Evented commits (copy_done pattern): handoff queue plus the
         # thread-local FIFO whose head gates on its round's copy_done event --
@@ -123,6 +137,7 @@ class VerifierIpcThread:
         # builds, retired by DraftClose. Owning it here (not mirroring the
         # scheduler's) keeps the wire stream self-consistent by construction.
         self._sent_committed_lens: dict[str, int] = {}
+        self._sent_committed_outputs: dict[str, list[int]] = {}
         # Desync re-seed floors (see _drain_send_queue): rid -> the snapshot
         # length its in-flight rounds must clear before commits resume.
         self._resync_floors: dict[str, int] = {}
@@ -215,15 +230,28 @@ class VerifierIpcThread:
             # them would double-apply on the re-opened seat.
             for sync in batch.sync_messages:
                 if sync.desync_reseed:
+                    wire_outputs = self._sent_committed_outputs.get(sync.request_id)
+                    if wire_outputs is not None:
+                        # The scheduler's req.output_ids can trail the evented
+                        # relay by one whole verify result. Re-seed from what
+                        # was actually sent, otherwise the next commit starts
+                        # beyond the re-opened draft prefix.
+                        sync.committed_outputs = list(wire_outputs)
                     self._resync_floors[sync.request_id] = len(sync.committed_outputs)
+                    if self._on_resync_sent is not None:
+                        self._on_resync_sent(sync)
                 else:
                     self._sent_committed_lens[sync.request_id] = len(
+                        sync.committed_outputs
+                    )
+                    self._sent_committed_outputs[sync.request_id] = list(
                         sync.committed_outputs
                     )
                     self._resync_floors.pop(sync.request_id, None)
                 self._closed_rids.discard(sync.request_id)
             for close in batch.close_messages:
                 self._sent_committed_lens.pop(close.request_id, None)
+                self._sent_committed_outputs.pop(close.request_id, None)
                 self._resync_floors.pop(close.request_id, None)
                 if close.request_id not in self._closed_rids:
                     if len(self._closed_rid_ring) == self._closed_rid_ring.maxlen:
@@ -308,6 +336,9 @@ class VerifierIpcThread:
             # every later commit gets attributed to the wrong absolute base
             # and the drafter's alignment check passes on corrupt splices.
             self._sent_committed_lens[rid] = pre_len + len(tokens)
+            self._sent_committed_outputs.setdefault(rid, []).extend(
+                int(token) for token in tokens
+            )
             floor = self._resync_floors.get(rid)
             if floor is not None:
                 if pre_len + len(tokens) <= floor:
@@ -367,6 +398,10 @@ class VerifierIpcThread:
         while (message := self.transport.try_recv()) is not None:
             did_work = True
             block = self._route_enumeration_message(message)
+            if self._filter_block is not None:
+                block = self._filter_block(block)
+                if block is None:
+                    continue
             # Verifier routing (wrong-verifier reject), validate(), and the
             # seat-range guard all live in land(); the SYNC scatter runs on the
             # current stream (6.3 moves it to a copy stream), or on the

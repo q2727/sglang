@@ -34,6 +34,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -156,10 +157,13 @@ class EnumArrivalBoard:
 
 
 class _ReqState:
-    def __init__(self, *, pool_idx: int, prompt_len: int, committed_len: int) -> None:
+    def __init__(
+        self, *, pool_idx: int, prompt_len: int, committed_len: int, epoch: int
+    ) -> None:
         self.pool_idx = pool_idx
         self.prompt_len = prompt_len
         self.committed_len = committed_len  # committed OUTPUT tokens
+        self.epoch = epoch
 
     @property
     def total_committed_len(self) -> int:
@@ -186,6 +190,10 @@ class DecoupledVerifyManager:
         self.num_drafters = max(1, len(ipc_config.connect_endpoints))
 
         self._rid_states: dict[str, _ReqState] = {}
+        # Never delete a seat counter: a late block from a finished request
+        # must not become valid when the same physical seat is reused.
+        self._seat_epochs: dict[int, int] = {}
+        self._stale_epoch_drop_ct = 0
         # Per-seat expected stamp for the NEXT decode round's select (armed by
         # each gate call from the batch it gated; seeded by DraftSync).
         self._gate_expected: dict[int, int] = {}
@@ -331,7 +339,9 @@ class DecoupledVerifyManager:
         self.ipc_thread = VerifierIpcThread(
             transport=transport,
             enum_buffer=verify_worker.enum_buffer,
+            filter_block=self._filter_block_epoch,
             on_land=self._on_block_landed,
+            on_resync_sent=self._on_resync_sent,
             num_drafters=self.num_drafters,
             src_verifier_rank=ipc_config.rank,
             land_stream=self.land_stream,
@@ -546,6 +556,89 @@ class DecoupledVerifyManager:
             self._prof_transport_ct += 1
         self.arrival_board.record(block)
 
+    def _filter_block_epoch(
+        self, block: DraftEnumerationBufferBatch
+    ) -> Optional[DraftEnumerationBufferBatch]:
+        """Drop rows emitted before the latest DraftSync for their seat."""
+        block.validate()
+        keep = [
+            i
+            for i, (seat, epoch) in enumerate(zip(block.pool_indices, block.epochs))
+            if self._seat_epochs.get(int(seat)) == int(epoch)
+        ]
+        if len(keep) == block.batch_size:
+            return block
+
+        dropped = block.batch_size - len(keep)
+        self._stale_epoch_drop_ct += dropped
+        if self._stale_epoch_drop_ct <= 10 or self._stale_epoch_drop_ct % 100 == 0:
+            logger.info(
+                "decoupled verifier dropped %d stale-epoch row(s), total=%d: "
+                "seats=%s epochs=%s current=%s",
+                dropped,
+                self._stale_epoch_drop_ct,
+                block.pool_indices,
+                block.epochs,
+                [self._seat_epochs.get(int(seat)) for seat in block.pool_indices],
+            )
+        if not keep:
+            return None
+
+        tokens: list[int] = []
+        for i in keep:
+            tokens.extend(block.row_tokens(i))
+        return replace(
+            block,
+            pool_indices=[block.pool_indices[i] for i in keep],
+            base_committed_lens=[block.base_committed_lens[i] for i in keep],
+            epochs=[block.epochs[i] for i in keep],
+            tokens=tuple(tokens),
+            rids=[block.rids[i] for i in keep] if block.rids else [],
+        )
+
+    def _on_resync_sent(self, sync: DraftSync) -> None:
+        """Adopt the IPC wire high-water used by the actual re-seed."""
+        state = self._rid_states.get(sync.request_id)
+        seat = int(sync.req_pool_idx)
+        if (
+            state is None
+            or state.pool_idx != seat
+            or state.epoch != int(sync.epoch)
+            or self._seat_epochs.get(seat) != int(sync.epoch)
+        ):
+            return
+        state.committed_len = max(state.committed_len, len(sync.committed_outputs))
+        self._gate_expected[seat] = state.total_committed_len
+        self._seat_timeout_streaks.pop(seat, None)
+        rank = self._drafter_rank_of(seat)
+        self._drafter_timeout_streaks[rank] = 0
+        self._drafter_cooldown_until.pop(rank, None)
+        logger.info(
+            "decoupled re-seed epoch=%d seat=%d adopted wire base=%d",
+            state.epoch,
+            seat,
+            state.total_committed_len,
+        )
+
+    def _force_ahead_resync(
+        self, expected: dict[int, int], landed: dict[int, Optional[int]]
+    ) -> None:
+        """A skipped generation cannot heal by waiting; re-seed immediately."""
+        for seat, stamp in expected.items():
+            got = landed.get(seat)
+            if got is None or got <= stamp or seat in self._force_resync_seats:
+                continue
+            self._force_resync_seats.add(seat)
+            self._gate_resync_ct += 1
+            logger.info(
+                "decoupled gate: seat %d landed ahead (expected=%d landed=%d) "
+                "-- forcing epoch re-seed #%d",
+                seat,
+                stamp,
+                got,
+                self._gate_resync_ct,
+            )
+
     def _collect_gate_expected(self, batch: ScheduleBatch) -> dict[int, int]:
         """Seats this round's gate covers -> expected stamp. A seat with no
         armed expectation (first decode round: under overlap even its
@@ -740,6 +833,7 @@ class DecoupledVerifyManager:
                     self._skip_log_ct,
                     ahead,
                 )
+                self._force_ahead_resync(expected, snapshot)
         if expected and self.arrival_wait_s > 0 and self._stream_gate is not None:
             budget_s = self._gate_budget_s()
             if self._stream_gate.enqueue(
@@ -913,7 +1007,9 @@ class DecoupledVerifyManager:
                 pool_idx=req.req_pool_idx,
                 prompt_len=len(req.origin_input_ids),
                 committed_len=len(req.output_ids),
+                epoch=self._seat_epochs.get(int(req.req_pool_idx), 0) + 1,
             )
+            self._seat_epochs[int(req.req_pool_idx)] = state.epoch
             self._rid_states[req.rid] = state
             drafter_rank = self._drafter_rank_of(req.req_pool_idx)
             self._control_batch_for(control_batches, drafter_rank).sync_messages.append(
@@ -922,6 +1018,7 @@ class DecoupledVerifyManager:
                     src_verifier_rank=self.ipc_config.rank,
                     dst_drafter_rank=drafter_rank,
                     req_pool_idx=req.req_pool_idx,
+                    epoch=state.epoch,
                     prompt_token_ids=list(req.origin_input_ids),
                     committed_outputs=list(req.output_ids),
                     desync_reseed=desync_reseed,
@@ -946,7 +1043,10 @@ class DecoupledVerifyManager:
             # first and processes M afterwards (this hook arms gate M+2 ->
             # POST-delta total, T_M).
             pre_delta_total = state.total_committed_len
-            state.committed_len = len(req.output_ids)
+            # The evented commit relay can be one verify result ahead of the
+            # scheduler's output_ids. Never regress a wire-ledger high-water
+            # adopted by _on_resync_sent.
+            state.committed_len = max(state.committed_len, len(req.output_ids))
             self._gate_expected[state.pool_idx] = (
                 state.total_committed_len if overlap else pre_delta_total
             )

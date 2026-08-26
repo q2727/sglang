@@ -60,6 +60,7 @@ def _block(
         fanout=fanout,
         pool_indices=list(pool_indices),
         base_committed_lens=list(bases),
+        epochs=[1] * len(pool_indices),
         tokens=tokens,
     )
 

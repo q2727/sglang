@@ -43,9 +43,10 @@ _IDLE_WAIT_S = 0.001
 
 
 class _MirrorState:
-    def __init__(self, *, pool_idx: int, total_committed_len: int) -> None:
+    def __init__(self, *, pool_idx: int, total_committed_len: int, epoch: int) -> None:
         self.pool_idx = pool_idx
         self.total_committed_len = total_committed_len
+        self.epoch = epoch
 
 
 class ScriptedFakeDrafter:
@@ -106,6 +107,7 @@ class ScriptedFakeDrafter:
             for sync in ready.sync_messages:
                 self._states[sync.draft_key] = _MirrorState(
                     pool_idx=int(sync.req_pool_idx),
+                    epoch=int(sync.epoch),
                     total_committed_len=(
                         len(sync.prompt_token_ids) + len(sync.committed_outputs)
                     ),
@@ -125,6 +127,7 @@ class ScriptedFakeDrafter:
     ) -> DraftEnumerationBufferBatch:
         pool_indices: list[int] = []
         base_committed_lens: list[int] = []
+        epochs: list[int] = []
         seen: set[int] = set()
         for draft_key in draft_keys:
             state = self._states.get(draft_key)
@@ -132,6 +135,7 @@ class ScriptedFakeDrafter:
                 continue
             seen.add(state.pool_idx)
             pool_indices.append(state.pool_idx)
+            epochs.append(state.epoch)
             stamp = state.total_committed_len
             if self.mode == "stale":
                 stamp -= 1  # always one behind -> deterministic staleness miss
@@ -146,5 +150,6 @@ class ScriptedFakeDrafter:
             fanout=self.fanout,
             pool_indices=pool_indices,
             base_committed_lens=base_committed_lens,
+            epochs=epochs,
             tokens=tokens,
         )

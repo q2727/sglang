@@ -42,6 +42,7 @@ def _control_msg(rid="r", drafter_rank=0) -> DraftMeshMessage:
                 src_verifier_rank=0,
                 dst_drafter_rank=drafter_rank,
                 req_pool_idx=1,
+                epoch=1,
             )
         ],
     )
@@ -57,6 +58,7 @@ def _enum_msg(pool_idx=1, verifier_rank=0, tok=7) -> DraftMeshMessage:
         fanout=1,
         pool_indices=[pool_idx],
         base_committed_lens=[0],
+        epochs=[1],
         tokens=(tok, tok + 1, tok + 2, tok + 3),
     )
     return DraftMeshMessage.from_enumeration_buffer_batch(block)

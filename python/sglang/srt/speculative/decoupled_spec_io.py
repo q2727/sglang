@@ -60,6 +60,10 @@ class DraftSync:
     src_verifier_rank: int
     dst_drafter_rank: int
     req_pool_idx: int
+    # Monotonic incarnation of this verifier seat. A re-seed or seat reuse
+    # increments it so enumeration blocks already in flight from the previous
+    # incarnation can be rejected before they touch the verifier GPU buffer.
+    epoch: int
     prompt_token_ids: list[int] = field(default_factory=list)
     committed_outputs: list[int] = field(default_factory=list)
     # Desync re-seed (same rid, same seat, chain intact): the verifier IPC
@@ -183,6 +187,9 @@ class DraftEnumerationBufferBatch:
     fanout: int
     pool_indices: list[int] = field(default_factory=list)
     base_committed_lens: list[int] = field(default_factory=list)
+    # Parallel to pool_indices. The verifier accepts a row only when this
+    # equals the current epoch of that seat.
+    epochs: list[int] = field(default_factory=list)
     tokens: tuple[int, ...] = ()
     rids: list[str] = field(default_factory=list)
     # Drafter-side time.time() at submit; debug-profile latency only (both
@@ -229,6 +236,13 @@ class DraftEnumerationBufferBatch:
                 f"len(pool_indices)={len(self.pool_indices)} "
                 f"len(base_committed_lens)={len(self.base_committed_lens)}"
             )
+        if len(self.epochs) != len(self.pool_indices):
+            raise ValueError(
+                "DraftEnumerationBufferBatch epochs must parallel "
+                "pool_indices: "
+                f"len(epochs)={len(self.epochs)} "
+                f"len(pool_indices)={len(self.pool_indices)}"
+            )
         if self.rids and len(self.rids) != len(self.pool_indices):
             raise ValueError(
                 "DraftEnumerationBufferBatch rids, when present, must parallel "
@@ -261,6 +275,12 @@ class DraftEnumerationBufferBatch:
                     "non-negative: "
                     f"pool_idx={self.pool_indices[i]} "
                     f"base_committed_len={base_committed_len}"
+                )
+        for i, epoch in enumerate(self.epochs):
+            if int(epoch) < 1:
+                raise ValueError(
+                    "DraftEnumerationBufferBatch epochs must be positive: "
+                    f"pool_idx={self.pool_indices[i]} epoch={epoch}"
                 )
         if len(self.tokens) != self.num_tokens:
             raise ValueError(

@@ -401,11 +401,17 @@ class _PinnedH2D:
 
 class _DraftReqState:
     def __init__(
-        self, *, req_pool_idx: int, device: torch.device, max_slots: int = 0
+        self,
+        *,
+        req_pool_idx: int,
+        epoch: int,
+        device: torch.device,
+        max_slots: int = 0,
     ) -> None:
         # The seat on the OWNING VERIFIER (echoed into every block row); this
         # engine's own scratch rows are unrelated and transient.
         self.req_pool_idx = req_pool_idx
+        self.epoch = epoch
         self.committed_tokens: list[int] = []
         # Prompt prefix length inside committed_tokens: VerifyCommit bases
         # (pre_verify_committed_len) index OUTPUT tokens only, so alignment
@@ -1644,13 +1650,17 @@ class EnumDraftEngine:
         key: DraftReqKey,
         *,
         req_pool_idx: int,
+        epoch: int,
         prompt_tokens: list[int],
         committed_outputs: list[int],
     ) -> None:
         # Re-open (retraction re-sync) drops the old prefix KV entirely.
+        if int(epoch) < 1:
+            raise ValueError(f"Draft request epoch must be positive, got {epoch}")
         self.close(key)
         state = _DraftReqState(
             req_pool_idx=req_pool_idx,
+            epoch=epoch,
             device=self.device,
             max_slots=self.model_runner.req_to_token_pool.req_to_token.shape[1],
         )
@@ -3696,6 +3706,19 @@ class EnumDraftEngine:
         """The verifier seat (req_pool_idx) this key occupies, or None."""
         state = self._states.get(key)
         return None if state is None else int(state.req_pool_idx)
+
+    def epoch_of_seat(self, req_pool_idx: int) -> int:
+        matches = [
+            int(state.epoch)
+            for state in self._states.values()
+            if int(state.req_pool_idx) == int(req_pool_idx)
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Expected exactly one draft state for verifier seat "
+                f"{req_pool_idx}, found {len(matches)}"
+            )
+        return matches[0]
 
     def commit_base_aligned(
         self, key: DraftReqKey, pre_verify_committed_len: int

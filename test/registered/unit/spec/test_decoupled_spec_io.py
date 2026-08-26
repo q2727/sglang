@@ -144,6 +144,7 @@ class TestDraftControlInbox(CustomTestCase):
             src_verifier_rank=0,
             dst_drafter_rank=drafter_rank,
             req_pool_idx=1,
+            epoch=1,
         )
 
     def _close(self, rid, drafter_rank=0):
@@ -262,6 +263,7 @@ def _enum_batch(
     dst_verifier_rank=0,
     tokens=None,
     rids=(),
+    epochs=None,
 ) -> DraftEnumerationBufferBatch:
     pool_indices = list(pool_indices)
     if base_committed_lens is None:
@@ -270,6 +272,8 @@ def _enum_batch(
         # A well-formed batch_size * (K + 1) * F * (K + 1) flat block.
         row_stride = (num_steps + 1) * fanout * (num_steps + 1)
         tokens = tuple(range(len(pool_indices) * row_stride))
+    if epochs is None:
+        epochs = [1] * len(pool_indices)
     return DraftEnumerationBufferBatch(
         src_drafter_rank=src_drafter_rank,
         dst_verifier_rank=dst_verifier_rank,
@@ -277,6 +281,7 @@ def _enum_batch(
         fanout=fanout,
         pool_indices=pool_indices,
         base_committed_lens=list(base_committed_lens),
+        epochs=list(epochs),
         tokens=tokens,
         rids=list(rids),
     )
@@ -315,6 +320,14 @@ class TestDraftEnumerationBufferBatch(CustomTestCase):
         with self.assertRaises(ValueError):
             _enum_batch(pool_indices=[1, 2], base_committed_lens=[0]).validate()
 
+    def test_epochs_length_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_batch(pool_indices=[1, 2], epochs=[1]).validate()
+
+    def test_nonpositive_epoch_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_batch(pool_indices=[1], epochs=[0]).validate()
+
     def test_duplicate_pool_indices_raise(self):
         # One row per seat: duplicate pool indices would make the verifier-side
         # scatter's winning row/stamp nondeterministic.
@@ -343,6 +356,7 @@ class TestDraftEnumerationBufferBatch(CustomTestCase):
             fanout=batch.fanout,
             pool_indices=batch.pool_indices,
             base_committed_lens=batch.base_committed_lens,
+            epochs=batch.epochs,
             tokens=batch.tokens[:-1],
         )
         with self.assertRaises(ValueError):

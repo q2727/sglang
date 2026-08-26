@@ -26,6 +26,7 @@ from sglang.srt.speculative.decoupled_spec_transport import (
     build_transport,
 )
 from sglang.srt.speculative.drafter_ipc_thread import DrafterIpcThread
+from sglang.srt.speculative.decoupled_verify_manager import DecoupledVerifyManager
 from sglang.srt.speculative.verifier_ipc_thread import VerifierIpcThread
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -36,7 +37,7 @@ V_EP = "ipc:///tmp/decoupled-spec-itest-v"
 D_EP = "ipc:///tmp/decoupled-spec-itest-d"
 
 
-def _block(pool_idx=1, dst=0, tok=100) -> DraftEnumerationBufferBatch:
+def _block(pool_idx=1, dst=0, tok=100, epoch=1) -> DraftEnumerationBufferBatch:
     # Minimal K=1, F=1 enumeration block: row_stride = (K+1)*F*(K+1) = 4, one row.
     return DraftEnumerationBufferBatch(
         src_drafter_rank=0,
@@ -45,6 +46,7 @@ def _block(pool_idx=1, dst=0, tok=100) -> DraftEnumerationBufferBatch:
         fanout=1,
         pool_indices=[pool_idx],
         base_committed_lens=[0],
+        epochs=[epoch],
         tokens=(tok, tok + 1, tok + 2, tok + 3),
     )
 
@@ -92,6 +94,48 @@ def _drain_all(token):
 
 
 class TestDecoupledSpecIpcIntegration(CustomTestCase):
+    def test_epoch_filter_rejects_old_inflight_block(self):
+        manager = DecoupledVerifyManager.__new__(DecoupledVerifyManager)
+        manager._seat_epochs = {3: 2}
+        manager._stale_epoch_drop_ct = 0
+
+        self.assertIsNone(manager._filter_block_epoch(_block(pool_idx=3, epoch=1)))
+        current = _block(pool_idx=3, epoch=2)
+        self.assertIs(manager._filter_block_epoch(current), current)
+        self.assertEqual(manager._stale_epoch_drop_ct, 1)
+
+    def test_desync_reseed_uses_wire_ledger_high_water(self):
+        _mesh, v_tp, d_tp, _enum_buffer, proxy, token = self._wire()
+        adopted = []
+        proxy._on_resync_sent = adopted.append
+        proxy._sent_committed_lens["r"] = 3
+        proxy._sent_committed_outputs["r"] = [10, 11, 12]
+        try:
+            proxy.submit_control_batch(
+                DraftControlBatch(
+                    dst_drafter_rank=0,
+                    sync_messages=[
+                        DraftSync(
+                            request_id="r",
+                            src_verifier_rank=0,
+                            dst_drafter_rank=0,
+                            req_pool_idx=3,
+                            epoch=2,
+                            committed_outputs=[10],
+                            desync_reseed=True,
+                        )
+                    ],
+                )
+            )
+            proxy._step()
+            token._step()
+            ready = _drain_sync_and_close(token)
+            self.assertEqual(ready.sync_messages[0].committed_outputs, [10, 11, 12])
+            self.assertEqual(adopted[0].committed_outputs, [10, 11, 12])
+        finally:
+            v_tp.close()
+            d_tp.close()
+
     def _wire(self):
         mesh = FakeTransportMesh()
         v_tp = build_transport(
@@ -127,6 +171,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                             src_verifier_rank=0,
                             dst_drafter_rank=0,
                             req_pool_idx=3,
+                            epoch=1,
                             committed_outputs=[],
                         )
                     ],
@@ -213,6 +258,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                                 src_verifier_rank=0,
                                 dst_drafter_rank=5,
                                 req_pool_idx=1,
+                                epoch=1,
                                 committed_outputs=[],
                             )
                         ],
