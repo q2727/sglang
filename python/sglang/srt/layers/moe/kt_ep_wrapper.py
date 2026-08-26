@@ -288,9 +288,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
         """
         # 1. Process GPU weights
-        if self.num_gpu_experts > 0 and hasattr(
-            self.gpu_method, "process_weights_after_loading"
-        ):
+        if hasattr(self.gpu_method, "process_weights_after_loading"):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
@@ -322,8 +320,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.override_num_local_experts:
             moe_runner_config.num_local_experts = self.num_gpu_experts
         # Delegate to GPU method to create its runner
-        if self.num_gpu_experts > 0:
-            self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        self.gpu_method.create_moe_runner(layer, moe_runner_config)
 
     def submit(
         self,
@@ -402,28 +399,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
-        # Step 2/3: Execute the GPU subset.  Quantization backends generally do
-        # not accept a zero-expert weight tensor, so the all-CPU configuration
-        # must bypass the GPU MoE call entirely.
-        if self.num_gpu_experts == 0:
-            output = torch.zeros_like(x)
-        else:
-            topk_ids = topk_output.topk_ids
-            masked_topk_ids = mask_cpu_expert_ids(
-                topk_ids, self.num_gpu_experts
-            )
-            masked_topk_output = topk_output._replace(
-                topk_ids=masked_topk_ids
-            )
-            masked_dispatch_output = dispatch_output._replace(
-                topk_output=masked_topk_output
-            )
-            gpu_combine_input = self.gpu_method.apply(
-                layer, masked_dispatch_output
-            )
-            output = gpu_combine_input.hidden_states
+        # Step 2: Prepare GPU computation by masking CPU expert IDs
+        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+        topk_ids = topk_output.topk_ids
+        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+
+        # Create modified dispatch output for GPU computation
+        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+        masked_dispatch_output = dispatch_output._replace(
+            topk_output=masked_topk_output
+        )
+
+        # Step 3: Execute GPU expert computation (any quantization method)
+        # This runs in parallel with CPU computation
+        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
 
         # Step 4: Synchronize CPU results and merge with GPU results
+        output = gpu_combine_input.hidden_states
         if self.tp_rank == 0:
             cpu_output = self.sync(x)
             output = output + cpu_output
