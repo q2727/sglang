@@ -733,27 +733,6 @@ class DecoupledVerifyManager:
                 if snapshot.get(seat) is not None and snapshot[seat] > exp
             }
             if ahead:
-                # A catch-up merge deliberately skips intermediate block
-                # generations. Exact-stamp select cannot consume that newer
-                # block, and continuing to arm one old generation per verify
-                # round leaves the verifier in a permanent fallback chase.
-                # Re-root the drafter at the verifier's current committed
-                # prefix on the next result hook; the current round falls back
-                # once, then normal lockstep resumes.
-                newly_desynced = [
-                    seat for seat in ahead if seat not in self._force_resync_seats
-                ]
-                for seat in newly_desynced:
-                    self._force_resync_seats.add(seat)
-                    self._gate_expected.pop(seat, None)
-                    self._seat_timeout_streaks.pop(seat, None)
-                if newly_desynced:
-                    self._gate_resync_ct += len(newly_desynced)
-                    logger.info(
-                        "decoupled gate: Draft advanced past expected generation "
-                        "%s -- forcing immediate DraftSync re-seed",
-                        {seat: ahead[seat] for seat in newly_desynced},
-                    )
                 self._skip_log_ct += 1
                 logger.info(
                     "decoupled gate skip-signature #%d (landed AHEAD of "

@@ -24,6 +24,7 @@ KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-2}"
 KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-0}"
 TARGET_DISABLE_OVERLAP_SCHEDULE="${TARGET_DISABLE_OVERLAP_SCHEDULE:-0}"
 TARGET_STREAM_GATE="${TARGET_STREAM_GATE:-0}"
+TARGET_DOORBELL="${TARGET_DOORBELL:-0}"
 
 if (( K < 1 || F < 1 )); then
   echo "K and F must both be positive." >&2
@@ -119,6 +120,7 @@ wait_for_ready_log() {
 setsid env \
   SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
   SGLANG_ENABLE_DECOUPLED_STREAM_GATE="${TARGET_STREAM_GATE}" \
+  SGLANG_ENABLE_DECOUPLED_DOORBELL="${TARGET_DOORBELL}" \
   CUDA_VISIBLE_DEVICES="${GPU_ID}" \
   CUDA_MPS_PIPE_DIRECTORY="${MPS_PIPE_DIR}" \
   CUDA_MPS_LOG_DIRECTORY="${MPS_LOG_DIR}" \
@@ -204,6 +206,7 @@ printf '%s\n' \
   "draft_page_size=${DRAFT_PAGE_SIZE}" \
   "target_disable_overlap_schedule=${TARGET_DISABLE_OVERLAP_SCHEDULE}" \
   "target_stream_gate=${TARGET_STREAM_GATE}" \
+  "target_doorbell=${TARGET_DOORBELL}" \
   "draft_max_requests=${DRAFT_MAX_REQUESTS}" \
   "draft_mamba_slots=${DRAFT_MAMBA_SLOTS}" \
   "mps_pipe=${MPS_PIPE_DIR}" \
