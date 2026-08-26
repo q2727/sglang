@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
+    get_flags,
     get_parallel,
     get_schedule,
 )
@@ -73,7 +74,10 @@ def create_kt_config_from_server_args(
     Returns:
         KTConfig if KT is configured, None otherwise
     """
-    if server_args.kt_weight_path is None:
+    # The target and speculative draft are built in the same process. KT
+    # settings belong to the target only; applying them while the draft model is
+    # under construction would load target expert weights into the draft.
+    if get_flags().moe.in_speculative_scope or server_args.kt_weight_path is None:
         return None
 
     # Try to get num_layers from model config
@@ -113,8 +117,15 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     Returns:
         Modified topk_ids tensor with CPU expert IDs masked as -1
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-    return topk_ids
+    # KT consumes the original routing tensor asynchronously.  Mutating it in
+    # place here can therefore race with the CPU worker and turn valid expert
+    # ids into -1 before KT has copied them.  Return a distinct tensor for the
+    # GPU path instead.
+    return torch.where(
+        topk_ids < num_gpu_experts,
+        topk_ids,
+        torch.full_like(topk_ids, -1),
+    )
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -219,12 +230,46 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
+            # kt-kernel's inference API requires an explicit GPU-expert mask.
+            # The upstream SGLang wrapper only passed num_gpu_experts, which is
+            # an SFT-side argument and leaves inference construction missing a
+            # required parameter.  This experiment uses zero GPU experts, but
+            # constructing the prefix mask also preserves the wrapper's stated
+            # behavior for non-zero values.
+            gpu_experts_mask = None
+            if self.num_gpu_experts > 0:
+                gpu_experts_mask = torch.arange(
+                    num_experts, dtype=torch.int64, device="cpu"
+                ) < int(self.num_gpu_experts)
+
+            # DeepSeek-V4-Flash-0731 routes through the clamped MXFP4 SwiGLU
+            # path (swiglu_limit=10.0).  Propagate the model's MoE runner
+            # configuration to KT so CPU and GPU expert numerics agree.
+            moe_runner_config = getattr(layer, "moe_runner_config", None)
+            gemm1_alpha = getattr(moe_runner_config, "gemm1_alpha", None)
+            gemm1_clamp_limit = getattr(
+                moe_runner_config, "gemm1_clamp_limit", None
+            )
+            runner_swiglu_limit = getattr(
+                moe_runner_config, "swiglu_limit", None
+            )
+            swiglu_alpha = float(gemm1_alpha or 0.0)
+            swiglu_limit = float(
+                gemm1_clamp_limit
+                if gemm1_clamp_limit is not None
+                else (runner_swiglu_limit or 0.0)
+            )
+            if (self.kt_config.method or "").upper() not in ("MXFP4", "MXFP8"):
+                swiglu_alpha = 0.0
+                swiglu_limit = 0.0
+
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
+                gpu_experts_mask=gpu_experts_mask,
                 num_gpu_experts=self.num_gpu_experts,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
@@ -232,6 +277,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -241,7 +288,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
         """
         # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        if self.num_gpu_experts > 0 and hasattr(
+            self.gpu_method, "process_weights_after_loading"
+        ):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
@@ -273,7 +322,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.override_num_local_experts:
             moe_runner_config.num_local_experts = self.num_gpu_experts
         # Delegate to GPU method to create its runner
-        self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        if self.num_gpu_experts > 0:
+            self.gpu_method.create_moe_runner(layer, moe_runner_config)
 
     def submit(
         self,
@@ -352,23 +402,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
-        # Step 2: Prepare GPU computation by masking CPU expert IDs
-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-        topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
-
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
-        )
-
-        # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+        # Step 2/3: Execute the GPU subset.  Quantization backends generally do
+        # not accept a zero-expert weight tensor, so the all-CPU configuration
+        # must bypass the GPU MoE call entirely.
+        if self.num_gpu_experts == 0:
+            output = torch.zeros_like(x)
+        else:
+            topk_ids = topk_output.topk_ids
+            masked_topk_ids = mask_cpu_expert_ids(
+                topk_ids, self.num_gpu_experts
+            )
+            masked_topk_output = topk_output._replace(
+                topk_ids=masked_topk_ids
+            )
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=masked_topk_output
+            )
+            gpu_combine_input = self.gpu_method.apply(
+                layer, masked_dispatch_output
+            )
+            output = gpu_combine_input.hidden_states
 
         # Step 4: Synchronize CPU results and merge with GPU results
-        output = gpu_combine_input.hidden_states
         if self.tp_rank == 0:
             cpu_output = self.sync(x)
             output = output + cpu_output
