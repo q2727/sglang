@@ -135,16 +135,54 @@ def summarize(
         "latency_median_s": statistics.median(latencies) if latencies else None,
         "throughput_tok_s": tokens / sum(latencies) if latencies else None,
     }
-    if rounds:
+    records_with_accept_length = [
+        record for record in records if record.get("spec_accept_length") is not None
+    ]
+    if rounds and records_with_accept_length:
+        weighted_rounds = sum(
+            int(record.get("spec_verify_ct", 0))
+            for record in records_with_accept_length
+        )
+        weighted_tau = (
+            sum(
+                float(record["spec_accept_length"])
+                * int(record.get("spec_verify_ct", 0))
+                for record in records_with_accept_length
+            )
+            / weighted_rounds
+            if weighted_rounds
+            else None
+        )
+        rate_rounds = sum(
+            int(record.get("spec_verify_ct", 0))
+            for record in records_with_accept_length
+            if record.get("spec_accept_rate") is not None
+        )
+        weighted_acceptance_rate = (
+            sum(
+                float(record["spec_accept_rate"])
+                * int(record.get("spec_verify_ct", 0))
+                for record in records_with_accept_length
+                if record.get("spec_accept_rate") is not None
+            )
+            / rate_rounds
+            if rate_rounds
+            else None
+        )
         summary.update(
             {
                 "verify_rounds": rounds,
-                "accepted_draft_tokens": accepted,
-                "drafted_tokens": drafted,
-                "acceptance_rate": accepted / drafted if drafted else None,
-                "tau": (accepted + rounds) / rounds,
+                "acceptance_rate": weighted_acceptance_rate,
+                "tau": weighted_tau,
             }
         )
+        if accepted or drafted:
+            summary.update(
+                {
+                    "accepted_draft_tokens": accepted,
+                    "drafted_tokens": drafted,
+                }
+            )
     output_path.with_suffix(".jsonl.summary.json").write_text(
         json.dumps(summary, indent=2) + "\n"
     )
