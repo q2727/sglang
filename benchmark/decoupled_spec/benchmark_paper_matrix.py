@@ -158,6 +158,7 @@ def main() -> None:
     parser.add_argument("--dataset-dir", type=Path, required=True)
     parser.add_argument("--dataset", choices=DATASETS, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--warmup-requests", type=int, default=0)
     parser.add_argument("--max-input-tokens", type=int, default=4096)
     parser.add_argument("--request-timeout", type=float, default=300.0)
     parser.add_argument("--apply-chat-template", action="store_true")
@@ -171,6 +172,29 @@ def main() -> None:
     records = read_jsonl(args.output)
     validate_resume(records, prompts, args.dataset, args.label)
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+
+    if args.warmup_requests < 0:
+        raise ValueError("--warmup-requests must be non-negative")
+    for warmup_index in range(args.warmup_requests):
+        prompt = prompts[warmup_index % len(prompts)]
+        input_text = prompt["text"]
+        if args.apply_chat_template:
+            input_text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": input_text}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=args.enable_thinking,
+            )
+        input_ids = tokenizer.encode(input_text, add_special_tokens=False)
+        result = generate(
+            args.url, input_ids, args.max_new_tokens, args.request_timeout
+        )
+        print(
+            f"[warmup {warmup_index + 1}/{args.warmup_requests}] "
+            f"input={len(input_ids)} output={result['completion_tokens']} "
+            f"latency={result['latency_s']:.3f}s",
+            flush=True,
+        )
 
     with args.output.open("a") as output:
         for ordinal in range(len(records), len(prompts)):

@@ -64,6 +64,7 @@ TARGET_DISABLE_OVERLAP_SCHEDULE=0 TARGET_STREAM_GATE=0 \
 DRAFT_PAGE_SIZE=1 DRAFT_MAX_TOKENS=4096 \
 "${SCRIPT_DIR}/launch_kt_same_gpu.sh"
 
+warmup_requests=1
 for dataset in "${DATASETS[@]}"; do
   "${PYTHON_BIN}" "${SCRIPT_DIR}/benchmark_paper_matrix.py" \
     --url "http://127.0.0.1:${TARGET_PORT}" \
@@ -71,11 +72,13 @@ for dataset in "${DATASETS[@]}"; do
     --dataset-dir "${DATASET_DIR}" \
     --dataset "${dataset}" \
     --max-new-tokens "${MAX_NEW_TOKENS}" \
+    --warmup-requests "${warmup_requests}" \
     --max-input-tokens 4096 \
     --request-timeout 300 \
     --apply-chat-template \
     --label "${LABEL}" \
     --output "${MATRIX_ROOT}/records/${dataset}.jsonl"
+  warmup_requests=0
 done
 
 touch "${MATRIX_ROOT}/DONE"
