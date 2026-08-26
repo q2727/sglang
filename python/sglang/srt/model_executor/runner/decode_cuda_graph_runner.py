@@ -285,7 +285,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner, self.captured_req_width
         )
         if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+            # KT keys its CPU-MoE buffers by flattened tokens, while capture_bs
+            # is measured in requests. Preserve shapes registered by other graph
+            # runners because every captured graph retains those buffer addresses.
+            kt_capture_bs = {bs * self.captured_req_width for bs in self.capture_bs}
+            kt_capture_bs.update(KTMoEWrapper.get_capture_batch_sizes())
+            KTMoEWrapper.set_capture_batch_sizes(sorted(kt_capture_bs))
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
