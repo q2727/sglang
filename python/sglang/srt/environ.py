@@ -476,10 +476,6 @@ class Envs:
     # poisoned in the fixed-shape block, so the verifier needs no change.
     # Active only when SGLANG_DECOUPLED_ENUM_WAIT_MS > 0.
     SGLANG_ENABLE_DECOUPLED_ADAPTIVE_FANOUT = EnvBool(True)
-    # Decoupled spec: consume exactly one verifier generation per draft round,
-    # even when the commit inbox briefly exceeds the catch-up threshold. This
-    # avoids skipping enumeration generations when D is known to fit inside T.
-    SGLANG_DECOUPLED_STRICT_LOCKSTEP = EnvBool(False)
     # Decoupled spec: ship enumeration blocks through a pinned staging ring +
     # CUDA event consumed on the drafter's IPC thread (the copy_done pattern)
     # instead of a blocking D2H on the drafter loop. ZMQ data plane only.
