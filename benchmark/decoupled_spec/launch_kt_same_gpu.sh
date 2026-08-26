@@ -16,11 +16,14 @@ TARGET_SM_PERCENT="${TARGET_SM_PERCENT:-75}"
 DRAFT_SM_PERCENT="${DRAFT_SM_PERCENT:-25}"
 TARGET_MEM_FRACTION="${TARGET_MEM_FRACTION:-0.60}"
 DRAFT_MEM_FRACTION="${DRAFT_MEM_FRACTION:-0.24}"
+DRAFT_PAGE_SIZE="${DRAFT_PAGE_SIZE:-1}"
 TARGET_MAX_TOKENS="${TARGET_MAX_TOKENS:-8192}"
 DRAFT_MAX_TOKENS="${DRAFT_MAX_TOKENS:-4096}"
 KT_CPU_INFER="${KT_CPU_INFER:-120}"
 KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-2}"
 KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-0}"
+TARGET_DISABLE_OVERLAP_SCHEDULE="${TARGET_DISABLE_OVERLAP_SCHEDULE:-0}"
+TARGET_STREAM_GATE="${TARGET_STREAM_GATE:-0}"
 
 if (( K < 1 || F < 1 )); then
   echo "K and F must both be positive." >&2
@@ -60,6 +63,11 @@ DRAFT_ENDPOINT="ipc:///tmp/${USER}-ssd-enum-gpu${GPU_ID}-draft"
 VERIFY_ENDPOINT_PATH="${VERIFY_ENDPOINT#ipc://}"
 DRAFT_ENDPOINT_PATH="${DRAFT_ENDPOINT#ipc://}"
 SOURCE_PYTHONPATH="${REPO_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
+
+TARGET_SCHEDULER_ARGS=()
+if [[ "${TARGET_DISABLE_OVERLAP_SCHEDULE}" == "1" ]]; then
+  TARGET_SCHEDULER_ARGS+=(--disable-overlap-schedule)
+fi
 
 mkdir -p "${RUN_DIR}" "${MPS_PIPE_DIR}" "${MPS_LOG_DIR}"
 ln -sfn "${RUN_DIR}" "${RUN_BASE}/latest"
@@ -109,6 +117,7 @@ wait_for_ready_log() {
 
 setsid env \
   SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
+  SGLANG_ENABLE_DECOUPLED_STREAM_GATE="${TARGET_STREAM_GATE}" \
   CUDA_VISIBLE_DEVICES="${GPU_ID}" \
   CUDA_MPS_PIPE_DIRECTORY="${MPS_PIPE_DIR}" \
   CUDA_MPS_LOG_DIRECTORY="${MPS_LOG_DIR}" \
@@ -122,7 +131,7 @@ setsid env \
   --max-running-requests 2 --max-total-tokens "${TARGET_MAX_TOKENS}" \
   --chunked-prefill-size 2048 --max-prefill-tokens 4096 \
   --disable-prefill-cuda-graph --skip-server-warmup --trust-remote-code \
-  --disable-radix-cache --disable-overlap-schedule --disable-shared-experts-fusion \
+  --disable-radix-cache "${TARGET_SCHEDULER_ARGS[@]}" --disable-shared-experts-fusion \
   --kt-weight-path "${TARGET_MODEL}" --kt-method BF16 \
   --kt-cpuinfer "${KT_CPU_INFER}" --kt-threadpool-count "${KT_THREADPOOL_COUNT}" \
   --kt-num-gpu-experts "${KT_NUM_GPU_EXPERTS}" \
@@ -162,7 +171,7 @@ setsid env \
   PYTHONPATH="${SOURCE_PYTHONPATH}" \
   "${PYTHON_BIN}" -m sglang.launch_server \
   --host 127.0.0.1 --port "${DRAFT_PORT}" \
-  --model-path "${DRAFT_MODEL}" --tp 1 --attention-backend triton --page-size 1 \
+  --model-path "${DRAFT_MODEL}" --tp 1 --attention-backend triton --page-size "${DRAFT_PAGE_SIZE}" \
   --mem-fraction-static "${DRAFT_MEM_FRACTION}" \
   --max-running-requests "${DRAFT_MAX_REQUESTS}" --max-total-tokens "${DRAFT_MAX_TOKENS}" \
   --chunked-prefill-size 1024 --max-prefill-tokens 2048 \
@@ -190,6 +199,9 @@ printf '%s\n' \
   "branch_rows=${BRANCH_ROWS}" \
   "target_sm=${TARGET_SM_PERCENT}" \
   "draft_sm=${DRAFT_SM_PERCENT}" \
+  "draft_page_size=${DRAFT_PAGE_SIZE}" \
+  "target_disable_overlap_schedule=${TARGET_DISABLE_OVERLAP_SCHEDULE}" \
+  "target_stream_gate=${TARGET_STREAM_GATE}" \
   "draft_max_requests=${DRAFT_MAX_REQUESTS}" \
   "draft_mamba_slots=${DRAFT_MAMBA_SLOTS}" \
   "mps_pipe=${MPS_PIPE_DIR}" \
