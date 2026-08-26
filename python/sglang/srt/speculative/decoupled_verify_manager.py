@@ -623,10 +623,18 @@ class DecoupledVerifyManager:
     def _force_ahead_resync(
         self, expected: dict[int, int], landed: dict[int, Optional[int]]
     ) -> None:
-        """A skipped generation cannot heal by waiting; re-seed immediately."""
+        """Re-seed only after the expected block fell out of the 2-gen ring."""
         for seat, stamp in expected.items():
             got = landed.get(seat)
-            if got is None or got <= stamp or seat in self._force_resync_seats:
+            # The enum buffer retains the two newest real generations. When
+            # landed == expected + 1, the expected block is still in the other
+            # slot and exact-stamp selection remains valid. A gap of two or
+            # more means it has been overwritten and cannot heal by waiting.
+            if (
+                got is None
+                or got - stamp < 2
+                or seat in self._force_resync_seats
+            ):
                 continue
             self._force_resync_seats.add(seat)
             self._gate_resync_ct += 1

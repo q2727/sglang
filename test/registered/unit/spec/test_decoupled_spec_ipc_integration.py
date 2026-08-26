@@ -136,6 +136,17 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
             v_tp.close()
             d_tp.close()
 
+    def test_ahead_resync_respects_two_generation_ring(self):
+        manager = DecoupledVerifyManager.__new__(DecoupledVerifyManager)
+        manager._force_resync_seats = set()
+        manager._gate_resync_ct = 0
+
+        manager._force_ahead_resync({3: 10}, {3: 11})
+        self.assertEqual(manager._force_resync_seats, set())
+        manager._force_ahead_resync({3: 10}, {3: 12})
+        self.assertEqual(manager._force_resync_seats, {3})
+        self.assertEqual(manager._gate_resync_ct, 1)
+
     def _wire(self):
         mesh = FakeTransportMesh()
         v_tp = build_transport(
