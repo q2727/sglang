@@ -49,16 +49,14 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
     DraftEnumerationBufferBatch,
     DraftSync,
+    VerifyCommit,
 )
 from sglang.srt.speculative.decoupled_spec_transport import (
     DecoupledSpecTransportKind,
     FakeTransportMesh,
     build_transport,
 )
-from sglang.srt.speculative.verifier_ipc_thread import (
-    EventedVerifyCommits,
-    VerifierIpcThread,
-)
+from sglang.srt.speculative.verifier_ipc_thread import VerifierIpcThread
 from sglang.srt.utils.nvtx_utils import profile_range
 
 if TYPE_CHECKING:
@@ -74,7 +72,7 @@ _LOOPBACK_DRAFTER_ENDPOINT = "loopback://decoupled-spec-drafter"
 # drafter sick; its seats are not waited on for the cooldown (one W burned per
 # cooldown instead of per round). Any landed block clears it. Real failover
 # is 5c's job -- this only bounds the damage of a dead peer.
-_QUARANTINE_TIMEOUT_STREAK = 3
+_QUARANTINE_TIMEOUT_STREAK = 8
 _QUARANTINE_COOLDOWN_S = 5.0
 
 
@@ -113,7 +111,9 @@ class EnumArrivalBoard:
     def record_pairs(self, pool_indices: list[int], stamps: list[int]) -> None:
         with self._cond:
             for pool_idx, stamp in zip(pool_indices, stamps):
-                self._stamps[int(pool_idx)] = int(stamp)
+                seat = int(pool_idx)
+                value = int(stamp)
+                self._stamps[seat] = value
             self._cond.notify_all()
 
     def reset_seat(self, pool_idx: int) -> None:
@@ -158,10 +158,19 @@ class EnumArrivalBoard:
 
 class _ReqState:
     def __init__(
-        self, *, pool_idx: int, prompt_len: int, committed_len: int, epoch: int
+        self,
+        *,
+        pool_idx: int,
+        prompt_token_ids: list[int],
+        committed_len: int,
+        epoch: int,
     ) -> None:
         self.pool_idx = pool_idx
-        self.prompt_len = prompt_len
+        # SGLang may trim or restage req.origin_input_ids after prefill. Keep
+        # the exact prompt announced by the first DraftSync so every later
+        # re-seed uses the same token prefix and length on both peers.
+        self.prompt_token_ids = tuple(int(t) for t in prompt_token_ids)
+        self.prompt_len = len(self.prompt_token_ids)
         self.committed_len = committed_len  # committed OUTPUT tokens
         self.epoch = epoch
 
@@ -347,16 +356,16 @@ class DecoupledVerifyManager:
             land_stream=self.land_stream,
         )
         self.ipc_thread.start()
-        # The worker calls the gate at decode-launch, before its select gather,
-        # and relays each round's result for evented commit sending. With the
-        # doorbell armed the gate enqueues device-side waits instead of
-        # parking the host.
+        # The worker calls the gate at decode-launch, before its select gather.
+        # Verify commits deliberately come from on_batch_result's finalized
+        # output_ids below: the earlier evented raw-result relay could diverge
+        # from scheduler-visible tokens under overlap.
         verify_worker.select_gate = (
             self.enqueue_doorbell_gate
             if self.doorbell is not None
             else self.wait_for_select_blocks
         )
-        verify_worker.commit_relay = self._relay_round_commits
+        verify_worker.commit_relay = None
 
         self._ipc_poll_closed = threading.Event()
         self._ipc_poll_thread: Optional[threading.Thread] = None
@@ -479,19 +488,6 @@ class DecoupledVerifyManager:
             self.scripted_drafter.close()
         self.ipc_thread.close()
 
-    def _relay_round_commits(self, batch: ScheduleBatch, batch_result) -> None:
-        """Hand one decode round's result to the IPC thread (copy_done
-        pattern): commits hit the wire at forward end + copy, not when the
-        scheduler thread gets around to the deferred result processing."""
-        self.ipc_thread.submit_evented_commits(
-            EventedVerifyCommits(
-                result=batch_result,
-                rids=[req.rid for req in batch.reqs],
-                pool_indices=[int(req.req_pool_idx) for req in batch.reqs],
-                submitted_ts=time.monotonic(),
-            )
-        )
-
     def _track_drafter_timeouts(
         self, expected: dict[int, int], landed: dict[int, Optional[int]], *, now: float
     ) -> None:
@@ -502,22 +498,18 @@ class DecoupledVerifyManager:
             streak = self._seat_timeout_streaks.get(seat, 0) + 1
             self._seat_timeout_streaks[seat] = streak
             if streak >= 4 and now - self._seat_resync_last.get(seat, 0.0) >= 5.0:
-                # Past the anneal (2): this lag is beyond what a longer wait
-                # heals. Queue a full re-seed; the next on_batch_result emits
-                # the DraftSync. The 5s cooldown bounds the re-prefill tax:
-                # against the readiness-lag basin (commit copy_to_cpu queued
-                # on the scheduler thread BEHIND the gate under overlap) a
-                # re-seed only re-rolls the lock lottery -- 500ms retriggering
-                # was measured to cost more than the desync itself (resync
-                # churn, 21-45 tok/s). The real cure for that basin is
-                # launch-time result staging (push-model), not more re-seeds.
+                # A behind stamp cannot catch up one-for-one: each fallback
+                # creates one new commit and therefore only one new draft
+                # generation. Collapse that fixed lag from the wire ledger.
+                # Ahead stamps are deliberately never re-seeded because this
+                # host estimate does not encode variable accept lengths.
                 self._seat_resync_last[seat] = now
                 self._force_resync_seats.add(seat)
                 self._gate_resync_ct += 1
                 if self._gate_resync_ct <= 10 or self._gate_resync_ct % 50 == 0:
                     logger.info(
-                        "decoupled gate: seat %d desynced (%d consecutive "
-                        "timeouts, expected=%d landed=%s) -- forcing DraftSync "
+                        "decoupled gate: seat %d behind for %d consecutive "
+                        "timeouts (expected=%d landed=%s) -- forcing DraftSync "
                         "re-seed #%d",
                         seat,
                         streak,
@@ -607,7 +599,10 @@ class DecoupledVerifyManager:
             or self._seat_epochs.get(seat) != int(sync.epoch)
         ):
             return
-        state.committed_len = max(state.committed_len, len(sync.committed_outputs))
+        # The IPC thread has reconciled scheduler and wire prefixes to their
+        # longest verified high-water. Adopt that exact snapshot; max() here
+        # would reintroduce a stamp that was not in the reconciled prefix.
+        state.committed_len = len(sync.committed_outputs)
         self._gate_expected[seat] = state.total_committed_len
         self._seat_timeout_streaks.pop(seat, None)
         rank = self._drafter_rank_of(seat)
@@ -620,33 +615,6 @@ class DecoupledVerifyManager:
             state.total_committed_len,
         )
 
-    def _force_ahead_resync(
-        self, expected: dict[int, int], landed: dict[int, Optional[int]]
-    ) -> None:
-        """Re-seed only after the expected block fell out of the 2-gen ring."""
-        for seat, stamp in expected.items():
-            got = landed.get(seat)
-            # The enum buffer retains the two newest real generations. When
-            # landed == expected + 1, the expected block is still in the other
-            # slot and exact-stamp selection remains valid. A gap of two or
-            # more means it has been overwritten and cannot heal by waiting.
-            if (
-                got is None
-                or got - stamp < 2
-                or seat in self._force_resync_seats
-            ):
-                continue
-            self._force_resync_seats.add(seat)
-            self._gate_resync_ct += 1
-            logger.info(
-                "decoupled gate: seat %d landed ahead (expected=%d landed=%d) "
-                "-- forcing epoch re-seed #%d",
-                seat,
-                stamp,
-                got,
-                self._gate_resync_ct,
-            )
-
     def _collect_gate_expected(self, batch: ScheduleBatch) -> dict[int, int]:
         """Seats this round's gate covers -> expected stamp. A seat with no
         armed expectation (first decode round: under overlap even its
@@ -655,8 +623,25 @@ class DecoupledVerifyManager:
         quarantined drafter are skipped the same way."""
         now = time.monotonic()
         expected: dict[int, int] = {}
-        for req in batch.reqs:
-            stamp = self._gate_expected.get(req.req_pool_idx)
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+        for i, req in enumerate(batch.reqs):
+            state = self._rid_states.get(req.rid)
+            if state is None or state.pool_idx != req.req_pool_idx:
+                # The physical seat may still carry the previous request's
+                # expectation until this request's first result hook sends
+                # its DraftSync. Never gate a new owner on that stale value.
+                continue
+            # Use the exact host mirror of the value consumed by GPU select
+            # (VerifyWorker uses batch.seq_lens + 1). Inferring it from the
+            # previous result hook is fragile under overlap: req.output_ids,
+            # evented commits, and the next launched batch advance on three
+            # different clocks, so the inferred stamp can be one accepted run
+            # ahead or behind even after a correct re-seed.
+            stamp = (
+                int(seq_lens_cpu[i].item()) + 1
+                if seq_lens_cpu is not None and i < len(seq_lens_cpu)
+                else self._gate_expected.get(req.req_pool_idx)
+            )
             if stamp is None:
                 continue
             rank = self._drafter_rank_of(req.req_pool_idx)
@@ -837,11 +822,10 @@ class DecoupledVerifyManager:
                 self._skip_log_ct += 1
                 logger.info(
                     "decoupled gate skip-signature #%d (landed AHEAD of "
-                    "expected -- drafter merge outran the arming): %s",
+                    "the host pacing estimate): %s",
                     self._skip_log_ct,
                     ahead,
                 )
-                self._force_ahead_resync(expected, snapshot)
         if expected and self.arrival_wait_s > 0 and self._stream_gate is not None:
             budget_s = self._gate_budget_s()
             if self._stream_gate.enqueue(
@@ -993,6 +977,11 @@ class DecoupledVerifyManager:
                 and state is not None
                 and state.pool_idx == req.req_pool_idx
             )
+            prompt_token_ids = (
+                list(state.prompt_token_ids)
+                if desync_reseed
+                else list(req.origin_input_ids)
+            )
             self._force_resync_seats.discard(req.req_pool_idx)
             self._seat_timeout_streaks.pop(req.req_pool_idx, None)
             if state is not None:
@@ -1013,7 +1002,7 @@ class DecoupledVerifyManager:
             self.arrival_board.reset_seat(req.req_pool_idx)
             state = _ReqState(
                 pool_idx=req.req_pool_idx,
-                prompt_len=len(req.origin_input_ids),
+                prompt_token_ids=prompt_token_ids,
                 committed_len=len(req.output_ids),
                 epoch=self._seat_epochs.get(int(req.req_pool_idx), 0) + 1,
             )
@@ -1027,7 +1016,7 @@ class DecoupledVerifyManager:
                     dst_drafter_rank=drafter_rank,
                     req_pool_idx=req.req_pool_idx,
                     epoch=state.epoch,
-                    prompt_token_ids=list(req.origin_input_ids),
+                    prompt_token_ids=list(state.prompt_token_ids),
                     committed_outputs=list(req.output_ids),
                     desync_reseed=desync_reseed,
                 )
@@ -1038,23 +1027,27 @@ class DecoupledVerifyManager:
             # gated batch's entry seq_lens).
             self._gate_expected[state.pool_idx] = state.total_committed_len
         else:
-            # VerifyCommits ride the evented relay (the IPC thread builds and
-            # sends them at forward end + copy_done); this hook only keeps the
-            # host bookkeeping the gate and re-syncs are built from.
-            #
-            # Arm the gate for the NEXT launch. The protocol value is the same
-            # in both modes -- the select of round R reads the block stamped
-            # two commits back (T_{R-2}) -- but which hook is "the last one
-            # before that launch" differs: the synchronous loop processes
-            # round M before launching M+1 (this hook arms gate M+1 ->
-            # PRE-delta total, T_{M-1}), while the overlap loop launches M+1
-            # first and processes M afterwards (this hook arms gate M+2 ->
-            # POST-delta total, T_M).
+            # Finalized scheduler output_ids are the target's source of truth.
+            # The overlap loop processes this result while the next launch is
+            # already in flight, so this later-but-correct commit still gives
+            # the drafter a target window in which to build its next block.
             pre_delta_total = state.total_committed_len
-            # The evented commit relay can be one verify result ahead of the
-            # scheduler's output_ids. Never regress a wire-ledger high-water
-            # adopted by _on_resync_sent.
-            state.committed_len = max(state.committed_len, len(req.output_ids))
+            committed_len = len(req.output_ids)
+            if committed_len > state.committed_len:
+                drafter_rank = self._drafter_rank_of(state.pool_idx)
+                self._control_batch_for(
+                    control_batches, drafter_rank
+                ).verify_commit_messages.append(
+                    VerifyCommit(
+                        request_id=req.rid,
+                        src_verifier_rank=self.ipc_config.rank,
+                        dst_drafter_rank=drafter_rank,
+                        pre_verify_committed_len=state.committed_len,
+                        committed_tokens=list(req.output_ids[state.committed_len :]),
+                        req_pool_idx=state.pool_idx,
+                    )
+                )
+                state.committed_len = committed_len
             self._gate_expected[state.pool_idx] = (
                 state.total_committed_len if overlap else pre_delta_total
             )

@@ -1717,6 +1717,29 @@ class EnumDraftEngine:
         )
         return False
 
+    def republish_current_block(self, key: DraftReqKey) -> Optional[dict]:
+        """Return the block for an exact, zero-delta forward re-seed.
+
+        The verifier resets a seat when it changes epochs, so an in-flight
+        copy of the otherwise-current block is filtered as stale. Re-send the
+        already-computed block under the new epoch instead of issuing an
+        invalid zero-token advance.
+        """
+        state = self._states.get(key)
+        if (
+            state is None
+            or state.pending_delta()
+            or state.last_units_dev is None
+            or state.mirror_event is None
+        ):
+            return None
+        return {
+            "pool_indices": [state.req_pool_idx],
+            "base_committed_lens": [len(state.committed_tokens)],
+            "units_device": state.last_units_dev.unsqueeze(0),
+            "ready_event": state.mirror_event,
+        }
+
     def attach_commit_mirror(self, mirror, board) -> None:
         self._commit_mirror = mirror
         self._commit_board = board

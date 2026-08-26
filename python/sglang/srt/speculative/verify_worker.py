@@ -136,9 +136,9 @@ def select_enum_units(
 
     ``rows`` / ``stamps`` are the seat-gathered enumeration generations
     ([bs, gen_count, num_cases * fanout * unit_width] and [bs, gen_count]):
-    each seat keeps its two newest stamped blocks, because the block serving
-    THIS round (enumerated two commits back) coexists with the one the last
-    commit already pushed. Three steps: pick the generation whose stamp equals
+    each seat keeps a bounded ring of stamped blocks so overlap-scheduled
+    results cannot overwrite an older launched batch's input. Three steps:
+    pick the generation whose stamp equals
     the expected base (fresh), then the (accept_case, bonus_guess) unit within
     it -- a hit iff fresh AND the real bonus is among the case's F guesses
     (unit element 0). Miss rows become the bonus-seeded fallback

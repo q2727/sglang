@@ -232,11 +232,30 @@ class VerifierIpcThread:
                 if sync.desync_reseed:
                     wire_outputs = self._sent_committed_outputs.get(sync.request_id)
                     if wire_outputs is not None:
-                        # The scheduler's req.output_ids can trail the evented
-                        # relay by one whole verify result. Re-seed from what
-                        # was actually sent, otherwise the next commit starts
-                        # beyond the re-opened draft prefix.
-                        sync.committed_outputs = list(wire_outputs)
+                        # Scheduler state and the evented wire ledger advance
+                        # independently under overlap. Both contain verified
+                        # target tokens, so use their longest common-prefix
+                        # high-water. The floor below filters duplicate older
+                        # commits while the shorter side catches up.
+                        scheduler_outputs = list(sync.committed_outputs)
+                        wire_outputs = list(wire_outputs)
+                        if len(scheduler_outputs) <= len(wire_outputs) and wire_outputs[
+                            : len(scheduler_outputs)
+                        ] == scheduler_outputs:
+                            sync.committed_outputs = wire_outputs
+                        elif len(wire_outputs) <= len(scheduler_outputs) and scheduler_outputs[
+                            : len(wire_outputs)
+                        ] == wire_outputs:
+                            sync.committed_outputs = scheduler_outputs
+                        else:
+                            logger.error(
+                                "desync re-seed prefixes diverged for %s "
+                                "(scheduler=%d wire=%d); using wire ledger",
+                                sync.request_id,
+                                len(scheduler_outputs),
+                                len(wire_outputs),
+                            )
+                            sync.committed_outputs = wire_outputs
                     self._resync_floors[sync.request_id] = len(sync.committed_outputs)
                     if self._on_resync_sent is not None:
                         self._on_resync_sent(sync)
@@ -249,6 +268,24 @@ class VerifierIpcThread:
                     )
                     self._resync_floors.pop(sync.request_id, None)
                 self._closed_rids.discard(sync.request_id)
+            for commit in batch.verify_commit_messages:
+                rid = commit.request_id
+                pre_len = self._sent_committed_lens.get(rid)
+                if pre_len is None or pre_len != int(commit.pre_verify_committed_len):
+                    logger.error(
+                        "scheduler commit ledger mismatch for %s "
+                        "(wire=%s commit_base=%d)",
+                        rid,
+                        pre_len,
+                        int(commit.pre_verify_committed_len),
+                    )
+                    continue
+                self._sent_committed_lens[rid] = pre_len + len(
+                    commit.committed_tokens
+                )
+                self._sent_committed_outputs.setdefault(rid, []).extend(
+                    int(token) for token in commit.committed_tokens
+                )
             for close in batch.close_messages:
                 self._sent_committed_lens.pop(close.request_id, None)
                 self._sent_committed_outputs.pop(close.request_id, None)

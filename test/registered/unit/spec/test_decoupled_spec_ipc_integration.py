@@ -10,6 +10,9 @@ enumerate -> land -> commit -> close loop end to end.
 """
 
 import unittest
+from types import SimpleNamespace
+
+import torch
 
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
@@ -94,6 +97,66 @@ def _drain_all(token):
 
 
 class TestDecoupledSpecIpcIntegration(CustomTestCase):
+    def test_desync_reseed_preserves_initial_prompt_snapshot(self):
+        reset_slots = []
+        manager = DecoupledVerifyManager.__new__(DecoupledVerifyManager)
+        manager.ipc_config = SimpleNamespace(rank=0)
+        manager.num_drafters = 1
+        manager.verify_worker = SimpleNamespace(
+            enum_buffer=SimpleNamespace(reset_slot=reset_slots.append)
+        )
+        manager.arrival_board = SimpleNamespace(reset_seat=lambda _seat: None)
+        manager._rid_states = {}
+        manager._seat_epochs = {}
+        manager._gate_expected = {}
+        manager._seat_timeout_streaks = {}
+        manager._drafter_timeout_streaks = {}
+        manager._drafter_cooldown_until = {}
+        manager._force_resync_seats = set()
+
+        req = SimpleNamespace(
+            rid="r",
+            req_pool_idx=3,
+            origin_input_ids=[10, 11, 12, 13],
+            output_ids=[],
+            multimodal_inputs=None,
+            finished=lambda: False,
+        )
+        controls = {}
+        manager._collect_req_controls(req, controls, overlap=True)
+        first = controls[0].sync_messages[0]
+        self.assertEqual(first.prompt_token_ids, [10, 11, 12, 13])
+
+        # The live Req is mutable under overlap scheduling. A recovery sync
+        # must still use the original prompt rather than this restaged view.
+        req.origin_input_ids[:] = [12, 13]
+        req.output_ids[:] = [20, 21]
+        manager._force_resync_seats.add(3)
+        controls = {}
+        manager._collect_req_controls(req, controls, overlap=True)
+        reseed = controls[0].sync_messages[0]
+        self.assertEqual(reseed.prompt_token_ids, [10, 11, 12, 13])
+        self.assertEqual(manager._rid_states["r"].prompt_len, 4)
+
+        # Recovery adopts the exact prefix selected by the IPC re-seed rather
+        # than retaining a stale scheduler-side committed length.
+        reseed.committed_outputs[:] = [20]
+        manager._on_resync_sent(reseed)
+        self.assertEqual(manager._rid_states["r"].committed_len, 1)
+        self.assertEqual(manager._gate_expected[3], 5)
+
+        manager._gate_expected[3] = 999  # deliberately stale inferred value
+        expected = manager._collect_gate_expected(
+            SimpleNamespace(reqs=[req], seq_lens_cpu=torch.tensor([17]))
+        )
+        self.assertEqual(expected, {3: 18})
+
+        controls = {}
+        manager._collect_req_controls(req, controls, overlap=True)
+        commit = controls[0].verify_commit_messages[0]
+        self.assertEqual(commit.pre_verify_committed_len, 1)
+        self.assertEqual(commit.committed_tokens, [21])
+
     def test_epoch_filter_rejects_old_inflight_block(self):
         manager = DecoupledVerifyManager.__new__(DecoupledVerifyManager)
         manager._seat_epochs = {3: 2}
@@ -136,16 +199,40 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
             v_tp.close()
             d_tp.close()
 
-    def test_ahead_resync_respects_two_generation_ring(self):
-        manager = DecoupledVerifyManager.__new__(DecoupledVerifyManager)
-        manager._force_resync_seats = set()
-        manager._gate_resync_ct = 0
-
-        manager._force_ahead_resync({3: 10}, {3: 11})
-        self.assertEqual(manager._force_resync_seats, set())
-        manager._force_ahead_resync({3: 10}, {3: 12})
-        self.assertEqual(manager._force_resync_seats, {3})
-        self.assertEqual(manager._gate_resync_ct, 1)
+    def test_desync_reseed_uses_scheduler_high_water_when_wire_trails(self):
+        _mesh, v_tp, d_tp, _enum_buffer, proxy, token = self._wire()
+        adopted = []
+        proxy._on_resync_sent = adopted.append
+        proxy._sent_committed_lens["r"] = 2
+        proxy._sent_committed_outputs["r"] = [10, 11]
+        try:
+            proxy.submit_control_batch(
+                DraftControlBatch(
+                    dst_drafter_rank=0,
+                    sync_messages=[
+                        DraftSync(
+                            request_id="r",
+                            src_verifier_rank=0,
+                            dst_drafter_rank=0,
+                            req_pool_idx=3,
+                            epoch=2,
+                            committed_outputs=[10, 11, 12, 13],
+                            desync_reseed=True,
+                        )
+                    ],
+                )
+            )
+            proxy._step()
+            token._step()
+            ready = _drain_sync_and_close(token)
+            self.assertEqual(
+                ready.sync_messages[0].committed_outputs, [10, 11, 12, 13]
+            )
+            self.assertEqual(adopted[0].committed_outputs, [10, 11, 12, 13])
+            self.assertEqual(proxy._resync_floors["r"], 4)
+        finally:
+            v_tp.close()
+            d_tp.close()
 
     def _wire(self):
         mesh = FakeTransportMesh()
@@ -228,6 +315,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
             ready2 = _drain_all(token)
             self.assertEqual(len(ready2.ready_commit_segments), 1)
             self.assertEqual(ready2.ready_commit_segments[0].committed_tokens, [100])
+            self.assertEqual(proxy._sent_committed_outputs["r"], [100])
 
             # 6. verifier closes the request; a late block for the retired seat
             #    would land but stays on the fallback path via its stale

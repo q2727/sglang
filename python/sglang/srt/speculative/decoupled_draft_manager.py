@@ -59,7 +59,7 @@ _IDLE_WAIT_S = 0.0005
 
 # Generation accounting. A draft round must consume exactly one verify round;
 # otherwise intermediate blocks never exist and the verifier cannot select
-# them from its two-generation ring.
+# them by exact stamp from its bounded generation ring.
 _MERGE_STATS = {"merged": 0, "skipped_rounds": 0, "lockstep": 0}
 
 # CUDA IPC slot capacity in block rows; bounds the verifier batch size a
@@ -441,7 +441,6 @@ class DecoupledDraftManager:
                     prompt_tokens=list(sync.prompt_token_ids),
                     committed_outputs=list(sync.committed_outputs),
                 )
-                touched[sync.draft_key] = None
                 if not was_open:
                     self._open_seats += 1
                 if incremental:
@@ -450,6 +449,21 @@ class DecoupledDraftManager:
                         sync.draft_key.request_id,
                         int(sync.epoch),
                     )
+                    current = self.engine.republish_current_block(sync.draft_key)
+                    if current is not None:
+                        self._push_block(
+                            verifier_rank=sync.draft_key.src_verifier_rank,
+                            packed=current,
+                        )
+                        logger.info(
+                            "decoupled drafter re-published current block for "
+                            "%s at epoch=%d base=%d",
+                            sync.draft_key.request_id,
+                            int(sync.epoch),
+                            int(current["base_committed_lens"][0]),
+                        )
+                        continue
+                touched[sync.draft_key] = None
             for segment in ready.ready_commit_segments:
                 if not self.engine.has(segment.draft_key):
                     continue

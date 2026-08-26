@@ -83,18 +83,18 @@ class DecoupledEnumBuffer:
         # req_to_token.shape[0] == max_running + 1, so seat 0 stays the harmless
         # cuda-graph padding row; never size to bare max_running.
         self.seats = int(req_to_token_pool.req_to_token.shape[0])
-        # Each seat holds the TWO newest stamped real blocks (generations 0/1).
-        # The block serving round r was enumerated two commits back (stamp
-        # |P_{r-2}|), while the commit of round r-1 has already pushed the next
-        # block (stamp |P_{r-1}|): with one generation the newer push would
-        # clobber the block round r selects from, turning every round into a
-        # staleness fallback under sync pacing. Generation 2 is the dedicated
-        # slot for top-1 prerun blocks (enumerated from a PREDICTED commit and
-        # shipped early); its stamp matches only when the bet was right, so
-        # the select needs no lookup-order logic -- it scans all generations
-        # and stamp equality picks the winner.
-        self.gen_count = 3
-        self._prerun_gen = 2
+        # Keep a short ring of real blocks. Two generations are enough for a
+        # synchronous verifier, but SGLang's overlap scheduler can launch and
+        # relay several results before an older launched batch reaches select.
+        # Eight covers that measured pipeline depth without host coordination;
+        # exact stamps still decide which generation is usable. The final slot
+        # is dedicated to top-1 prerun blocks (enumerated from a PREDICTED
+        # commit and shipped early); its stamp matches only when the bet was
+        # right, so the select needs no lookup-order logic -- it scans all
+        # generations and stamp equality picks the winner.
+        self.real_gen_count = 8
+        self.gen_count = self.real_gen_count + 1
+        self._prerun_gen = self.real_gen_count
         # Single buffer by design; versioning lives in the generation stamps
         # (module docstring), not in slot ping-pong.
         self.buf_count = 1
@@ -135,8 +135,8 @@ class DecoupledEnumBuffer:
             )
             for _ in range(self.buf_count)
         ]
-        # Which generation was written last per seat; the next land overwrites
-        # the OTHER one, so the previous block survives exactly one more push.
+        # Which real generation was written last per seat; the next land walks
+        # the ring and overwrites only after the measured overlap depth.
         self.enum_last_gen = [
             torch.zeros((self.seats,), dtype=torch.int64, device=device)
             for _ in range(self.buf_count)
@@ -312,9 +312,11 @@ class DecoupledEnumBuffer:
                 pool_indices, self._prerun_gen
             ] = base_committed_lens
             return
-        # Write the real generation NOT written last, then mark it newest: the
-        # previous block survives exactly one more push (see gen_count above).
-        write_gens = 1 - self.enum_last_gen[slot][pool_indices]
+        # Advance within the real-generation ring. Prerun owns the final slot
+        # and never participates in this rotation.
+        write_gens = (
+            self.enum_last_gen[slot][pool_indices] + 1
+        ) % self.real_gen_count
         self.enum_tokens[slot][pool_indices, write_gens] = rows
         self.enum_base_committed_lens[slot][
             pool_indices, write_gens
@@ -347,6 +349,7 @@ class DecoupledEnumBuffer:
         # scheduler at prefill alloc / retraction re-admit.
         for slot in range(self.buf_count):
             self.enum_base_committed_lens[slot][pool_idx, :] = _STAMP_EMPTY
+            self.enum_last_gen[slot][pool_idx] = 0
         # The new occupant's committed lengths restart from ITS prompt, which
         # may be shorter than the previous tenant's stamp: a stale doorbell
         # would satisfy the GEQ wait early. Harmless for correctness (the
