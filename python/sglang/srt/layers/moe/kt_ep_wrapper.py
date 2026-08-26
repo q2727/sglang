@@ -223,6 +223,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
                 num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=(
+                    torch.arange(num_experts) < self.num_gpu_experts
+                ),
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
