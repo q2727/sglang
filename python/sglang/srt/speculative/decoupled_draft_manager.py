@@ -57,13 +57,10 @@ logger = logging.getLogger(__name__)
 
 _IDLE_WAIT_S = 0.0005
 
-# Commit backlog (in verify rounds) beyond which the drafter merges the whole
-# backlog to catch up instead of producing every generation; <= this depth is
-# the overlap scheduler's normal in-flight allowance (one in-flight commit
-# plus jitter headroom).
+# Generation accounting. A draft round must consume exactly one verify round;
+# otherwise intermediate blocks never exist and the verifier cannot select
+# them from its two-generation ring.
 _MERGE_STATS = {"merged": 0, "skipped_rounds": 0, "lockstep": 0}
-
-_CATCH_UP_BACKLOG_ROUNDS = 2
 
 # CUDA IPC slot capacity in block rows; bounds the verifier batch size a
 # single push can carry (the verifier's default running cap is far below it).
@@ -410,23 +407,13 @@ class DecoupledDraftManager:
 
     @staticmethod
     def _consumable_commit_len(segment) -> int:
-        """Generation lockstep with a catch-up escape hatch.
+        """Consume one verify generation, even when several are queued.
 
-        Consuming one verify round's delta per drafter round produces EVERY
-        block generation, so the verifier's select always finds the one it
-        needs -- merging commits (the old unconditional behavior) skips
-        generations and each skip costs the verifier a fallback round; under
-        the overlap scheduler those fast fallback rounds outrun the drafter
-        and the skips cascade. A small backlog is normal there (commits flow
-        while a round is in flight); only when the drafter genuinely fell
-        behind does merging the whole backlog become right: one jump, one
-        fallback, re-locked -- instead of dragging a permanent lag whose gate
-        wait would eventually exceed the budget and cascade anyway.
+        The steady drafter round is much shorter than target verification, so
+        it catches up by producing multiple ordered generations within one
+        target window. Merging saves draft work but permanently skips stamps;
+        fallback rounds then feed more commits and amplify the gap.
         """
-        if segment.pending_rounds > _CATCH_UP_BACKLOG_ROUNDS:
-            _MERGE_STATS["merged"] += 1
-            _MERGE_STATS["skipped_rounds"] += segment.pending_rounds - 1
-            return len(segment.committed_tokens)
         _MERGE_STATS["lockstep"] += 1
         return segment.round_lens[0] if segment.round_lens else 0
 
