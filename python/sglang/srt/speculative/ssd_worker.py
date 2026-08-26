@@ -545,6 +545,37 @@ class SSDWorker:
         if not batch.sampling_info.is_all_greedy:
             raise ValueError("SSD currently supports greedy sampling only.")
 
+    def _commit_recurrent_state_after_verify(
+        self,
+        batch: ScheduleBatch,
+        accepted_steps: torch.Tensor,
+        seq_lens_pre_verify: torch.Tensor,
+    ) -> None:
+        """Commit the accepted GDN/Mamba state produced by target verification."""
+        if batch.mamba_track_indices is not None:
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != batch.seq_lens // mamba_track_interval
+            )
+            tracking_point = (
+                batch.seq_lens // mamba_track_interval * mamba_track_interval
+            )
+            mamba_steps_to_track = torch.where(
+                to_track_mask,
+                torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0),
+                -1,
+            )
+        else:
+            mamba_steps_to_track = None
+
+        self.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps.to(dtype=torch.int64),
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.model_runner.model,
+        )
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend():
             model_worker_batch = batch.get_model_worker_batch()
@@ -583,6 +614,14 @@ class SSDWorker:
             )
             state.pending_kind = "outcomes"
 
+        has_recurrent_target = (
+            self.model_runner.hybrid_gdn_config is not None
+            or self.model_runner.mamba2_config is not None
+            or self.model_runner.hybrid_lightning_config is not None
+        )
+        seq_lens_pre_verify = (
+            batch.seq_lens.clone() if has_recurrent_target else None
+        )
         self._prepare_verify(batch, prefix, candidate)
         model_worker_batch = batch.get_model_worker_batch()
         target_begin = time.perf_counter()
@@ -595,6 +634,12 @@ class SSDWorker:
         with torch.cuda.nvtx.range("ssd_accept_and_kv_commit"):
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, batch_result.logits_output, self.page_size
+            )
+        if seq_lens_pre_verify is not None:
+            self._commit_recurrent_state_after_verify(
+                batch,
+                verify_input.accept_length,
+                seq_lens_pre_verify,
             )
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
