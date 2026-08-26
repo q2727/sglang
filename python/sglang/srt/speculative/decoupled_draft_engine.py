@@ -1675,6 +1675,48 @@ class EnumDraftEngine:
             pool.mamba_pool.clear_slots(pool.translate_mamba_indices(state.mamba_slot))
         self._states[key] = state
 
+    def sync(
+        self,
+        key: DraftReqKey,
+        *,
+        req_pool_idx: int,
+        epoch: int,
+        prompt_tokens: list[int],
+        committed_outputs: list[int],
+    ) -> bool:
+        """Align a seat to a verifier snapshot, preserving KV when possible.
+
+        Returns True for an incremental forward-only re-seed and False when a
+        full open was required. Desync recovery normally advances the same
+        request, so throwing away its KV turns one scheduling hiccup into a
+        costly re-prefill that can create another backlog and re-seed storm.
+        """
+        if int(epoch) < 1:
+            raise ValueError(f"Draft request epoch must be positive, got {epoch}")
+        state = self._states.get(key)
+        full_prefix = [int(t) for t in prompt_tokens]
+        full_prefix.extend(int(t) for t in committed_outputs)
+        if state is not None and int(state.req_pool_idx) == int(req_pool_idx):
+            if state.prerun_len > 0:
+                self._rollback_prerun(state)
+            current = state.committed_tokens
+            if (
+                len(full_prefix) >= len(current)
+                and full_prefix[: len(current)] == current
+            ):
+                state.committed_tokens.extend(full_prefix[len(current) :])
+                state.epoch = int(epoch)
+                return True
+
+        self.open(
+            key,
+            req_pool_idx=req_pool_idx,
+            epoch=epoch,
+            prompt_tokens=prompt_tokens,
+            committed_outputs=committed_outputs,
+        )
+        return False
+
     def attach_commit_mirror(self, mirror, board) -> None:
         self._commit_mirror = mirror
         self._commit_board = board

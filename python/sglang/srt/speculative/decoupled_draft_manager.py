@@ -446,7 +446,8 @@ class DecoupledDraftManager:
                 self.engine.close(draft_key)
                 self._open_seats = max(0, self._open_seats - 1)
             for sync in ready.sync_messages:
-                self.engine.open(
+                was_open = self.engine.has(sync.draft_key)
+                incremental = self.engine.sync(
                     sync.draft_key,
                     req_pool_idx=int(sync.req_pool_idx),
                     epoch=int(sync.epoch),
@@ -454,7 +455,14 @@ class DecoupledDraftManager:
                     committed_outputs=list(sync.committed_outputs),
                 )
                 touched[sync.draft_key] = None
-                self._open_seats += 1
+                if not was_open:
+                    self._open_seats += 1
+                if incremental:
+                    logger.info(
+                        "decoupled drafter incrementally re-seeded %s at epoch=%d",
+                        sync.draft_key.request_id,
+                        int(sync.epoch),
+                    )
             for segment in ready.ready_commit_segments:
                 if not self.engine.has(segment.draft_key):
                     continue
