@@ -423,7 +423,10 @@ class DecoupledDraftManager:
         fallback, re-locked -- instead of dragging a permanent lag whose gate
         wait would eventually exceed the budget and cascade anyway.
         """
-        if segment.pending_rounds > _CATCH_UP_BACKLOG_ROUNDS:
+        if (
+            not envs.SGLANG_DECOUPLED_STRICT_LOCKSTEP.get()
+            and segment.pending_rounds > _CATCH_UP_BACKLOG_ROUNDS
+        ):
             _MERGE_STATS["merged"] += 1
             _MERGE_STATS["skipped_rounds"] += segment.pending_rounds - 1
             return len(segment.committed_tokens)
