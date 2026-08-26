@@ -115,6 +115,7 @@ wait_for_ready_log() {
   return 1
 }
 
+: >"${RUN_DIR}/target.log"
 setsid env \
   SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
   SGLANG_ENABLE_DECOUPLED_STREAM_GATE="${TARGET_STREAM_GATE}" \
@@ -157,6 +158,7 @@ if (( DRAFT_GRAPH_BS[${#DRAFT_GRAPH_BS[@]} - 1] != DRAFT_MAX_REQUESTS )); then
   DRAFT_GRAPH_BS+=("${DRAFT_MAX_REQUESTS}")
 fi
 
+: >"${RUN_DIR}/draft.log"
 setsid env \
   SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
   SGLANG_ENABLE_DECOUPLED_CHAIN_GRAPH=1 \
