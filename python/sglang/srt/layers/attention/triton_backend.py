@@ -976,8 +976,12 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices = kv_indices_buf
 
         if not self.skip_prefill and not self.is_draft_runner:
+            # Verify masks cover each query against its prefix and draft tree.
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (
+                    max_num_tokens
+                    * (self.max_context_len + (self.num_draft_tokens or 0))
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )

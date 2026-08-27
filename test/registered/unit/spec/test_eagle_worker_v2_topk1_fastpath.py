@@ -128,6 +128,49 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             worker._rebuild_topk1_chain_buffers()
 
 
+class TestHybridDraftRecurrentState(CustomTestCase):
+    def _make_worker(self):
+        mamba_pool = SimpleNamespace(clear_slots=MagicMock())
+        req_pool = SimpleNamespace(
+            mamba_pool=mamba_pool,
+            get_mamba_indices=MagicMock(side_effect=lambda indices: indices + 10),
+            translate_mamba_indices=MagicMock(
+                side_effect=lambda indices: indices + 100
+            ),
+        )
+        worker = object.__new__(EagleDraftWorker)
+        worker._draft_has_recurrent_plane = True
+        worker.draft_runner = SimpleNamespace(req_to_token_pool=req_pool)
+        return worker, req_pool
+
+    def test_clears_only_fresh_request_state(self):
+        worker, req_pool = self._make_worker()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            prefix_lens=[0, 5, 0],
+            req_pool_indices=torch.tensor([4, 7, 9], device=DEVICE),
+        )
+
+        worker._clear_fresh_recurrent_state(batch)
+
+        cleared = req_pool.mamba_pool.clear_slots.call_args.args[0]
+        self.assertTrue(
+            torch.equal(cleared, torch.tensor([114, 119], device=DEVICE))
+        )
+
+    def test_preserves_existing_prefix_state(self):
+        worker, req_pool = self._make_worker()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            prefix_lens=[4, 8],
+            req_pool_indices=torch.tensor([2, 3], device=DEVICE),
+        )
+
+        worker._clear_fresh_recurrent_state(batch)
+
+        req_pool.mamba_pool.clear_slots.assert_not_called()
+
+
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def test_missing_seed_cuda_graph_fallback(self):
         graph_result = (

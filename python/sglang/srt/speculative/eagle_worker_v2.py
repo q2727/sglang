@@ -458,6 +458,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             pool.get_mamba_indices(batch.req_pool_indices)
         )
 
+    def _clear_fresh_recurrent_state(self, batch: ScheduleBatch) -> None:
+        """Reset reused recurrent rows before a request's first draft prefill."""
+        if not self._draft_has_recurrent_plane or batch.forward_mode.is_idle():
+            return
+
+        prefix_lens = batch.prefix_lens
+        if prefix_lens is None:
+            return
+        fresh_rows = [i for i, prefix_len in enumerate(prefix_lens) if prefix_len == 0]
+        if not fresh_rows:
+            return
+
+        pool = self.draft_runner.req_to_token_pool
+        req_indices = batch.req_pool_indices[fresh_rows]
+        state_indices = pool.translate_mamba_indices(
+            pool.get_mamba_indices(req_indices)
+        )
+        pool.mamba_pool.clear_slots(state_indices)
+
     def save_recurrent_state(self, batch: ScheduleBatch) -> None:
         """Snapshot the draft model's committed recurrent state for this batch.
 
@@ -866,6 +885,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        self._clear_fresh_recurrent_state(batch)
+
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
