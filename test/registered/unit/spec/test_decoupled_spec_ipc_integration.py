@@ -230,6 +230,31 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
             )
             self.assertEqual(adopted[0].committed_outputs, [10, 11, 12, 13])
             self.assertEqual(proxy._resync_floors["r"], 4)
+            self.assertEqual(proxy._sent_committed_lens["r"], 4)
+            self.assertEqual(proxy._sent_committed_outputs["r"], [10, 11, 12, 13])
+
+            # The first post-reseed commit must continue exactly at the
+            # reconciled high-water instead of tripping a permanent ledger
+            # mismatch against the stale pre-reseed cursor.
+            proxy.submit_control_batch(
+                DraftControlBatch(
+                    dst_drafter_rank=0,
+                    verify_commit_messages=[
+                        VerifyCommit(
+                            request_id="r",
+                            src_verifier_rank=0,
+                            dst_drafter_rank=0,
+                            pre_verify_committed_len=4,
+                            committed_tokens=[14],
+                        )
+                    ],
+                )
+            )
+            proxy._step()
+            self.assertEqual(proxy._sent_committed_lens["r"], 5)
+            self.assertEqual(
+                proxy._sent_committed_outputs["r"], [10, 11, 12, 13, 14]
+            )
         finally:
             v_tp.close()
             d_tp.close()

@@ -137,6 +137,13 @@ class _ScratchTreeCache(SimpleNamespace):
     def evict(self, params: EvictParams):
         pass
 
+    def available_and_evictable_str(self) -> str:
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        return (
+            f"Available tokens: {available_size} "
+            f"(available_size={available_size} + evictable_size=0)\n"
+        )
+
 
 class _ExtendCaseStaging(msgspec.Struct):
     """One accept case's device staging for the fused-extend graph replay,
@@ -1117,6 +1124,10 @@ class EnumDraftEngine:
         self._branch_template: Optional[ScheduleBatch] = None
         self.hit_ct = 0
         self.miss_ct = 0
+        # Host-side matches are already materialized for routing, so this
+        # histogram adds no device read or synchronization. It is used to size
+        # per-case fanout budgets from the workload's actual outcome ranks.
+        self.selection_hist: dict[tuple[int, int], int] = {}
         self.profiler = _RoundProfiler(
             enabled=envs.SGLANG_DEBUG_DECOUPLED_DRAFT_PROFILE.get()
         )
@@ -4054,6 +4065,9 @@ class EnumDraftEngine:
                     hit_keys.append(key)
                     hit_states.append(state)
                     selections.append(selection)
+                    self.selection_hist[selection] = (
+                        self.selection_hist.get(selection, 0) + 1
+                    )
                 elif key in self._seat_carriers:
                     case0_keys.append(key)
                     case0_states.append(state)
@@ -7254,13 +7268,24 @@ class EnumDraftEngine:
         carrier-destined and removed from the list on donation."""
         ppr = self._pages_per_carrier_row
         rows_per_seat = (self.num_steps + 1) * self.fanout
-        backbone_pages = self._kv_page_arena.take(bs).view(bs, 1)
-        glue_pages = self._kv_page_arena.take(bs * self.num_steps * ppr).view(
+        backbone_count = bs
+        glue_count = bs * self.num_steps * ppr
+        branch_count = bs * rows_per_seat * ppr
+
+        # Take the complete round allocation atomically.  Separate takes can
+        # consume backbone/glue pages and then fail on the branch allocation,
+        # leaking the earlier pages because this function has not added them
+        # to scratch_kv_pages yet.
+        all_pages = self._kv_page_arena.take(
+            backbone_count + glue_count + branch_count
+        )
+        glue_begin = backbone_count
+        branch_begin = glue_begin + glue_count
+        backbone_pages = all_pages[:glue_begin].view(bs, 1)
+        glue_pages = all_pages[glue_begin:branch_begin].view(
             bs * self.num_steps, ppr
         )
-        branch_pages = self._kv_page_arena.take(bs * rows_per_seat * ppr).view(
-            bs * rows_per_seat, ppr
-        )
+        branch_pages = all_pages[branch_begin:].view(bs * rows_per_seat, ppr)
         scratch_kv_pages += [backbone_pages, glue_pages, branch_pages]
         return _SlowRoundPages(
             backbone_pages=backbone_pages,

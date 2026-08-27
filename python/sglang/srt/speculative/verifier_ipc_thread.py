@@ -223,11 +223,10 @@ class VerifierIpcThread:
             did_work = True
             # The ledger follows the wire: a DraftSync (re-)roots the
             # request's committed-output total, a DraftClose retires it.
-            # A desync re-seed keeps the cursor (the chain is intact, the
-            # snapshot merely re-tells it to the drafter) and instead sets a
-            # send FLOOR: in-flight rounds whose base falls under the
-            # snapshot are already inside its committed_outputs -- sending
-            # them would double-apply on the re-opened seat.
+            # A desync re-seed advances the wire cursor to the reconciled
+            # snapshot and sets a send FLOOR: in-flight rounds whose base
+            # falls under the snapshot are already inside committed_outputs,
+            # so sending them would double-apply on the re-opened seat.
             for sync in batch.sync_messages:
                 if sync.desync_reseed:
                     wire_outputs = self._sent_committed_outputs.get(sync.request_id)
@@ -256,7 +255,12 @@ class VerifierIpcThread:
                                 len(wire_outputs),
                             )
                             sync.committed_outputs = wire_outputs
-                    self._resync_floors[sync.request_id] = len(sync.committed_outputs)
+                    reconciled_outputs = list(sync.committed_outputs)
+                    self._sent_committed_lens[sync.request_id] = len(
+                        reconciled_outputs
+                    )
+                    self._sent_committed_outputs[sync.request_id] = reconciled_outputs
+                    self._resync_floors[sync.request_id] = len(reconciled_outputs)
                     if self._on_resync_sent is not None:
                         self._on_resync_sent(sync)
                 else:

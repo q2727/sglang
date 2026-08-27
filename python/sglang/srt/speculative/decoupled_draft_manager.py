@@ -517,7 +517,7 @@ class DecoupledDraftManager:
                     "decoupled drafter rounds: ct=%d avg_ms=%.1f push_ms=%.2f "
                     "idle_ms=%.2f starved=%.0f%% last_bs=%d fast=%d slow=%d "
                     "eff_fanout=%d prerun_hit=%d prerun_miss=%d merge=%d "
-                    "skips=%d lockstep=%d bet=%d/%d/%d",
+                    "skips=%d lockstep=%d bet=%d/%d/%d selection_hist=%s",
                     self._round_ct,
                     1000.0 * self._round_time_s / self._round_ct,
                     1000.0 * self._push_time_s / self._round_ct,
@@ -535,6 +535,7 @@ class DecoupledDraftManager:
                     self.engine.bet_armed_ct,
                     self.engine.bet_hit_ct,
                     self.engine.bet_miss_ct,
+                    dict(sorted(self.engine.selection_hist.items())),
                 )
                 if self.engine.profiler.enabled:
                     logger.info(
